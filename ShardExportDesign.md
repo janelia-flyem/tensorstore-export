@@ -30,39 +30,43 @@ This distributed workflow fundamentally changes the design from a single large c
 
 The key to the distributed design is that **all workers write to the same, single destination TensorStore volume, but each worker only writes to its assigned slice.**
 
-*   **Global Destination:** The destination Neuroglancer volume is defined with the **full, final dimensions** of the entire dataset. This is critical for creating a single, coherent `info` metadata file on GCS that describes the complete volume.
-*   **Worker-Specific Source:** Each worker creates a temporary, virtual source for **one shard file at a time**. The domain of this source is small (e.g., `[2048, 2048, 2048]`).
+*   **Global Destination:** The destination Neuroglancer volume is defined with the **full, final dimensions** of the entire dataset.
+*   **Worker-Specific Source:** Each worker creates a temporary, virtual source for **one shard file at a time**.
 *   **Targeted Copy:** The worker copies its small source into the correct **offset** within the giant destination volume.
 
-TensorStore's write operations are atomic at the chunk level, making this approach safe from race conditions.
+### 3.2. State Management for Workers via Transactional Moves
 
-### 3.2. State Management for Workers
+To coordinate work without a central database, we use a simple and robust state management system where a shard's state is determined by its GCS prefix. This is preferable to semaphore/lock files as it is more performant for task discovery and simpler to manage.
 
-To coordinate the work without a central database, a simple and robust state management system can be implemented directly on GCS using directory structures.
-
+The workflow is as follows:
 *   `gs://<bucket>/unprocessed/`: All shard files start here.
-*   `gs://<bucket>/processing/`: A worker transactionally moves a shard file here before it begins processing. This acts as a lock.
-*   `gs://<bucket>/finished/`: After a worker successfully processes a shard, it moves the file here.
+*   `gs://<bucket>/processing/`: A worker transactionally moves a shard file here *before* it begins processing. This move is an atomic operation and acts as a lock, ensuring only one worker can claim a given shard.
+*   `gs://<bucket>/finished/`: After a worker successfully processes a shard, it moves the file here to mark it as complete.
+
+A worker finds a task by listing the `unprocessed/` directory and attempting to move a file. If the move fails due to contention (another worker moved it first), it simply tries the next available file. This "optimistic locking" is highly efficient and scalable.
 
 ---
 
 ## 4. Optimal Arrow Shard File Design for Fast Random Access
 
-A sequential scan of a large Arrow file to find a specific chunk would be a major performance bottleneck, especially since TensorStore may request chunks in a non-sequential (e.g., Morton) order. The shard file format must be optimized for fast, random-access reads.
+A sequential scan of a large Arrow file would be a major performance bottleneck. The shard file format must be optimized for fast, random-access reads.
 
 ### 4.1. Use the Arrow IPC File Format
 
-The key is to use the **Arrow IPC File Format** (also known as Feather V2) instead of the Arrow Streaming Format. The IPC File Format is designed for random access; it contains a footer that acts as a built-in index, storing the exact byte offset and length of every Record Batch in the file.
+The key is to use the **Arrow IPC File Format** (Feather V2), which is designed for random access. It contains a footer that acts as a built-in index, storing the exact byte offset and length of every Record Batch in the file. The Arrow Streaming Format is unsuitable for this task.
 
 ### 4.2. One Record Batch Per Chunk
 
 Each `64x64x64` chunk will be stored as a single `pyarrow.RecordBatch`. Since each shard is `2048x2048x2048` voxels, it is composed of a `32x32x32` grid of chunks. Therefore, each shard Arrow file will contain `32 * 32 * 32 = 32,768` record batches.
 
-### 4.3. Companion Index File
+### 4.3. Indexing Chunks for Fast Lookup
 
-To avoid having each worker read metadata from the Arrow file to build a coordinate-to-batch map, we will pre-compute a companion index file. For each `shard_name.arrow`, we will generate `shard_name.arrow.index.json`.
+To map a `(z,y,x)` chunk coordinate to a record batch number (0-32767), we need an index. The recommended approach is to store this index directly in the Arrow file's metadata.
 
-This tiny JSON file will contain a `32x32x32` array where the value at `[z][y][x]` is the integer index of the record batch corresponding to that chunk. This allows for an instant lookup.
+**Storing Index in Arrow Metadata (Recommended)**
+The Arrow IPC File Format allows for arbitrary key-value metadata to be stored in the file's footer. This is the technically superior approach because the data and its index are in the same atomic unit, simplifying file management.
+
+The Go writer will serialize the `32x32x32` index map into a JSON string and store it in the Arrow schema's metadata under a key like `chunk_index_json`.
 
 ### 4.4. Shard File Schema
 
@@ -70,6 +74,10 @@ The `pyarrow.Table` within the shard file will use the following schema:
 
 ```python
 import pyarrow as pa
+
+# The JSON-serialized index map will be stored in the schema's metadata.
+# metadata = {b'chunk_index_json': b'[[[0, 1, ...], ...]]'}
+# schema = pa.schema([...]).with_metadata(metadata)
 
 SCHEMA = pa.schema([
     # Chunk coordinates relative to the shard origin (0-31)
@@ -88,21 +96,17 @@ SCHEMA = pa.schema([
 
 ## 5. Implementation for a Distributed Worker (Revised)
 
-Here is the revised step-by-step logic for a single worker, incorporating the optimal Arrow reading strategy.
+Here is the revised logic for a worker, incorporating the recommended strategy of reading the index from the Arrow file metadata.
 
 ### 5.1. Define the Global Destination (Common to all workers)
-
-This part of the design remains unchanged. Every worker uses the same spec with the full dataset dimensions.
+This part of the design remains unchanged.
 
 ```python
 import tensorstore as ts
 import numpy as np
 
-# This is the GLOBAL shape of the final dataset
 total_shape = [94088, 78317, 134576] 
 chunk_shape = [64, 64, 64]
-
-# Every worker uses the SAME destination spec
 dest_spec = {
     'driver': 'neuroglancer_precomputed',
     'kvstore': {'driver': 'gcs', 'bucket': 'your-bucket', 'path': 'path/to/global-volume'},
@@ -110,13 +114,12 @@ dest_spec = {
     },
     'open': True, 'create': True, 'delete_existing': False
 }
-
 global_dest_dataset = ts.open(dest_spec).result()
 ```
 
 ### 5.2. The Worker's Main Processing Loop with Efficient Reading
 
-The worker's `read_single_shard_chunk` function is now implemented to be highly efficient.
+The worker's `read_single_shard_chunk` function and its helper are updated to read the index from the file's metadata.
 
 ```python
 import pyarrow.ipc as ipc
@@ -130,21 +133,25 @@ def your_custom_decompressor(compressed_data: bytes, labels: list) -> np.ndarray
     pass
 
 @functools.lru_cache(maxsize=10) # Cache a few open readers/indices
-def get_shard_data(shard_gcs_path, fs):
-    """Reads the index and opens the Arrow file reader, caching the result."""
-    index_path = shard_gcs_path + ".index.json"
-    with fs.open(index_path, 'r') as f:
-        index_map = json.load(f)["zyx_to_batch_index"]
-    
+def get_shard_data_from_metadata(shard_gcs_path, fs):
+    """Reads the index from metadata and opens the Arrow file reader."""
     arrow_file = fs.open(shard_gcs_path, 'rb')
     reader = ipc.open_file(arrow_file)
+    
+    # Read the index from the Arrow file's metadata
+    metadata = reader.schema.metadata
+    if b'chunk_index_json' not in metadata:
+        raise RuntimeError(f"Index not found in metadata for shard: {shard_gcs_path}")
+    index_json_string = metadata[b'chunk_index_json']
+    index_map = json.loads(index_json_string)
+    
     return reader, index_map
 
 def read_single_shard_chunk(transform: ts.IndexTransform, shard_gcs_path: str) -> ts.ReadResult:
     fs = gcsfs.GCSFileSystem()
 
     # 1. Get the cached reader and index map for this shard.
-    reader, index_map = get_shard_data(shard_gcs_path, fs)
+    reader, index_map = get_shard_data_from_metadata(shard_gcs_path, fs)
 
     # 2. Calculate the chunk coordinate within the 32x32x32 grid.
     origin = transform.input_origin
@@ -164,13 +171,6 @@ def read_single_shard_chunk(transform: ts.IndexTransform, shard_gcs_path: str) -
 
 # --- Worker's Main Loop ---
 # The main loop remains structurally the same, but now calls the efficient
-# read function. (Code for moving files and setting up the copy is omitted for brevity).
-
-# for shard_gcs_path in assigned_shard_files:
-    # ... move file to 'processing' ...
-    # ... get shard_global_origin ...
-    # ... create source_spec with the efficient read_single_shard_chunk ...
-    # ... define dest_slice ...
-    # ... ts.copy(source, dest_slice).result() ...
-    # ... move file to 'finished' ...
+# read function. (Code for moving files and setting up the copy is omitted for brevity,
+# but it would implement the transactional moves described in section 3.2).
 ```
