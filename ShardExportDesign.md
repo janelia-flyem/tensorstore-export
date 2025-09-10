@@ -81,16 +81,51 @@ import pyarrow as pa
 
 SCHEMA = pa.schema([
     # Chunk coordinates relative to the shard origin (0-31)
-    pa.field('chunk_coord_x', pa.int32(), nullable=False),
-    pa.field('chunk_coord_y', pa.int32(), nullable=False),
-    pa.field('chunk_coord_z', pa.int32(), nullable=False),
+    pa.field('chunk_x', pa.int32(), nullable=False),
+    pa.field('chunk_y', pa.int32(), nullable=False),
+    pa.field('chunk_z', pa.int32(), nullable=False),
     
     # Custom data fields
     pa.field('labels', pa.list_(pa.uint64()), nullable=False),
     pa.field('supervoxels', pa.list_(pa.uint64()), nullable=False),
-    pa.field('payload', pa.binary(), nullable=False)
+    pa.field('compressed_dvid_block', pa.binary(), nullable=False)
 ])
 ```
+
+### 4.5. DVID Compressed Segmentation Format
+
+A Block is the unit of storage for compressed DVID labels. It is inspired by the Neuroglancer compression scheme and makes the following changes:
+
+1.  A block-level label list with sub-block indices into the list (using the minimal required bits vs. 64 bits in the original Neuroglancer scheme).
+2.  The number of bits for encoding values is not required to be a power of two.
+
+A block-level label list allows easy sharing of labels between sub-blocks. Sub-block storage can be more efficient due to the smaller index (at the cost of an indirection) and better encoded value packing (at the cost of byte alignment). In both cases, memory is gained for increased computation. It is assumed that block compression and decompression is handled on the CPU, not the GPU, as the Neuroglancer compression was originally designed for GPU decompression.
+
+Blocks cover `nx * ny * nz` voxels. This implementation allows any choice of `nx`, `ny`, and `nz` with two restrictions:
+1.  `nx`, `ny`, and `nz` must be a multiple of 8 and greater than 16.
+2.  The total number of labels cannot exceed the capacity of a `uint32`.
+
+Internally, labels are stored in `8x8x8` sub-blocks. There are `gx * gy * gz` sub-blocks, where `gx = nx / 8`, `gy = ny / 8`, and `gz = nz / 8`.
+
+#### Byte Layout
+
+The byte layout for a block with `N` labels is as follows:
+
+-   `3 * uint32`: The values of `gx`, `gy`, and `gz`.
+-   `uint32`: The number of labels (`N`), which cannot exceed the `uint32` capacity.
+-   `N * uint64`: Packed labels in little-endian format. Label `0` can be used to represent deleted labels (e.g., after a merge operation) to avoid changing all sub-block indices.
+
+--- 
+*The following data is only included if `N > 1`; otherwise, it is a solid block. `Nsb` is the number of sub-blocks (`gx * gy * gz`).*
+
+-   `Nsb * uint16`: The number of labels for each sub-block (`Ns[i]`).
+    -   If `Ns[i] == 0`, the sub-block has no data (uninitialized), which is useful for constructing blocks with sparse data.
+-   `Nsb * Ns * uint32`: Label indices for the sub-blocks, where `Ns` is the sum of all `Ns[i]`. For each sub-block `i`, there are `Ns[i]` label indices of `lBits`.
+-   `Nsb * values`: Sub-block indices for each voxel.
+    -   Data encompasses `512 * ceil(log2(Ns[i]))` bits, padded so no two sub-blocks have indices in the same byte.
+    -   At most, 9 bits are used per voxel for up to 512 labels in a sub-block.
+    -   A value provides the sub-block index, which points to an index in the main block's label list (`N` labels).
+    -   If `Ns[i] <= 1`, there are no values; if `Ns[i] = 0`, the `8x8x8` voxels are set to label `0`; if `Ns[i] = 1`, all voxels are set to the single given label index.
 
 ---
 

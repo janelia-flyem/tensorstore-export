@@ -1,18 +1,17 @@
-# Efficiently Writing Large Datasets with Custom Logic using TensorStore
+# Efficiently Writing of a Shard using TensorStore
 
-> **Note:** This document introduces the core concepts of using `tensorstore.virtual_chunked` for custom, memory-efficient data processing. For the complete, recommended architecture for a highly parallel, distributed system, please see `ShardExportDesign.md`. The code examples in this file have been updated to reflect the final, optimized design from that document.
-
-This document outlines how to use TensorStore to efficiently process a large dataset that requires custom, on-the-fly decoding, without ever needing to load the entire dataset into memory.
+This document introduces the core concepts of using `tensorstore.virtual_chunked` for custom, memory-efficient data processing. It outlines how to use TensorStore to efficiently process a large shard of data that requires custom, on-the-fly decoding, without ever needing to load the entire dataset into memory.
 
 The core idea is to use the `tensorstore.virtual_chunked` driver. This driver allows you to define a large, virtual TensorStore array that is backed by a Python function you provide. TensorStore will call your function whenever it needs a specific chunk of data, and your function is responsible for reading, decompressing, and returning just that single chunk.
 
 ## The Problem
 
 We have a large dataset (e.g., 2048x2048x2048 `uint64` values) stored in a sharded Arrow file format. For each chunk (e.g., 64x64x64), the Arrow file contains:
-1.  A list of `uint64` labels.
+1.  A list of `uint64` agglomerated labels.
+2.  A list of `uint64` unique supervoxel labels.
 2.  A custom compressed binary blob.
 
-To get the final `uint64` array for a chunk, we must read these two fields and apply a bespoke decompression algorithm. Loading the entire 2048^3 volume (64 GB) into memory is not feasible.
+To get the final `uint64` array for a chunk, we must read these three fields and apply a bespoke decompression algorithm. Loading the entire 2048^3 volume (64 GB) into memory is not efficient.
 
 ## The Solution: `tensorstore.virtual_chunked`
 
