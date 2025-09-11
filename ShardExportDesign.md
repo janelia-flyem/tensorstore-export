@@ -4,13 +4,15 @@ This document outlines a design for converting a very large dataset, stored in c
 
 ## 1. The Core Problem: Memory-Efficient Custom Data Transformation
 
-The initial challenge is to process a large dataset (e.g., 2048x2048x2048 `uint64` values) that is too large to fit in memory (64 GB). The data is stored in a sharded Arrow file format where each chunk (e.g., 64x64x64) requires custom decompression logic.
+The initial challenge is to process a massive dataset (e.g., the male CNS is 94088 x 78317 x 134576 `uint64` voxels).
+Neuroglancer precomputed volumes break such large volumes into shards that are effectively smaller subvolumes
+(e.g., 2048x2048x2048 `uint64` values for the male CNS). The shard files are the unit of storage for precomputed volumes,
+and DVID can export segmentation partitioned exactly along those shards: an Arrow IPC file with records for each 64x64x64
+block or chunk, and a CSV file with each row describing the global chunk coordinate and its Arrow record number.
 
-**Data Format per Chunk:**
-*   A list of `uint64` labels (a lookup table).
-*   A custom compressed binary blob that represents indices into the label table.
-
-A naive approach would require loading the entire 2048^3 volume, which is not feasible.
+The goal is to run a large pool of Cloud Run jobs to efficiently write the DVID exported shards (Arrow IPC + CSV files)
+into a neuroglancer precomputed volume.  Even at the shard level, we'd prefer not to keep the 2048 x 2048 x 2048 `uint64`
+3D array in memory so we can use more job workers with smaller memory requirements.
 
 ## 2. The Solution: `tensorstore.virtual_chunked`
 
