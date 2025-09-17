@@ -228,23 +228,27 @@ class ShardReader:
             labels = self._table['labels'][record_idx].as_py()
             supervoxels = self._table['supervoxels'][record_idx].as_py()
             compressed_data = self._table['dvid_compressed_block'][record_idx].as_py()
-            uncompressed_size = self._table['uncompressed_size'][record_idx].as_py()
+            # Note: uncompressed_size not needed since zstd decompressor handles this automatically
             
-            # Select which label list to use
+            # Decompress using DVID decompressor with label mapping
             if label_type == LabelType.LABELS:
-                label_list = labels
+                # Use agglomerated labels with supervoxel mapping
+                decompressed_chunk = self._decompressor.decompress_block(
+                    compressed_data=compressed_data,
+                    agglo_labels=labels,
+                    supervoxels=supervoxels,
+                    block_shape=chunk_shape
+                )
             elif label_type == LabelType.SUPERVOXELS:
-                label_list = supervoxels
+                # Use supervoxels directly (no mapping)
+                decompressed_chunk = self._decompressor.decompress_block(
+                    compressed_data=compressed_data,
+                    agglo_labels=supervoxels,
+                    supervoxels=None,
+                    block_shape=chunk_shape
+                )
             else:
                 raise ValueError(f"Invalid label type: {label_type}")
-            
-            # Decompress using DVID decompressor
-            decompressed_chunk = self._decompressor.decompress_block(
-                compressed_data=compressed_data,
-                labels=label_list,
-                uncompressed_size=uncompressed_size,
-                block_shape=chunk_shape
-            )
             
             return decompressed_chunk
             

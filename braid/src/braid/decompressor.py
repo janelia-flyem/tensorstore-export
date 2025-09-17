@@ -3,257 +3,290 @@ DVID Block Decompressor.
 
 Implements the DVID compressed segmentation format decompression with support
 for both agglomerated labels and supervoxel labels.
+
+This is a complete implementation of the DVID compressed block format,
+equivalent to the Go MakeLabelVolume function.
 """
 
 import struct
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import numpy as np
 import zstandard as zstd
 from .exceptions import DecompressionError
 
 
+def bits_for(n: int) -> int:
+    """Calculate minimum bits needed to represent n-1 values (0 to n-1)."""
+    if n < 2:
+        return 0
+    n -= 1
+    bits = 0
+    while n > 0:
+        bits += 1
+        n >>= 1
+    return bits
+
+
+def get_packed_value(data: bytes, bit_head: int, bits: int) -> int:
+    """Extract a packed value from byte array at given bit position."""
+    if bits == 0:
+        return 0
+
+    byte_pos = bit_head >> 3
+    bit_pos = bit_head & 7
+
+    # Left bit masks for each bit position in a byte
+    LEFT_BIT_MASK = [0xFF, 0x7F, 0x3F, 0x1F, 0x0F, 0x07, 0x03, 0x01]
+
+    if bit_pos + bits <= 8:
+        # Index totally within this byte
+        right_shift = 8 - bit_pos - bits
+        return (data[byte_pos] & LEFT_BIT_MASK[bit_pos]) >> right_shift
+    else:
+        # Index spans byte boundaries
+        index = (data[byte_pos] & LEFT_BIT_MASK[bit_pos]) << 8
+        index |= data[byte_pos + 1]
+        index >>= (16 - bit_pos - bits)
+        return index
+
+
 class DVIDDecompressor:
     """
     DVID Block decompressor implementation.
-    
-    This class handles the DVID compressed segmentation format as described in 
-    the DVID documentation. The format supports block-level label lists with 
+
+    This class handles the DVID compressed segmentation format as described in
+    the DVID documentation. The format supports block-level label lists with
     sub-block indices for efficient storage.
-    
+
     Block Format Overview:
     - gx, gy, gz: Number of sub-blocks in each dimension (uint32 each)
-    - N: Number of labels (uint32)  
+    - N: Number of labels (uint32)
     - labels: N uint64 labels
-    - sub-block data: Variable length compressed indices
+    - sub-block data: Variable length compressed indices with bit packing
     """
-    
+
     def __init__(self):
         """Initialize the DVID decompressor."""
         self._zstd_decompressor = zstd.ZstdDecompressor()
-    
-    def decompress_block(self, compressed_data: bytes, labels: List[int], 
-                        uncompressed_size: int, 
+
+    def decompress_block(self, compressed_data: bytes,
+                        agglo_labels: Optional[List[int]] = None,
+                        supervoxels: Optional[List[int]] = None,
                         block_shape: Tuple[int, int, int] = (64, 64, 64)) -> np.ndarray:
         """
-        Decompress a DVID compressed block using the specified labels.
-        
+        Decompress a two-layer compressed DVID block.
+
         Args:
-            compressed_data: The zstd-compressed DVID binary blob
-            labels: List of uint64 labels to use for decompression
-            uncompressed_size: Expected size after zstd decompression
+            compressed_data: The zstd-compressed DVID block data
+            agglo_labels: Optional list of agglomerated label IDs
+            supervoxels: Optional list of supervoxel IDs
             block_shape: Shape of the output block (nz, ny, nx)
-            
+
         Returns:
             Decompressed uint64 array of shape block_shape
-            
+
         Raises:
             DecompressionError: If decompression fails
         """
-        if len(compressed_data) == 0:
-            # Empty block - return all zeros
-            return np.zeros(block_shape, dtype=np.uint64)
-        
-        if len(labels) == 0:
-            # No labels available - return zeros
-            return np.zeros(block_shape, dtype=np.uint64)
-        
-        if len(labels) == 1:
-            # Solid block - single label for entire block
-            return np.full(block_shape, labels[0], dtype=np.uint64)
-        
         try:
-            # First decompress the zstd data
+            # First layer: decompress zstd to get raw DVID compressed block
+            if len(compressed_data) == 0:
+                # Empty block - return all zeros
+                return np.zeros(block_shape, dtype=np.uint64)
+
             try:
-                decompressed_data = self._zstd_decompressor.decompress(compressed_data)
+                dvid_compressed_data = self._zstd_decompressor.decompress(compressed_data)
             except Exception as e:
-                raise DecompressionError(f"Failed to decompress zstd data: {e}")
-            
-            if len(decompressed_data) != uncompressed_size:
-                # Size mismatch - this might be okay depending on format
-                pass  # Continue with available data
-            
-            # Parse the DVID block format
-            return self._parse_dvid_block(decompressed_data, labels, block_shape)
-            
+                raise DecompressionError(f"Failed to decompress zstd layer: {e}")
+
+            # Second layer: decompress DVID segmentation format
+            return self._make_label_volume(dvid_compressed_data, agglo_labels, supervoxels, block_shape)
         except Exception as e:
             if isinstance(e, DecompressionError):
                 raise
             raise DecompressionError(f"DVID block decompression failed: {e}")
-    
-    def _parse_dvid_block(self, data: bytes, labels: List[int], 
-                         block_shape: Tuple[int, int, int]) -> np.ndarray:
+
+    def _make_label_volume(
+        self,
+        compressed_data: bytes,
+        agglo_labels: Optional[List[int]] = None,
+        supervoxels: Optional[List[int]] = None,
+        block_shape: Tuple[int, int, int] = (64, 64, 64)
+    ) -> np.ndarray:
         """
-        Parse DVID block format and return decompressed array.
-        
-        Args:
-            data: Decompressed DVID block data
-            labels: Label list to use for mapping
-            block_shape: Output block shape (nz, ny, nx)
-            
-        Returns:
-            Decompressed array
+        Decompress a DVID compressed block into a numpy array in ZYX order.
+
+        This is equivalent to the Go MakeLabelVolume function.
         """
-        if len(data) < 16:
-            # Data too small for valid DVID format
-            return self._fallback_decompression(data, labels, block_shape)
-        
-        try:
-            # Parse header: gx, gy, gz, N (4 uint32s)
-            offset = 0
-            gx, gy, gz, N = struct.unpack('<IIII', data[offset:offset+16])
-            offset += 16
-            
-            # Validate dimensions
-            expected_subblocks = gx * gy * gz
-            expected_voxels = np.prod(block_shape)
-            
-            if gx * 8 != block_shape[2] or gy * 8 != block_shape[1] or gz * 8 != block_shape[0]:
-                # Sub-block grid doesn't match expected block shape
-                return self._fallback_decompression(data, labels, block_shape)
-            
-            if N > len(labels):
-                # More labels in block than available in label list
-                N = len(labels)
-            
-            # Extract labels from the block (N uint64s)
-            if len(data) < offset + N * 8:
-                return self._fallback_decompression(data, labels, block_shape)
-            
-            block_labels = []
-            for i in range(N):
-                label = struct.unpack('<Q', data[offset:offset+8])[0]
-                block_labels.append(label)
-                offset += 8
-            
-            if N <= 1:
-                # Solid block case
-                fill_value = block_labels[0] if block_labels else 0
-                return np.full(block_shape, fill_value, dtype=np.uint64)
-            
-            # Parse sub-block structure
-            output = np.zeros(block_shape, dtype=np.uint64)
-            
-            # For now, implement a simplified version
-            # In production, this would parse the full sub-block structure
-            return self._parse_subblocks(
-                data[offset:], block_labels, gx, gy, gz, block_shape
-            )
-            
-        except Exception:
-            # Fall back to simpler decompression
-            return self._fallback_decompression(data, labels, block_shape)
-    
-    def _parse_subblocks(self, subblock_data: bytes, block_labels: List[int],
-                        gx: int, gy: int, gz: int, 
-                        block_shape: Tuple[int, int, int]) -> np.ndarray:
-        """
-        Parse sub-block compressed data.
-        
-        This is a simplified implementation. The full DVID format is complex
-        with variable-bit encoding and sub-block specific label counts.
-        """
+        SUB_BLOCK_SIZE = 8
+
+        if len(compressed_data) < 16:
+            raise ValueError("Compressed data too short for header")
+
+        # Parse header: gx, gy, gz, numLabels (4 uint32s in little-endian)
+        gx, gy, gz, num_labels = struct.unpack('<IIII', compressed_data[:16])
+
+        # Verify this matches expected block shape
+        expected_shape = (gz * SUB_BLOCK_SIZE, gy * SUB_BLOCK_SIZE, gx * SUB_BLOCK_SIZE)
+        if expected_shape != block_shape:
+            raise ValueError(f"Block shape mismatch: expected {expected_shape}, got {block_shape}")
+
+        if num_labels == 0:
+            raise ValueError("Block has 0 labels, which is not allowed")
+
+        # Create output array in ZYX order
         output = np.zeros(block_shape, dtype=np.uint64)
-        
-        try:
-            # Simplified parsing - treat as raw indices if possible
-            expected_voxels = np.prod(block_shape)
-            
-            if len(subblock_data) >= expected_voxels:
-                # Interpret as direct indices
-                indices = np.frombuffer(subblock_data[:expected_voxels], dtype=np.uint8)
-                indices = indices.reshape(block_shape)
-                
-                # Map indices to labels
-                label_array = np.array(block_labels, dtype=np.uint64)
-                valid_mask = indices < len(label_array)
-                output[valid_mask] = label_array[indices[valid_mask]]
-                
-                return output
-            
-            # If data is too small, fill with first label
-            fill_value = block_labels[0] if block_labels else 0
-            output.fill(fill_value)
+
+        # Parse labels
+        pos = 16
+        labels_size = num_labels * 8
+        if pos + labels_size > len(compressed_data):
+            raise ValueError("Compressed data too short for labels")
+
+        labels = np.frombuffer(compressed_data[pos:pos + labels_size], dtype='<u8')
+        pos += labels_size
+
+        # Convert to numpy arrays if needed
+        if agglo_labels is not None:
+            agglo_labels = np.array(agglo_labels, dtype=np.uint64)
+        if supervoxels is not None:
+            supervoxels = np.array(supervoxels, dtype=np.uint64)
+
+        # If only 0 or 1 labels, fill entire array
+        if num_labels < 2:
+            label = labels[0] if num_labels == 1 else 0
+
+            # Apply label mapping if provided
+            if agglo_labels is not None and supervoxels is not None:
+                sv_matches = np.where(supervoxels == label)[0]
+                if len(sv_matches) > 0:
+                    sv_idx = sv_matches[0]
+                    if sv_idx < len(agglo_labels):
+                        label = agglo_labels[sv_idx]
+
+            output.fill(label)
             return output
-            
-        except Exception:
-            # Ultimate fallback
-            fill_value = block_labels[0] if block_labels else 0
-            output.fill(fill_value)
-            return output
-    
-    def _fallback_decompression(self, data: bytes, labels: List[int], 
-                               block_shape: Tuple[int, int, int]) -> np.ndarray:
-        """
-        Fallback decompression for when DVID format parsing fails.
-        
-        Uses simple heuristics to extract meaningful data.
-        """
-        if len(labels) == 0:
-            return np.zeros(block_shape, dtype=np.uint64)
-        
-        if len(labels) == 1:
-            return np.full(block_shape, labels[0], dtype=np.uint64)
-        
-        # Try to interpret data as raw indices
-        expected_voxels = np.prod(block_shape)
-        
-        try:
-            if len(data) >= expected_voxels:
-                # Use first part of data as indices
-                indices = np.frombuffer(data[:expected_voxels], dtype=np.uint8)
-                indices = indices.reshape(block_shape)
-                
-                # Map to available labels
-                label_array = np.array(labels, dtype=np.uint64)
-                return label_array[indices % len(labels)]
-            
-            elif len(data) >= expected_voxels // 2:
-                # Try uint16 indices
-                indices = np.frombuffer(data[:expected_voxels*2], dtype=np.uint16)
-                if len(indices) >= expected_voxels:
-                    indices = indices[:expected_voxels].reshape(block_shape)
-                    label_array = np.array(labels, dtype=np.uint64)
-                    return label_array[indices % len(labels)]
-            
-        except Exception:
-            pass
-        
-        # Ultimate fallback - use first label
-        return np.full(block_shape, labels[0], dtype=np.uint64)
-    
+
+        # Parse sub-block metadata
+        num_sub_blocks = gx * gy * gz
+
+        # NumSBLabels: number of labels per sub-block (uint16 each)
+        num_sb_labels_size = num_sub_blocks * 2
+        if pos + num_sb_labels_size > len(compressed_data):
+            raise ValueError("Compressed data too short for NumSBLabels")
+
+        num_sb_labels = np.frombuffer(compressed_data[pos:pos + num_sb_labels_size], dtype='<u2')
+        pos += num_sb_labels_size
+
+        # SBIndices: indices into Labels array (uint32 each)
+        total_sb_indices = np.sum(num_sb_labels, dtype=np.uint32)
+        sb_indices_size = total_sb_indices * 4
+        if pos + sb_indices_size > len(compressed_data):
+            raise ValueError("Compressed data too short for SBIndices")
+
+        sb_indices = np.frombuffer(compressed_data[pos:pos + sb_indices_size], dtype='<u4')
+        pos += sb_indices_size
+
+        # SBValues: packed sub-block voxel indices
+        sb_values = compressed_data[pos:]
+
+        # Decompress each sub-block
+        sub_block_num_voxels = SUB_BLOCK_SIZE * SUB_BLOCK_SIZE * SUB_BLOCK_SIZE
+        sb_labels = np.zeros(sub_block_num_voxels, dtype=np.uint64)
+
+        index_pos = 0
+        bit_pos = 0
+        sub_block_num = 0
+
+        for sz in range(gz):
+            for sy in range(gy):
+                for sx in range(gx):
+                    num_sb_labels_cur = num_sb_labels[sub_block_num]
+                    bits = bits_for(num_sb_labels_cur)
+
+                    # Get labels for this sub-block
+                    for i in range(num_sb_labels_cur):
+                        sb_labels[i] = labels[sb_indices[index_pos]]
+                        index_pos += 1
+
+                    # Calculate position in output array
+                    base_z = sz * SUB_BLOCK_SIZE
+                    base_y = sy * SUB_BLOCK_SIZE
+                    base_x = sx * SUB_BLOCK_SIZE
+
+                    # Decompress voxels in this sub-block
+                    for z in range(SUB_BLOCK_SIZE):
+                        for y in range(SUB_BLOCK_SIZE):
+                            for x in range(SUB_BLOCK_SIZE):
+                                if num_sb_labels_cur == 0:
+                                    label = 0
+                                elif num_sb_labels_cur == 1:
+                                    label = sb_labels[0]
+                                else:
+                                    index = get_packed_value(sb_values, bit_pos, bits)
+                                    label = sb_labels[index]
+                                    bit_pos += bits
+
+                                # Apply label mapping if provided
+                                if agglo_labels is not None and supervoxels is not None:
+                                    sv_matches = np.where(supervoxels == label)[0]
+                                    if len(sv_matches) > 0:
+                                        sv_idx = sv_matches[0]
+                                        if sv_idx < len(agglo_labels):
+                                            label = agglo_labels[sv_idx]
+
+                                output[base_z + z, base_y + y, base_x + x] = label
+
+                    # Pad to byte boundary
+                    if bit_pos % 8 != 0:
+                        bit_pos += 8 - (bit_pos % 8)
+
+                    sub_block_num += 1
+
+        return output
+
     def get_block_info(self, compressed_data: bytes) -> dict:
         """
-        Extract metadata from a compressed DVID block without full decompression.
-        
+        Extract metadata from a two-layer compressed DVID block without full decompression.
+
         Args:
-            compressed_data: The compressed block data
-            
+            compressed_data: The zstd-compressed DVID block data
+
         Returns:
             Dictionary with block metadata
         """
         try:
             if len(compressed_data) == 0:
-                return {'type': 'empty', 'size': 0}
-            
-            # Decompress to get header
-            decompressed = self._zstd_decompressor.decompress(compressed_data)
-            
-            if len(decompressed) < 16:
-                return {'type': 'invalid', 'size': len(decompressed)}
-            
-            gx, gy, gz, N = struct.unpack('<IIII', decompressed[:16])
-            
+                return {'type': 'empty', 'zstd_size': 0}
+
+            # First decompress zstd layer to get DVID header
+            try:
+                dvid_data = self._zstd_decompressor.decompress(compressed_data)
+            except Exception as e:
+                return {
+                    'type': 'zstd_error',
+                    'error': str(e),
+                    'zstd_size': len(compressed_data)
+                }
+
+            if len(dvid_data) < 16:
+                return {'type': 'invalid', 'zstd_size': len(compressed_data), 'dvid_size': len(dvid_data)}
+
+            # Parse DVID header
+            gx, gy, gz, N = struct.unpack('<IIII', dvid_data[:16])
+
             return {
                 'type': 'solid' if N <= 1 else 'compressed',
                 'subblocks': (gx, gy, gz),
                 'label_count': N,
-                'compressed_size': len(compressed_data),
-                'uncompressed_size': len(decompressed)
+                'block_size': (gx * 8, gy * 8, gz * 8),
+                'zstd_compressed_size': len(compressed_data),
+                'dvid_uncompressed_size': len(dvid_data)
             }
-            
+
         except Exception as e:
             return {
                 'type': 'error',
                 'error': str(e),
-                'compressed_size': len(compressed_data)
+                'zstd_compressed_size': len(compressed_data)
             }
