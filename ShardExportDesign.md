@@ -82,7 +82,6 @@ import pyarrow as pa
 # schema = pa.schema([...]).with_metadata(metadata)
 
 SCHEMA = pa.schema([
-    # Chunk coordinates relative to the shard origin (0-31)
     pa.field('chunk_x', pa.int32(), nullable=False),
     pa.field('chunk_y', pa.int32(), nullable=False),
     pa.field('chunk_z', pa.int32(), nullable=False),
@@ -90,7 +89,8 @@ SCHEMA = pa.schema([
     # Custom data fields
     pa.field('labels', pa.list_(pa.uint64()), nullable=False),
     pa.field('supervoxels', pa.list_(pa.uint64()), nullable=False),
-    pa.field('compressed_dvid_block', pa.binary(), nullable=False)
+    pa.field('compressed_dvid_block', pa.binary(), nullable=False),
+    pa.field('uncompressed_size', pa.uint32(), nullable=False)
 ])
 ```
 
@@ -210,4 +210,65 @@ def read_single_shard_chunk(transform: ts.IndexTransform, shard_gcs_path: str) -
 # The main loop remains structurally the same, but now calls the efficient
 # read function. (Code for moving files and setting up the copy is omitted for brevity,
 # but it would implement the transactional moves described in section 3.2).
+```
+
+## 6. Handling Multiple Scales: A Two-Step Architecture
+
+A Neuroglancer volume is a multi-resolution pyramid. The architecture must be designed to generate these downsampled scales. The most robust and simple way to achieve this is to separate the initial data ingestion from the downsampling process.
+
+This separation confirms that the main distributed pipeline **only needs to know about the full-resolution (Scale 0) data**. This validates the design choice of a fixed `2048x2048x2048` shard size and a fixed `32x32x32` chunk index, as this is the only format the ingestion workers will ever encounter.
+
+### Step 1: Ingest Full-Resolution Data (Scale 0)
+
+This is the entire process described in sections 3, 4, and 5. The distributed workers convert all the sharded Arrow files into the `scale 0` layer of the Neuroglancer volume on GCS. At the end of this step, the full-resolution dataset is complete.
+
+### Step 2: Generate Downsampled Scales (Post-Processing)
+
+After Step 1 is 100% complete, a separate, much simpler program is run. This program's job is to create the lower-resolution scales. It does **not** read from the original Arrow files; it reads directly from the Scale 0 data already on GCS.
+
+This can be run on a single large machine, as the process is less complex than the initial ingestion.
+
+The script would look like this:
+
+```python
+# A separate script, run only after the main ingestion pipeline is finished.
+import tensorstore as ts
+
+# This spec must define the entire scale pyramid so TensorStore
+# knows the structure of the volume.
+dest_spec = {
+    'driver': 'neuroglancer_precomputed',
+    'kvstore': {'driver': 'gcs', 'bucket': 'your-bucket', 'path': 'path/to/global-volume'},
+    'metadata': {
+        'data_type': 'uint64',
+        'num_channels': 1,
+        'scales': [
+            # Scale 0 (Already written by the workers)
+            {'key': 'scale_0', 'size': [94088, 78317, 134576], 'resolution': [8, 8, 8], 'chunk_sizes': [[64, 64, 64]]},
+            # Scale 1 (This is what we will generate now)
+            {'key': 'scale_1', 'size': [47044, 39159, 67288], 'resolution': [16, 16, 16], 'chunk_sizes': [[64, 64, 64]]},
+            # ... more scales can be defined here
+        ]
+    },
+    'open': True,
+    'create': False # We are opening the existing volume
+}
+
+# Open a handle to the entire multi-scale volume
+full_volume = ts.open(dest_spec).result()
+
+print("Starting downsampling from Scale 0 to Scale 1...")
+
+# This single command tells TensorStore to generate all chunks for Scale 1.
+# It reads from scale_0, computes the downsampled data, and writes to scale_1.
+ts.downsample(
+    source=full_volume.T['key', 'scale_0'],
+    target=full_volume.T['key', 'scale_1'],
+    downsample_factors=[2, 2, 2],
+    # For uint64 segmentation, 'mode' (majority vote) is the correct method.
+    method='mode'
+).result()
+
+print("Downsampling to Scale 1 complete.")
+# This process can be repeated for subsequent scales.
 ```

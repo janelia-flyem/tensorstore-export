@@ -1,6 +1,6 @@
 # The export-shards architecture
 
-The `export-shards` RPC command creates Arrow IPC files that are partitioned into neuroglancer shards, 
+The [DVID](https://github.com/janelia-flyem/dvid) `export-shards` RPC command creates Arrow IPC files that are partitioned into neuroglancer shards, 
 where each DVID block is written as an Arrow record while traversing the segmentation database in ZYX 
 order. Since TensorStore may request blocks (chunks) in a non-ZYX Morton order, we need to use a shard file 
 format optimized for fast, random-access record reads.
