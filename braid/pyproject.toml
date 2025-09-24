@@ -10,12 +10,12 @@ authors = [
 ]
 description = "BRAID - A Python library for chunked segmentation data with sharded Arrow files"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "BSD-3-Clause"}
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: BSD License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -27,20 +27,20 @@ classifiers = [
 keywords = ["blocks", "chunks", "sharding", "segmentation", "arrow", "neuroglancer", "compression", "neuroscience"]
 
 dependencies = [
-    "numpy>=1.20.0",
+    "numpy>=1.24.0",
     "pyarrow>=18.0.0",
-    "zstandard>=0.18.0",
+    "zstandard>=0.22.0",
 ]
 
 [project.optional-dependencies]
-gcs = ["google-cloud-storage>=2.0.0"]
+gcs = ["google-cloud-storage>=2.10.0"]
 dev = [
-    "pytest>=6.0",
-    "pytest-cov>=3.0",
-    "black>=22.0",
-    "isort>=5.0",
-    "flake8>=4.0",
-    "mypy>=0.900",
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "black>=24.0",
+    "isort>=5.12.0",
+    "flake8>=6.0",
+    "mypy>=1.8.0",
 ]
 
 [project.urls]
