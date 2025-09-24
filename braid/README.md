@@ -1,5 +1,5 @@
 # BRAID
-A Python library for reading segmentation data from spatially-partitioned sharded Arrow files with efficient block-wise access and support for multiple label types and compression backends.
+A Python library for reading segmentation data from spatially-partitioned sharded Arrow files with efficient block-wise access and support for multiple levels of labels and compression backends.
 
 ## Overview
 

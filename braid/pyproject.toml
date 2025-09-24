@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "braid"
-version = "1.0.0"
+version = "0.5.0"
 authors = [
     {name = "BRAID Development Team"},
 ]
@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -27,7 +28,7 @@ keywords = ["blocks", "chunks", "sharding", "segmentation", "arrow", "neuroglanc
 
 dependencies = [
     "numpy>=1.20.0",
-    "pyarrow>=10.0.0",
+    "pyarrow>=18.0.0",
     "zstandard>=0.18.0",
 ]
 
@@ -43,9 +44,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/braid"
-Repository = "https://github.com/your-org/braid.git"
-Issues = "https://github.com/your-org/braid/issues"
+Homepage = "https://github.com/JaneliaSciComp/braid"
+Repository = "https://github.com/JaneliaSciComp/braid.git"
+Issues = "https://github.com/JaneliaSciComp/braid/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -55,14 +56,14 @@ where = ["src"]
 
 [tool.black]
 line-length = 100
-target-version = ["py38", "py39", "py310", "py311"]
+target-version = ["py310", "py311", "py312"]
 
 [tool.isort]
 profile = "black"
 line_length = 100
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
