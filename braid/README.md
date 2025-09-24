@@ -1,18 +1,24 @@
-# BRAID: Block Records Arrow Indexed Dataset
-
-A Python library for reading chunked segmentation data from sharded Arrow files with efficient chunk-wise access and support for multiple label types and compression backends.
+# BRAID
+A Python library for reading segmentation data from spatially-partitioned sharded Arrow files with efficient block-wise access and support for multiple label types and compression backends.
 
 ## Overview
 
-BRAID provides a unified interface for reading sharded Arrow files where individual block records are "braided" together into indexed datasets. It supports:
+BRAID provides an interface for efficient Arrow-based reading of large-scale (> TB) segmentation data. It was created to handle management of segmentation between different services, exploiting Arrow's zero-copy, multi-language ecosystem. In particular, it can be combined with `virtual_chunked` driver functions in [tensorstore](https://github.com/Google/tensorstore) to allow very memory-efficient reformatting to a variety of large-scale segmentation formats (e.g., zarr version 3 or neuroglancer precomputed volumes), see [tensorstore-export](https://github.com/JaneliaSciComp/tensorstore-export). From a data perspective, there are three levels of organization from small to large scale:
 
-- **Chunk-wise access**: Read individual chunks by coordinates
-- **Multiple label types**: Choose between agglomerated labels, supervoxel labels, or custom label sets  
-- **Pluggable compression**: Supports DVID compression with extensible backend system
-- **Fast lookups**: Uses CSV indices for O(1) chunk coordinate lookups
+1. **Block Records**: Individual chunks of 3D compressed segmentation data
+2. **Shard Files**: Collections of block records in Arrow format with accompanying CSV chunk indices  
+3. **Dataset**: Multiple shard files that together form the complete volume
+
+It supports:
+
+- **Efficient packaging**: Shard files package billions of block records improving object counts.
+- **Block-wise access**: Read individual blocks (chunks) by coordinates
+- **Fast lookups**: Uses CSV indices for O(1) block coordinate lookups
+- **Levels of labels**: Choose between agglomerated labels or supervoxel (atomic) labels 
+- **Pluggable compression**: Supports Zstd + DVID segmentation compression with extensible backend system
 - **Error handling**: Comprehensive error handling and validation
 
-The name BRAID evokes the concept of braiding individual block records into shard files, which in turn are like braids that come together to form the complete dataset.
+**BRAID** is an acronym for **Block Records Arrow Indexed Dataset**. The name evokes the concept of braiding individual block records into shard files, which in turn are like braids that come together to form the complete dataset. This metaphor captures both the technical structure (records → shards → dataset) and the parallel nature of how workers process large-scale datasets. Currently, the shape of the braids are shard subvolumes as defined by a given dataset's parameters.
 
 ## Installation
 
@@ -158,24 +164,7 @@ isort src/ tests/
 mypy src/
 ```
 
-## Architecture
-
-BRAID is designed around the concept of "braiding" block records:
-
-1. **Block Records**: Individual chunks of segmentation data
-2. **Shard Files**: Collections of block records in Arrow format with CSV indices  
-3. **Dataset**: Multiple shard files that together form the complete volume
-
-This architecture provides:
-- Efficient random access to any chunk
-- Scalable storage across multiple files
-- Fast coordinate-based lookups
-- Support for different compression schemes
-
 ## License
 
-MIT License - see LICENSE file for details.
+Janelia provides this under a [modified BSD 3-Clause License](LICENSE). 
 
-## Name Origin
-
-**BRAID** stands for **Block Records Arrow Indexed Dataset**. The name evokes the concept of braiding individual block records into shard files, which in turn are like braids that come together to form the complete dataset. This metaphor captures both the technical structure (records → shards → dataset) and the collaborative nature of how the data is assembled.
