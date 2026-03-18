@@ -9,6 +9,7 @@ This module specifically tests the interaction between:
 
 import struct
 import unittest
+from pathlib import Path
 import numpy as np
 import zstandard as zstd
 
@@ -66,34 +67,28 @@ class TestCompressionLayers(unittest.TestCase):
 
     def test_real_data_compression_efficiency(self):
         """Test compression efficiency with real DVID data."""
-        try:
-            import gzip
-            # Load real DVID data
-            with gzip.open('../research/fib19-64x64x64-sample1-block.dat.gz', 'rb') as f:
-                real_dvid_data = f.read()
-
-            # Apply zstd compression
-            zstd_compressed = self.zstd_compressor.compress(real_dvid_data)
-
-            # Calculate compression metrics
-            dvid_size = len(real_dvid_data)
-            zstd_size = len(zstd_compressed)
-            compression_ratio = dvid_size / zstd_size
-
-            # Verify compression is beneficial
-            self.assertGreater(compression_ratio, 2.0)  # Should get at least 2x compression
-
-            # Test decompression works
-            result = self.decompressor.decompress_block(zstd_compressed)
-            self.assertEqual(result.shape, (64, 64, 64))
-
-            print(f"\nReal data compression results:")
-            print(f"  DVID size: {dvid_size:,} bytes")
-            print(f"  zstd size: {zstd_size:,} bytes")
-            print(f"  Compression ratio: {compression_ratio:.2f}x")
-
-        except (FileNotFoundError, ImportError):
+        import gzip
+        block_path = Path(__file__).parent / "test_data" / "fib19-64x64x64-sample1-block.dat.gz"
+        if not block_path.exists():
             self.skipTest("Real DVID test data not available")
+
+        with gzip.open(block_path, "rb") as f:
+            real_dvid_data = f.read()
+
+        # Apply zstd compression
+        zstd_compressed = self.zstd_compressor.compress(real_dvid_data)
+
+        # Calculate compression metrics
+        dvid_size = len(real_dvid_data)
+        zstd_size = len(zstd_compressed)
+        compression_ratio = dvid_size / zstd_size
+
+        # Verify compression is beneficial
+        self.assertGreater(compression_ratio, 2.0)  # Should get at least 2x compression
+
+        # Test decompression works
+        result = self.decompressor.decompress_block(zstd_compressed)
+        self.assertEqual(result.shape, (64, 64, 64))
 
     def test_label_mapping_through_layers(self):
         """Test that label mapping works correctly through both compression layers."""

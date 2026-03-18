@@ -7,6 +7,7 @@ Tests both the DVID segmentation compression and zstd compression layers.
 
 import struct
 import unittest
+from pathlib import Path
 from typing import List, Optional
 import numpy as np
 import zstandard as zstd
@@ -155,7 +156,9 @@ class TestDVIDDecompressor(unittest.TestCase):
 
 
 class TestRealDataIntegration(unittest.TestCase):
-    """Test with real DVID data if available."""
+    """Test with real DVID data from test_data/ directory."""
+
+    TEST_DATA_DIR = Path(__file__).parent / "test_data"
 
     def setUp(self):
         """Set up test fixtures."""
@@ -163,34 +166,31 @@ class TestRealDataIntegration(unittest.TestCase):
         self.zstd_compressor = zstd.ZstdCompressor()
 
     def test_real_dvid_data(self):
-        """Test with real DVID compressed data if available."""
-        try:
-            import gzip
-            # Try to load real test data (relative to braid directory)
-            test_data_path = '../research/fib19-64x64x64-sample1-block.dat.gz'
-
-            with gzip.open(test_data_path, 'rb') as f:
-                real_dvid_data = f.read()
-
-            # Apply zstd compression to simulate shard format
-            zstd_compressed = self.zstd_compressor.compress(real_dvid_data)
-
-            # Test decompression
-            result = self.decompressor.decompress_block(zstd_compressed)
-
-            self.assertEqual(result.shape, (64, 64, 64))
-            self.assertEqual(result.dtype, np.uint64)
-
-            # Should have multiple unique labels
-            unique_labels = np.unique(result)
-            self.assertGreater(len(unique_labels), 1)
-
-            # Test compression efficiency
-            compression_ratio = len(real_dvid_data) / len(zstd_compressed)
-            self.assertGreater(compression_ratio, 1.0)  # Should provide some compression
-
-        except (FileNotFoundError, ImportError):
+        """Test decompression of real DVID compressed block."""
+        import gzip
+        block_path = self.TEST_DATA_DIR / 'fib19-64x64x64-sample1-block.dat.gz'
+        if not block_path.exists():
             self.skipTest("Real DVID test data not available")
+
+        with gzip.open(block_path, 'rb') as f:
+            real_dvid_data = f.read()
+
+        # Apply zstd compression to simulate shard format
+        zstd_compressed = self.zstd_compressor.compress(real_dvid_data)
+
+        # Test decompression
+        result = self.decompressor.decompress_block(zstd_compressed)
+
+        self.assertEqual(result.shape, (64, 64, 64))
+        self.assertEqual(result.dtype, np.uint64)
+
+        # Should have multiple unique labels
+        unique_labels = np.unique(result)
+        self.assertGreater(len(unique_labels), 1)
+
+        # Test compression efficiency
+        compression_ratio = len(real_dvid_data) / len(zstd_compressed)
+        self.assertGreater(compression_ratio, 1.0)
 
 
 if __name__ == '__main__':

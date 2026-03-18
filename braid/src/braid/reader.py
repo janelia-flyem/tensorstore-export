@@ -13,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.ipc as ipc
 from .decompressor import DVIDDecompressor
-from .exceptions import BraidError, ChunkNotFoundError, InvalidShardFormatError, InvalidCoordinateError
+from .exceptions import BraidError, ChunkNotFoundError, DecompressionError, InvalidShardFormatError, InvalidCoordinateError
 
 
 class LabelType(Enum):

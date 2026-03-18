@@ -2,6 +2,7 @@
 Pytest configuration and shared fixtures for braid tests.
 """
 
+import csv
 import pytest
 import tempfile
 import struct
@@ -61,6 +62,29 @@ def sample_arrow_data(solid_dvid_block, zstd_compressor):
     }
 
     return pa.table(data, schema=schema)
+
+
+@pytest.fixture
+def two_label_dvid_block():
+    """Create a two-label DVID block split along Z axis.
+
+    Bottom half (z < 32) gets label_a, top half (z >= 32) gets label_b.
+    Each 8x8x8 sub-block is solid (single label).
+    """
+    def _create_block(label_a: int = 10, label_b: int = 20) -> bytes:
+        gx, gy, gz = 8, 8, 8
+        header = struct.pack('<IIII', gx, gy, gz, 2)
+        labels_data = struct.pack('<QQ', label_a, label_b)
+        num_sub_blocks = gx * gy * gz
+        num_sb_labels = struct.pack('<' + 'H' * num_sub_blocks, *([1] * num_sub_blocks))
+        sb_indices = []
+        for sz in range(gz):
+            for sy in range(gy):
+                for sx in range(gx):
+                    sb_indices.append(0 if sz < gz // 2 else 1)
+        sb_indices_data = struct.pack('<' + 'I' * num_sub_blocks, *sb_indices)
+        return header + labels_data + num_sb_labels + sb_indices_data
+    return _create_block
 
 
 @pytest.fixture

@@ -136,16 +136,17 @@ def test_read_chunk_with_labels(sample_shard_files):
     """Test reading chunk with agglomerated labels."""
     arrow_path, csv_path = sample_shard_files
     reader = ShardReader(arrow_path, csv_path)
-    
-    # Mock the decompressor to return predictable data
-    def mock_decompress(compressed_data, labels, uncompressed_size, block_shape):
-        # Return array filled with first label
-        return np.full(block_shape, labels[0], dtype=np.uint64)
-    
+
+    # Mock the decompressor to return predictable data.
+    # Signature must match DVIDDecompressor.decompress_block kwargs.
+    def mock_decompress(compressed_data, agglo_labels=None, supervoxels=None, block_shape=(64,64,64)):
+        # Return array filled with first agglomerated label
+        return np.full(block_shape, agglo_labels[0], dtype=np.uint64)
+
     reader._decompressor.decompress_block = mock_decompress
-    
+
     chunk = reader.read_chunk(0, 0, 0, label_type=LabelType.LABELS)
-    
+
     assert chunk.shape == (64, 64, 64)
     assert chunk.dtype == np.uint64
     assert np.all(chunk == 1)  # Should be filled with first label
@@ -155,15 +156,15 @@ def test_read_chunk_with_supervoxels(sample_shard_files):
     """Test reading chunk with supervoxel labels."""
     arrow_path, csv_path = sample_shard_files
     reader = ShardReader(arrow_path, csv_path)
-    
-    # Mock the decompressor
-    def mock_decompress(compressed_data, labels, uncompressed_size, block_shape):
-        return np.full(block_shape, labels[0], dtype=np.uint64)
-    
+
+    # Mock the decompressor. For SUPERVOXELS, reader passes agglo_labels=supervoxels.
+    def mock_decompress(compressed_data, agglo_labels=None, supervoxels=None, block_shape=(64,64,64)):
+        return np.full(block_shape, agglo_labels[0], dtype=np.uint64)
+
     reader._decompressor.decompress_block = mock_decompress
-    
+
     chunk = reader.read_chunk(0, 0, 0, label_type=LabelType.SUPERVOXELS)
-    
+
     assert chunk.shape == (64, 64, 64)
     assert chunk.dtype == np.uint64
     assert np.all(chunk == 100)  # Should be filled with first supervoxel
