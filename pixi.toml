@@ -9,10 +9,22 @@ platforms = ["linux-64"]
 python = ">=3.10,<3.13"
 
 [pypi-dependencies]
+# Core data libraries
 numpy = ">=1.24.0"
 pyarrow = ">=18.0.0"
 zstandard = ">=0.22.0"
 tensorstore = ">=0.1.70"
+
+# Cloud / production
+google-cloud-storage = ">=2.10.0"
+google-cloud-logging = ">=3.8.0"
+structlog = ">=23.2.0"
+pydantic = ">=2.5.0"
+pydantic-settings = ">=2.1.0"
+click = ">=8.1.0"
+gcsfs = ">=2024.2.0"
+
+# Testing
 pytest = ">=8.0"
 pytest-cov = ">=4.0"
 
@@ -23,3 +35,4 @@ braid = { path = "braid", editable = true }
 test-braid = "pytest braid/tests/ -v --no-header"
 test-e2e = "pytest braid/tests/test_e2e_precomputed.py -v --no-header"
 test-all = "pytest braid/tests/ -v --no-header"
+deploy = "python scripts/deploy.py"

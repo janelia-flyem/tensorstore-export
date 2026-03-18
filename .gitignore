@@ -1,0 +1,17 @@
+# Environment config (contains project-specific values)
+.env
+
+# Pixi environment
+.pixi/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Test artifacts
+.coverage
+.pytest_cache/
+htmlcov/

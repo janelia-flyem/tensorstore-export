@@ -255,46 +255,89 @@ class SingleShardAdapter:
             return ts.Future[ts.TimestampedStorageGeneration].exception(e)
 
 
-def create_neuroglancer_destination(bucket: str, path: str, volume_shape: Tuple[int, int, int], 
-                                  resolution: Tuple[int, int, int] = (8, 8, 8),
-                                  chunk_shape: Tuple[int, int, int] = (64, 64, 64)) -> ts.TensorStore:
+def create_neuroglancer_destination(bucket: str, path: str,
+                                    ng_spec: Optional[Dict[str, Any]] = None,
+                                    volume_shape: Optional[Tuple[int, int, int]] = None,
+                                    resolution: Tuple[int, int, int] = (8, 8, 8),
+                                    chunk_shape: Tuple[int, int, int] = (64, 64, 64)) -> ts.TensorStore:
     """
     Create a Neuroglancer precomputed destination volume on GCS.
-    
+
+    If ng_spec is provided (the neuroglancer multiscale volume JSON used by
+    DVID export-shards), the info file is written with the full sharding
+    configuration so the output volume matches the shard partitioning exactly.
+    Otherwise falls back to a simple unsharded single-scale spec.
+
     Args:
         bucket: GCS bucket name
         path: Path within bucket
-        volume_shape: Total volume shape (z, y, x)
-        resolution: Voxel resolution in nanometers (z, y, x)
-        chunk_shape: Chunk size for storage
-        
+        ng_spec: Full neuroglancer multiscale volume spec dict (optional)
+        volume_shape: Total volume shape (x, y, z) — used only if ng_spec is None
+        resolution: Voxel resolution in nm — used only if ng_spec is None
+        chunk_shape: Chunk size — used only if ng_spec is None
+
     Returns:
-        TensorStore for Neuroglancer precomputed volume
+        TensorStore for Neuroglancer precomputed volume (scale 0)
     """
-    spec = {
-        'driver': 'neuroglancer_precomputed',
-        'kvstore': {
-            'driver': 'gcs',
-            'bucket': bucket,
-            'path': path
-        },
-        'metadata': {
-            'data_type': 'uint64',
-            'num_channels': 1,
-            'scales': [{
+    import json as _json
+    from google.cloud import storage as gcs
+
+    if ng_spec and ng_spec.get("scales"):
+        # Write the full info file from the ng spec so sharding params are correct.
+        info = dict(ng_spec)  # shallow copy
+        # TensorStore expects the info file to live at <path>/info
+        client = gcs.Client()
+        info_blob = client.bucket(bucket).blob(f"{path}/info")
+        if not info_blob.exists():
+            info_blob.upload_from_string(
+                _json.dumps(info, indent=2),
+                content_type="application/json",
+            )
+            logger.info("Wrote neuroglancer info file",
+                        bucket=bucket, path=f"{path}/info",
+                        num_scales=len(info["scales"]))
+
+        spec = {
+            'driver': 'neuroglancer_precomputed',
+            'kvstore': {
+                'driver': 'gcs',
+                'bucket': bucket,
+                'path': path,
+            },
+            'scale_index': 0,
+            'open': True,
+        }
+    else:
+        # Fallback: minimal single-scale spec without sharding
+        if volume_shape is None:
+            raise ValueError("Either ng_spec or volume_shape must be provided")
+        spec = {
+            'driver': 'neuroglancer_precomputed',
+            'kvstore': {
+                'driver': 'gcs',
+                'bucket': bucket,
+                'path': path,
+            },
+            'multiscale_metadata': {
+                'data_type': 'uint64',
+                'num_channels': 1,
+                'type': 'segmentation',
+            },
+            'scale_metadata': {
                 'key': f'{volume_shape[0]}_{volume_shape[1]}_{volume_shape[2]}',
                 'size': list(volume_shape),
                 'resolution': list(resolution),
-                'chunk_sizes': [list(chunk_shape)]
-            }]
+                'encoding': 'raw',
+            },
+            'scale_index': 0,
+            'create': True,
+            'delete_existing': False,
         }
-    }
-    
-    store = ts.open(spec, create=True, delete_existing=False).result()
-    
-    logger.info("Created Neuroglancer destination", 
-               bucket=bucket, 
-               path=path,
-               volume_shape=volume_shape)
-    
+
+    store = ts.open(spec).result()
+
+    logger.info("Opened Neuroglancer destination",
+                bucket=bucket, path=path,
+                domain=str(store.domain))
+
     return store

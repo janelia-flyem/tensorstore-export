@@ -6,10 +6,12 @@ and writing them to a Neuroglancer precomputed volume, using the transactional
 file movement strategy described in ShardExportDesign.md.
 """
 
+import base64
+import json
 import os
 import time
 import asyncio
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 from pathlib import Path
 import structlog
 import tensorstore as ts
@@ -23,18 +25,21 @@ logger = structlog.get_logger()
 
 class WorkerConfig(BaseModel):
     """Configuration for the Cloud Run worker."""
-    
+
     # GCS configuration
     source_bucket: str
     dest_bucket: str
     dest_path: str
-    
-    # Volume configuration  
-    total_volume_shape: Tuple[int, int, int]  # (z, y, x)
-    shard_shape: Tuple[int, int, int] = (2048, 2048, 2048)
+
+    # Neuroglancer multiscale volume spec (the same JSON used for DVID export-shards).
+    # This is the single source of truth for volume geometry and sharding parameters.
+    ng_spec: Dict[str, Any]
+
+    # Volume configuration derived from ng_spec scale 0
+    total_volume_shape: Tuple[int, int, int]  # (x, y, z) from spec
     chunk_shape: Tuple[int, int, int] = (64, 64, 64)
     resolution: Tuple[int, int, int] = (8, 8, 8)  # nm
-    
+
     # Worker behavior
     max_processing_time_minutes: int = 55  # Cloud Run timeout is 60min
     polling_interval_seconds: int = 10
@@ -325,17 +330,43 @@ class CloudRunWorker:
 
 # Environment variable configuration
 def create_config_from_env() -> WorkerConfig:
-    """Create worker configuration from environment variables."""
+    """Create worker configuration from environment variables.
+
+    The NG_SPEC env var is a base64-encoded neuroglancer multiscale volume
+    spec JSON — the same file used for DVID's export-shards command.  Volume
+    geometry and sharding parameters are derived from it.
+    """
+    ng_spec_b64 = os.environ.get("NG_SPEC")
+    if not ng_spec_b64:
+        # Fall back to flat env vars for backwards compatibility
+        volume_shape = tuple(map(int, os.environ["VOLUME_SHAPE"].split(",")))
+        ng_spec = {}
+    else:
+        ng_spec = json.loads(base64.b64decode(ng_spec_b64))
+        scale0 = ng_spec["scales"][0]
+        volume_shape = tuple(int(v) for v in scale0["size"])
+
+    chunk_shape = tuple(map(int, os.environ.get("CHUNK_SHAPE", "64,64,64").split(",")))
+    resolution = tuple(map(int, os.environ.get("RESOLUTION", "8,8,8").split(",")))
+
+    # If we have the spec, override chunk_shape and resolution from scale 0
+    if ng_spec and "scales" in ng_spec:
+        scale0 = ng_spec["scales"][0]
+        if scale0.get("chunk_sizes"):
+            chunk_shape = tuple(int(v) for v in scale0["chunk_sizes"][0])
+        if scale0.get("resolution"):
+            resolution = tuple(int(v) for v in scale0["resolution"])
+
     return WorkerConfig(
         source_bucket=os.environ["SOURCE_BUCKET"],
-        dest_bucket=os.environ["DEST_BUCKET"], 
+        dest_bucket=os.environ["DEST_BUCKET"],
         dest_path=os.environ["DEST_PATH"],
-        total_volume_shape=tuple(map(int, os.environ["VOLUME_SHAPE"].split(','))),
-        shard_shape=tuple(map(int, os.environ.get("SHARD_SHAPE", "2048,2048,2048").split(','))),
-        chunk_shape=tuple(map(int, os.environ.get("CHUNK_SHAPE", "64,64,64").split(','))),
-        resolution=tuple(map(int, os.environ.get("RESOLUTION", "8,8,8").split(','))),
+        ng_spec=ng_spec,
+        total_volume_shape=volume_shape,
+        chunk_shape=chunk_shape,
+        resolution=resolution,
         max_processing_time_minutes=int(os.environ.get("MAX_PROCESSING_TIME", "55")),
-        polling_interval_seconds=int(os.environ.get("POLLING_INTERVAL", "10"))
+        polling_interval_seconds=int(os.environ.get("POLLING_INTERVAL", "10")),
     )
 
 
