@@ -71,3 +71,23 @@ BRAID's `test_real_data.py::TestGroundTruthRoundtrip` replicates step 5-6 in Pyt
 5. Assert all 262,144 voxels match exactly
 
 This proves the Python decompressor is equivalent to Go's `MakeLabelVolume()`.
+
+## Go-produced Arrow IPC shard files
+
+These files were copied from a real mCNS `export-shards` run and test the full cross-language pipeline: Go Arrow writer → Python Arrow reader → DVID decompression.
+
+| File | Format | Records | Source |
+|------|--------|---------|--------|
+| `30720_24576_28672.arrow` | Arrow IPC Stream | 258 | mCNS scale 1, edge shard |
+| `30720_24576_28672.csv` | CSV index (x,y,z,rec) | 258 rows | Companion index |
+
+**Important**: DVID writes Arrow IPC **Streaming** format (sequential), not the File format (random-access with footer). BRAID's `ShardReader` handles both formats transparently.
+
+The shard origin `(30720, 24576, 28672)` is in voxel coordinates at scale 1. Each shard covers a 2048-voxel cube, so chunk coordinates fall in `[origin/64, (origin+2048)/64)` per dimension. This is a sparse edge shard from the boundary of the brain volume, containing a mix of empty (label 0) and labeled regions.
+
+The test `test_go_produced_shard.py` verifies:
+- Arrow schema compatibility between Go writer and Python reader
+- CSV index coordinates match Arrow record fields
+- All 258 chunks decompress to 64x64x64 uint64 arrays
+- Decompressed supervoxel values are subsets of each chunk's supervoxel list
+- Agglomerated label mapping produces values from each chunk's labels list

@@ -161,3 +161,7 @@ test_output/
 *.arrow
 *.csv
 temp_shard_*
+
+# Allow test data fixtures
+!tests/test_data/*.arrow
+!tests/test_data/*.csv

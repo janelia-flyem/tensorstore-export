@@ -75,10 +75,20 @@ class ShardReader:
         self._validate_data()
         
     def _load_arrow_data(self) -> pa.Table:
-        """Load Arrow IPC table from file."""
+        """Load Arrow IPC table from file.
+
+        Supports both Arrow IPC File format (Feather V2, has footer with
+        random access) and Arrow IPC Streaming format (sequential).  DVID's
+        export-shards currently writes the streaming format.
+        """
         try:
             with open(self.arrow_path, 'rb') as f:
-                with ipc.open_file(f) as reader:
+                try:
+                    reader = ipc.open_file(f)
+                    return reader.read_all()
+                except pa.ArrowInvalid:
+                    f.seek(0)
+                    reader = ipc.open_stream(f)
                     return reader.read_all()
         except Exception as e:
             raise BraidError(f"Failed to load Arrow file {self.arrow_path}: {e}")
