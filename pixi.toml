@@ -35,4 +35,5 @@ braid = { path = "braid", editable = true }
 test-braid = "pytest braid/tests/ -v --no-header"
 test-e2e = "pytest braid/tests/test_e2e_precomputed.py -v --no-header"
 test-all = "pytest braid/tests/ -v --no-header"
+setup-destination = "python scripts/setup_destination.py"
 deploy = "python scripts/deploy.py"

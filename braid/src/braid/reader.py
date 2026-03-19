@@ -2,18 +2,31 @@
 BRAID Shard Reader class.
 
 Provides chunk-wise access to sharded Arrow files with CSV coordinate indices.
-Supports multiple compression backends and label types.
+Supports local files and cloud storage (GCS, S3) transparently via PyArrow's
+native filesystem abstraction.
 """
 
-import csv
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Tuple, Union, Optional
 import numpy as np
 import pyarrow as pa
+import pyarrow.csv as pcsv
+import pyarrow.fs as pafs
 import pyarrow.ipc as ipc
 from .decompressor import DVIDDecompressor
 from .exceptions import BraidError, ChunkNotFoundError, DecompressionError, InvalidShardFormatError, InvalidCoordinateError
+
+
+def _resolve_fs(path: str) -> Tuple[pafs.FileSystem, str]:
+    """Resolve a path string to a PyArrow filesystem and normalized path.
+
+    Handles local paths and URI schemes (gs://, s3://, etc.) transparently.
+    For local paths, resolves to absolute path for consistency.
+    """
+    if "://" in path:
+        return pafs.FileSystem.from_uri(path)
+    return pafs.LocalFileSystem(), str(Path(path).resolve())
 
 
 class LabelType(Enum):
@@ -25,173 +38,164 @@ class LabelType(Enum):
 class ShardReader:
     """
     BRAID shard reader for Arrow files with CSV coordinate indices.
-    
-    This class provides efficient chunk-wise access to sharded segmentation data
-    with support for multiple label types and compression backends.
-    
+
+    Reads Arrow IPC shard files and CSV chunk indices from local disk or
+    cloud storage (GCS, S3) using PyArrow's native filesystem layer.
+    All I/O stays in Arrow's C++ runtime for efficiency.
+
     Example:
+        >>> # Local files
         >>> reader = ShardReader("shard_0_0_0.arrow", "shard_0_0_0.csv")
+
+        >>> # GCS files (zero temp files, C++ native I/O)
+        >>> reader = ShardReader(
+        ...     "gs://bucket/shards/s0/0_0_0.arrow",
+        ...     "gs://bucket/shards/s0/0_0_0.csv",
+        ... )
+
         >>> chunk_data = reader.read_chunk(64, 128, 0, label_type=LabelType.LABELS)
         >>> print(chunk_data.shape)  # (64, 64, 64)
-        >>> print(chunk_data.dtype)  # uint64
     """
-    
+
     # Expected Arrow schema for shard files (compatible with DVID export format)
     EXPECTED_SCHEMA = pa.schema([
         pa.field('chunk_x', pa.int32(), nullable=False),
-        pa.field('chunk_y', pa.int32(), nullable=False), 
+        pa.field('chunk_y', pa.int32(), nullable=False),
         pa.field('chunk_z', pa.int32(), nullable=False),
         pa.field('labels', pa.list_(pa.uint64()), nullable=False),
         pa.field('supervoxels', pa.list_(pa.uint64()), nullable=False),
         pa.field('dvid_compressed_block', pa.binary(), nullable=False),
         pa.field('uncompressed_size', pa.uint32(), nullable=False)
     ])
-    
+
     def __init__(self, arrow_path: Union[str, Path], csv_path: Union[str, Path]):
         """
         Initialize BRAID shard reader.
-        
+
         Args:
-            arrow_path: Path to the Arrow IPC shard file
-            csv_path: Path to the CSV chunk index file
-            
+            arrow_path: Path or URI to the Arrow IPC shard file (local, gs://, s3://)
+            csv_path: Path or URI to the CSV chunk index file
+
         Raises:
             BraidError: If files cannot be loaded or have invalid format
         """
-        self.arrow_path = Path(arrow_path)
-        self.csv_path = Path(csv_path)
-        
-        if not self.arrow_path.exists():
-            raise BraidError(f"Arrow file not found: {arrow_path}")
-        if not self.csv_path.exists():
-            raise BraidError(f"CSV file not found: {csv_path}")
-        
+        self.arrow_path = str(arrow_path)
+        self.csv_path = str(csv_path)
+
+        # Resolve filesystems and check existence
+        self._arrow_fs, self._arrow_resolved = _resolve_fs(self.arrow_path)
+        info = self._arrow_fs.get_file_info(self._arrow_resolved)
+        if info.type == pafs.FileType.NotFound:
+            raise BraidError(f"Arrow file not found: {self.arrow_path}")
+
+        self._csv_fs, self._csv_resolved = _resolve_fs(self.csv_path)
+        info = self._csv_fs.get_file_info(self._csv_resolved)
+        if info.type == pafs.FileType.NotFound:
+            raise BraidError(f"CSV file not found: {self.csv_path}")
+
         # Load data during initialization
         self._table = self._load_arrow_data()
         self._chunk_index = self._load_csv_index()
         self._decompressor = DVIDDecompressor()
-        
+
         # Validate loaded data
         self._validate_data()
-        
-    def _load_arrow_data(self) -> pa.Table:
-        """Load Arrow IPC table from file.
 
-        Supports both Arrow IPC File format (Feather V2, has footer with
-        random access) and Arrow IPC Streaming format (sequential).  DVID's
-        export-shards currently writes the streaming format.
+    def _load_arrow_data(self) -> pa.Table:
+        """Load Arrow IPC table via PyArrow's native filesystem.
+
+        Data flows through Arrow's C++ runtime (NativeFile → IPC reader → Table).
+        Tries File format first (seekable, random access) then falls back to
+        Streaming format (sequential) which DVID's export-shards writes.
         """
         try:
-            with open(self.arrow_path, 'rb') as f:
-                try:
-                    reader = ipc.open_file(f)
-                    return reader.read_all()
-                except pa.ArrowInvalid:
-                    f.seek(0)
-                    reader = ipc.open_stream(f)
-                    return reader.read_all()
+            # Try File format first — needs seekable input (open_input_file)
+            f = self._arrow_fs.open_input_file(self._arrow_resolved)
+            try:
+                reader = ipc.open_file(f)
+                return reader.read_all()
+            except pa.ArrowInvalid:
+                pass
+
+            # Fall back to Streaming format — sequential read is fine
+            f = self._arrow_fs.open_input_stream(self._arrow_resolved)
+            reader = ipc.open_stream(f)
+            return reader.read_all()
         except Exception as e:
+            if isinstance(e, BraidError):
+                raise
             raise BraidError(f"Failed to load Arrow file {self.arrow_path}: {e}")
-    
+
     def _load_csv_index(self) -> Dict[Tuple[int, int, int], int]:
-        """Load CSV chunk index into memory for fast lookup."""
-        chunk_index = {}
-        
+        """Load CSV chunk index using PyArrow's CSV reader.
+
+        Parses entirely in C++ via pyarrow.csv.read_csv(), then builds
+        the Python lookup dict from Arrow columns.
+        """
         try:
-            with open(self.csv_path, 'r') as f:
-                reader = csv.DictReader(f)
-                
-                # Validate CSV headers
-                expected_headers = {'x', 'y', 'z', 'rec'}
-                if not expected_headers.issubset(reader.fieldnames or []):
-                    raise InvalidShardFormatError(
-                        f"CSV file missing required headers. Expected: {expected_headers}, "
-                        f"Found: {reader.fieldnames}"
-                    )
-                
-                for row_num, row in enumerate(reader, 1):
-                    try:
-                        coord_key = (int(row['x']), int(row['y']), int(row['z']))
-                        record_idx = int(row['rec'])
-                        
-                        if record_idx < 0:
-                            raise ValueError(f"Negative record index: {record_idx}")
-                        
-                        chunk_index[coord_key] = record_idx
-                        
-                    except (ValueError, KeyError) as e:
-                        raise InvalidShardFormatError(
-                            f"Invalid CSV format at row {row_num}: {e}"
-                        )
-                        
+            f = self._csv_fs.open_input_stream(self._csv_resolved)
+            table = pcsv.read_csv(f)
+
+            # Validate columns
+            expected = {"x", "y", "z", "rec"}
+            actual = set(table.column_names)
+            if not expected.issubset(actual):
+                raise InvalidShardFormatError(
+                    f"CSV missing required columns. Expected: {expected}, Found: {actual}"
+                )
+
+            # Build lookup dict from Arrow columns
+            xs = table.column("x").to_pylist()
+            ys = table.column("y").to_pylist()
+            zs = table.column("z").to_pylist()
+            recs = table.column("rec").to_pylist()
+            return {(x, y, z): rec for x, y, z, rec in zip(xs, ys, zs, recs)}
+
         except Exception as e:
             if isinstance(e, BraidError):
                 raise
             raise BraidError(f"Failed to load CSV index {self.csv_path}: {e}")
-        
-        return chunk_index
-    
+
     def _validate_data(self):
         """Validate that loaded data is consistent and valid."""
-        # Check Arrow table has expected schema structure
         table_fields = {field.name for field in self._table.schema}
         expected_fields = {field.name for field in self.EXPECTED_SCHEMA}
-        
+
         if not expected_fields.issubset(table_fields):
             missing = expected_fields - table_fields
             raise InvalidShardFormatError(
                 f"Arrow table missing required fields: {missing}"
             )
-        
-        # Check that all CSV record indices are valid
+
         max_record_idx = max(self._chunk_index.values()) if self._chunk_index else -1
         if max_record_idx >= self._table.num_rows:
             raise InvalidShardFormatError(
                 f"CSV references record index {max_record_idx} but table only has "
                 f"{self._table.num_rows} rows"
             )
-    
+
     @property
     def chunk_count(self) -> int:
         """Number of chunks available in this shard."""
         return len(self._chunk_index)
-    
+
     @property
     def available_chunks(self) -> List[Tuple[int, int, int]]:
         """List of all available chunk coordinates (x, y, z)."""
         return list(self._chunk_index.keys())
-    
+
     def has_chunk(self, x: int, y: int, z: int) -> bool:
-        """
-        Check if a chunk exists at the given coordinates.
-        
-        Args:
-            x, y, z: Chunk coordinates
-            
-        Returns:
-            True if chunk exists, False otherwise
-        """
+        """Check if a chunk exists at the given coordinates."""
         return (x, y, z) in self._chunk_index
-    
+
     def get_chunk_info(self, x: int, y: int, z: int) -> Dict[str, any]:
-        """
-        Get metadata about a chunk without decompressing it.
-        
-        Args:
-            x, y, z: Chunk coordinates
-            
-        Returns:
-            Dictionary with chunk metadata
-            
-        Raises:
-            ChunkNotFoundError: If chunk doesn't exist
-        """
+        """Get metadata about a chunk without decompressing it."""
         coord_key = (x, y, z)
         if coord_key not in self._chunk_index:
             raise ChunkNotFoundError(f"Chunk not found at coordinates {coord_key}")
-        
+
         record_idx = self._chunk_index[coord_key]
-        
+
         return {
             'coordinates': coord_key,
             'record_index': record_idx,
@@ -203,55 +207,34 @@ class ShardReader:
             'compressed_size': len(self._table['dvid_compressed_block'][record_idx].as_py()),
             'uncompressed_size': self._table['uncompressed_size'][record_idx].as_py()
         }
-    
-    def read_chunk(self, x: int, y: int, z: int, 
+
+    def read_chunk(self, x: int, y: int, z: int,
                    label_type: LabelType = LabelType.LABELS,
                    chunk_shape: Tuple[int, int, int] = (64, 64, 64)) -> np.ndarray:
-        """
-        Read and decompress a chunk at the given coordinates.
-        
-        Args:
-            x, y, z: Chunk coordinates
-            label_type: Which label type to use (LABELS or SUPERVOXELS)
-            chunk_shape: Expected shape of the output chunk
-            
-        Returns:
-            Decompressed uint64 array of specified shape
-            
-        Raises:
-            ChunkNotFoundError: If chunk doesn't exist
-            InvalidCoordinateError: If coordinates are invalid
-            DecompressionError: If decompression fails
-        """
-        # Validate coordinates
+        """Read and decompress a chunk at the given coordinates."""
         if not all(isinstance(coord, int) and coord >= 0 for coord in [x, y, z]):
             raise InvalidCoordinateError(f"Invalid coordinates: ({x}, {y}, {z})")
-        
+
         coord_key = (x, y, z)
         if coord_key not in self._chunk_index:
             raise ChunkNotFoundError(f"Chunk not found at coordinates {coord_key}")
-        
+
         record_idx = self._chunk_index[coord_key]
-        
+
         try:
-            # Extract data from Arrow record
             labels = self._table['labels'][record_idx].as_py()
             supervoxels = self._table['supervoxels'][record_idx].as_py()
             compressed_data = self._table['dvid_compressed_block'][record_idx].as_py()
-            # Note: uncompressed_size not needed since zstd decompressor handles this automatically
-            
-            # Decompress using DVID decompressor with label mapping
+
             if label_type == LabelType.LABELS:
-                # Use agglomerated labels with supervoxel mapping
-                decompressed_chunk = self._decompressor.decompress_block(
+                return self._decompressor.decompress_block(
                     compressed_data=compressed_data,
                     agglo_labels=labels,
                     supervoxels=supervoxels,
                     block_shape=chunk_shape
                 )
             elif label_type == LabelType.SUPERVOXELS:
-                # Use supervoxels directly (no mapping)
-                decompressed_chunk = self._decompressor.decompress_block(
+                return self._decompressor.decompress_block(
                     compressed_data=compressed_data,
                     agglo_labels=supervoxels,
                     supervoxels=None,
@@ -259,33 +242,20 @@ class ShardReader:
                 )
             else:
                 raise ValueError(f"Invalid label type: {label_type}")
-            
-            return decompressed_chunk
-            
+
         except Exception as e:
             if isinstance(e, (ChunkNotFoundError, InvalidCoordinateError)):
                 raise
             raise DecompressionError(f"Failed to read chunk at {coord_key}: {e}")
-    
+
     def read_chunk_raw(self, x: int, y: int, z: int) -> Dict[str, any]:
-        """
-        Read raw chunk data without decompression.
-        
-        Args:
-            x, y, z: Chunk coordinates
-            
-        Returns:
-            Dictionary with all raw chunk data
-            
-        Raises:
-            ChunkNotFoundError: If chunk doesn't exist
-        """
+        """Read raw chunk data without decompression."""
         coord_key = (x, y, z)
         if coord_key not in self._chunk_index:
             raise ChunkNotFoundError(f"Chunk not found at coordinates {coord_key}")
-        
+
         record_idx = self._chunk_index[coord_key]
-        
+
         return {
             'coordinates': coord_key,
             'chunk_x': self._table['chunk_x'][record_idx].as_py(),
@@ -296,11 +266,11 @@ class ShardReader:
             'compressed_data': self._table['dvid_compressed_block'][record_idx].as_py(),
             'uncompressed_size': self._table['uncompressed_size'][record_idx].as_py()
         }
-    
+
     def __repr__(self) -> str:
         return (f"ShardReader(arrow_path='{self.arrow_path}', "
                 f"csv_path='{self.csv_path}', chunks={self.chunk_count})")
-    
+
     def __len__(self) -> int:
         """Return number of chunks in this shard."""
         return self.chunk_count

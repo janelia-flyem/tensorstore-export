@@ -7,37 +7,35 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 # Install system dependencies required for TensorStore and Arrow
 RUN apt-get update && apt-get install -y \
-    # Build tools
     build-essential \
     gcc \
     g++ \
-    # Required for TensorStore
     cmake \
-    # Required for some Python packages
     pkg-config \
-    # Clean up
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better Docker layer caching
-COPY requirements.txt .
+# Copy and install BRAID library first for better layer caching
+COPY braid/pyproject.toml braid/README.md braid/
+COPY braid/src/ braid/src/
+RUN pip install --no-cache-dir braid/
 
-# Install Python dependencies
+# Copy and install main app dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY src/ src/
+COPY main.py .
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app \
     && chown -R app:app /app
 USER app
 
-# Set Python path
 ENV PYTHONPATH=/app
 
-# Command to run the application
 CMD ["python", "main.py"]

@@ -12,6 +12,7 @@ Usage:
 
 import base64
 import json
+import math
 import os
 import subprocess
 import sys
@@ -29,31 +30,33 @@ SECTIONS = [
         [
             ("PROJECT_ID", "your-gcp-project"),
             ("REGION", "us-central1"),
-            ("JOB_NAME", "tensorstore-dvid-export"),
         ],
     ),
     (
         "Data Settings",
         [
             ("SOURCE_BUCKET", "your-source-bucket"),
+            ("SOURCE_PREFIX", "path/to/shard/export"),
             ("DEST_BUCKET", "your-dest-bucket"),
-            ("DEST_PATH", "neuroglancer-volume"),
+            ("DEST_PATH", "path/to/precomputed/output"),
         ],
     ),
     (
         "Neuroglancer Volume Spec",
         [
-            ("NG_SPEC_PATH", "mcns-v0.9-ng-specs.json"),
+            ("NG_SPEC_PATH", "ng-specs.json"),
         ],
     ),
     (
-        "Cloud Run Settings",
+        "Deployment",
         [
-            ("PARALLELISM", "100"),
-            ("TASK_COUNT", "100"),
+            ("SCALES", "0,1"),
+            ("JOB_NAME", "tensorstore-dvid-export"),
+            ("PARALLELISM", "200"),
+            ("TASK_COUNT", "200"),
             ("MAX_RETRIES", "3"),
             ("TASK_TIMEOUT", "3600s"),
-            ("MEMORY", "4Gi"),
+            ("MEMORY", "2Gi"),
             ("CPU", "2"),
         ],
     ),
@@ -130,7 +133,7 @@ def load_ng_spec(spec_path: str) -> dict:
 
 
 def display_spec_summary(spec: dict):
-    """Print a summary of the neuroglancer spec."""
+    """Print a summary of the neuroglancer spec with memory estimates."""
     data_type = spec.get("data_type", "?")
     vol_type = spec.get("type", "?")
     num_scales = len(spec["scales"])
@@ -146,8 +149,24 @@ def display_spec_summary(spec: dict):
         res_str = f"{int(res[0])}nm" if res[0] == res[1] == res[2] else f"{res}"
         print(
             f"  Scale {i}: {size[0]}x{size[1]}x{size[2]} @ {res_str}, "
-            f"sharding: shard_bits={shard_bits} minishard_bits={minishard_bits} preshift_bits={preshift_bits}"
+            f"shard_bits={shard_bits} minishard_bits={minishard_bits} preshift_bits={preshift_bits}"
         )
+
+    # Estimate shard sizes per scale from sharding params
+    print("\n  Estimated shard sizes (from sharding params):")
+    for i, scale in enumerate(spec["scales"]):
+        sharding = scale.get("sharding", {})
+        preshift = sharding.get("preshift_bits", 0)
+        minishard = sharding.get("minishard_bits", 0)
+        # shardSideBits = (18 + preshift + minishard) / 3
+        shard_side_bits = (18 + preshift + minishard) // 3
+        shard_dim_voxels = 1 << shard_side_bits
+        max_chunks = (shard_dim_voxels // 64) ** 3
+        # Rough estimate: compressed block ~5-50 KB depending on scale
+        est_kb = 5 if i == 0 else min(50, 5 * (2 ** i))
+        est_max_mb = max_chunks * est_kb / 1024
+        print(f"    Scale {i}: shard={shard_dim_voxels}^3 voxels, up to {max_chunks} chunks, ~{est_max_mb:.0f} MB max")
+
     print()
 
 
@@ -159,6 +178,30 @@ def run_cmd(args: list, description: str) -> bool:
         print(f"  Failed (exit code {result.returncode})")
         return False
     return True
+
+
+def setup_destination_info(dest_bucket: str, dest_path: str, ng_spec: dict):
+    """Write the neuroglancer info file to GCS if it doesn't already exist."""
+    import copy
+    from google.cloud import storage
+
+    info = copy.deepcopy(ng_spec)
+    for scale in info.get("scales", []):
+        scale["encoding"] = "raw"
+        scale.pop("compressed_segmentation_block_size", None)
+
+    info_json = json.dumps(info, indent=2)
+    gcs_path = f"gs://{dest_bucket}/{dest_path}/info"
+
+    client = storage.Client()
+    blob = client.bucket(dest_bucket).blob(f"{dest_path}/info")
+
+    if blob.exists():
+        print(f"\n  Info file already exists at {gcs_path}")
+    else:
+        print(f"\nWriting neuroglancer info file to {gcs_path}...")
+        blob.upload_from_string(info_json, content_type="application/json")
+        print(f"  Written ({len(info_json)} bytes, {len(info['scales'])} scales)")
 
 
 def build_cloud_run_yaml(env: dict, ng_spec_b64: str) -> str:
@@ -184,10 +227,14 @@ spec:
             env:
             - name: SOURCE_BUCKET
               value: "{env['SOURCE_BUCKET']}"
+            - name: SOURCE_PREFIX
+              value: "{env['SOURCE_PREFIX']}"
             - name: DEST_BUCKET
               value: "{env['DEST_BUCKET']}"
             - name: DEST_PATH
               value: "{env['DEST_PATH']}"
+            - name: SCALES
+              value: "{env['SCALES']}"
             - name: NG_SPEC
               value: "{ng_spec_b64}"
             - name: MAX_PROCESSING_TIME
@@ -214,12 +261,6 @@ def main():
         print(f"No .env found, using defaults from {ENV_EXAMPLE.name}...")
     else:
         print("No .env or .env.example found, using built-in defaults...")
-
-    # Build flat defaults dict from SECTIONS
-    all_defaults = {}
-    for _, fields in SECTIONS:
-        for key, builtin_default in fields:
-            all_defaults[key] = env.get(key, builtin_default)
 
     # Interactive prompting by section
     final = {}
@@ -248,6 +289,9 @@ def main():
     if save_answer != "n":
         save_env(ENV_FILE, final)
         print(f"  Saved to {ENV_FILE}")
+
+    # Setup destination info file
+    setup_destination_info(final["DEST_BUCKET"], final["DEST_PATH"], ng_spec)
 
     # Encode the ng spec for the Cloud Run env var
     ng_spec_json = json.dumps(ng_spec, separators=(",", ":"))
@@ -289,8 +333,8 @@ def main():
         os.unlink(yaml_path)
 
     print(f"\nDone.")
-    print(f"  Run:  gcloud run jobs execute {final['JOB_NAME']} --region={final['REGION']} --project={final['PROJECT_ID']}")
-    print(f"  Logs: gcloud logging read \"resource.type=cloud_run_job AND resource.labels.job_name={final['JOB_NAME']}\" --project={final['PROJECT_ID']} --limit=100")
+    print(f"  Execute: gcloud run jobs execute {final['JOB_NAME']} --region={final['REGION']} --project={final['PROJECT_ID']}")
+    print(f"  Logs:    gcloud logging read \"resource.type=cloud_run_job AND resource.labels.job_name={final['JOB_NAME']}\" --project={final['PROJECT_ID']} --limit=100")
 
 
 if __name__ == "__main__":

@@ -199,7 +199,7 @@ def test_invalid_csv_format():
         with open(csv_path, 'w') as f:
             f.write("invalid,headers\n1,2\n")
         
-        with pytest.raises(InvalidShardFormatError, match="missing required headers"):
+        with pytest.raises(InvalidShardFormatError, match="missing required columns"):
             ShardReader(arrow_path, csv_path)
 
 
