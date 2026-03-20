@@ -143,6 +143,11 @@ The DVID compression format uses:
 - Support for sparse sub-blocks
 - zstd compression of the structured data
 
+## Architecture
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for I/O design decisions,
+the GCS backend choice, and future streaming optimization plans.
+
 ## Development
 
 ```bash
