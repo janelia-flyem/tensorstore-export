@@ -328,17 +328,37 @@ def main():
     # Build and push Docker image
     image = f"gcr.io/{final['PROJECT_ID']}/{final['JOB_NAME']}"
 
-    if not run_cmd(
-        ["docker", "build", "-t", image, str(PROJECT_ROOT)],
-        f"Building Docker image: {image}",
-    ):
-        sys.exit(1)
+    # Use Cloud Build if Docker is not available locally
+    try:
+        docker_ok = subprocess.run(
+            ["docker", "version"], capture_output=True, timeout=5
+        ).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        docker_ok = False
 
-    if not run_cmd(
-        ["docker", "push", image],
-        f"Pushing image to {image}",
-    ):
-        sys.exit(1)
+    if docker_ok:
+        if not run_cmd(
+            ["docker", "build", "-t", image, str(PROJECT_ROOT)],
+            f"Building Docker image locally: {image}",
+        ):
+            sys.exit(1)
+        if not run_cmd(
+            ["docker", "push", image],
+            f"Pushing image to {image}",
+        ):
+            sys.exit(1)
+    else:
+        print("\n  Docker not found locally — using Google Cloud Build instead.")
+        if not run_cmd(
+            [
+                "gcloud", "builds", "submit",
+                f"--tag={image}",
+                f"--project={final['PROJECT_ID']}",
+                str(PROJECT_ROOT),
+            ],
+            f"Building and pushing image via Cloud Build: {image}",
+        ):
+            sys.exit(1)
 
     # Create/update Cloud Run job
     yaml_content = build_cloud_run_yaml(final, ng_spec_b64)
