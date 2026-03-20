@@ -16,6 +16,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -213,18 +214,32 @@ def setup_destination_info(dest_uri: str, ng_spec: dict):
         print(f"  Written ({len(info_json)} bytes, {len(info['scales'])} scales)")
 
 
-def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str) -> list:
-    """Build the gcloud run jobs create/update CLI command."""
-    env_vars = ",".join([
-        f"SOURCE_PATH={env['SOURCE_PATH']}",
-        f"DEST_PATH={env['DEST_PATH']}",
-        f"SCALES={env['SCALES']}",
-        f"NG_SPEC={ng_spec_b64}",
-        "MAX_PROCESSING_TIME=55",
-        "POLLING_INTERVAL=10",
-    ])
+def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str) -> tuple:
+    """Build the gcloud run jobs create/update CLI command.
 
-    return [
+    Returns (cmd_list, env_vars_file_path).  The env vars are written to a
+    temp YAML file because the base64-encoded NG_SPEC contains characters
+    that break gcloud's --set-env-vars comma-separated format.
+    """
+    env_vars = {
+        "SOURCE_PATH": env["SOURCE_PATH"],
+        "DEST_PATH": env["DEST_PATH"],
+        "SCALES": env["SCALES"],
+        "NG_SPEC": ng_spec_b64,
+        "MAX_PROCESSING_TIME": "55",
+        "POLLING_INTERVAL": "10",
+    }
+
+    # Write env vars to a temp YAML file for --env-vars-file
+    env_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, prefix="cloudrun-env-"
+    )
+    # gcloud --env-vars-file expects KEY: VALUE yaml
+    for k, v in env_vars.items():
+        env_file.write(f"{k}: '{v}'\n")
+    env_file.close()
+
+    cmd = [
         "gcloud", "run", "jobs", "create", env["JOB_NAME"],
         f"--image={image}",
         f"--region={env['REGION']}",
@@ -235,8 +250,9 @@ def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str) -> list:
         f"--task-timeout={env['TASK_TIMEOUT']}",
         f"--memory={env['MEMORY']}",
         f"--cpu={env['CPU']}",
-        f"--set-env-vars={env_vars}",
+        f"--env-vars-file={env_file.name}",
     ]
+    return cmd, env_file.name
 
 
 # Placeholder values from .env.example that should be treated as "not configured"
@@ -393,21 +409,24 @@ def main():
                 sys.exit(1)
 
     # Create or update Cloud Run job
-    cmd = build_cloud_run_create_cmd(final, ng_spec_b64, image)
+    cmd, env_file = build_cloud_run_create_cmd(final, ng_spec_b64, image)
 
-    # Try create first; if job already exists, update it instead
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 and "already exists" in result.stderr:
-        cmd[3] = "update"  # replace "create" with "update"
-        if not run_cmd(cmd, "Updating Cloud Run job"):
+    try:
+        # Try create first; if job already exists, update it instead
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 and "already exists" in result.stderr:
+            cmd[3] = "update"  # replace "create" with "update"
+            if not run_cmd(cmd, "Updating Cloud Run job"):
+                sys.exit(1)
+        elif result.returncode != 0:
+            print(f"\nCreating Cloud Run job...")
+            print(result.stderr)
+            print(f"  Failed (exit code {result.returncode})")
             sys.exit(1)
-    elif result.returncode != 0:
-        print(f"\nCreating Cloud Run job...")
-        print(result.stderr)
-        print(f"  Failed (exit code {result.returncode})")
-        sys.exit(1)
-    else:
-        print(f"\nCreating Cloud Run job... done.")
+        else:
+            print(f"\nCreating Cloud Run job... done.")
+    finally:
+        os.unlink(env_file)
 
     print(f"\nDone.")
     print(f"  Execute: gcloud run jobs execute {final['JOB_NAME']} --region={final['REGION']} --project={final['PROJECT_ID']}")
