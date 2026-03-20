@@ -325,16 +325,18 @@ def main():
     final["PARALLELISM"] = final["TASKS"]
     final["TASK_COUNT"] = final["TASKS"]
 
-    # Offer to save
-    try:
-        save_answer = input("Save updated values to .env? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        save_answer = "n"
+    # Offer to save — skip if --use-env and nothing changed
+    changed = any(final.get(k) != env.get(k) for k in final if k not in ("PARALLELISM", "TASK_COUNT"))
+    if changed:
+        try:
+            save_answer = input("Save updated values to .env? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            save_answer = "n"
 
-    if save_answer != "n":
-        save_env(ENV_FILE, final)
-        print(f"  Saved to {ENV_FILE}")
+        if save_answer != "n":
+            save_env(ENV_FILE, final)
+            print(f"  Saved to {ENV_FILE}")
 
     # Setup destination info file
     setup_destination_info(final["DEST_PATH"], ng_spec)
