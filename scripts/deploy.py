@@ -350,18 +350,22 @@ def main():
     ng_spec_json = json.dumps(ng_spec, separators=(",", ":"))
     ng_spec_b64 = base64.b64encode(ng_spec_json.encode()).decode()
 
-    # Build and push Docker image, tagged with git commit hash.
-    # Skip build if image for current commit already exists in GCR.
-    git_hash = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
+    # Build and push Docker image.
+    # Tag with a hash of the files that go into the Docker image so we
+    # skip rebuilding when only deploy scripts or docs change.
+    import hashlib
+    content_hash_input = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--",
+         "Dockerfile", "requirements.txt", "main.py", "src/", "braid/src/", "braid/pyproject.toml"],
         capture_output=True, text=True, cwd=str(PROJECT_ROOT),
-    ).stdout.strip() or "latest"
+    ).stdout.strip()
+    content_tag = hashlib.sha256(content_hash_input.encode()).hexdigest()[:12] if content_hash_input else "latest"
 
     image_base = f"gcr.io/{final['PROJECT_ID']}/{final['JOB_NAME']}"
-    image_tagged = f"{image_base}:{git_hash}"
-    image = image_tagged  # used in Cloud Run job spec
+    image_tagged = f"{image_base}:{content_tag}"
+    image = image_tagged
 
-    # Check if this exact image already exists in GCR
+    # Check if an image with this content hash already exists in GCR
     image_exists = subprocess.run(
         ["gcloud", "container", "images", "describe", image_tagged,
          f"--project={final['PROJECT_ID']}"],
@@ -370,7 +374,7 @@ def main():
 
     if args.skip_build or image_exists:
         if image_exists:
-            print(f"\n  Image already exists for commit {git_hash} — skipping build.")
+            print(f"\n  Image already exists ({content_tag}) — skipping build.")
         else:
             print(f"\n  Skipping build (--skip-build) — reusing image: {image_base}:latest")
             image = f"{image_base}:latest"
