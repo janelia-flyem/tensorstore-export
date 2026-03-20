@@ -251,6 +251,10 @@ def main():
         "--use-env", action="store_true",
         help="Use all values from .env without prompting (only prompt for missing values)",
     )
+    parser.add_argument(
+        "--skip-build", action="store_true",
+        help="Skip Docker image build (reuse existing image in GCR)",
+    )
     args = parser.parse_args()
 
     print("\n=== TensorStore Export — Cloud Run Deployment ===\n")
@@ -341,7 +345,9 @@ def main():
     except (FileNotFoundError, subprocess.TimeoutExpired):
         docker_ok = False
 
-    if docker_ok:
+    if args.skip_build:
+        print(f"\n  Skipping build — reusing existing image: {image}")
+    elif docker_ok:
         if not run_cmd(
             ["docker", "build", "-t", image, str(PROJECT_ROOT)],
             f"Building Docker image locally: {image}",
