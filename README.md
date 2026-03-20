@@ -6,7 +6,7 @@ Converts DVID `export-shards` Arrow IPC files into neuroglancer precomputed segm
 
 [DVID](https://github.com/janelia-flyem/dvid) exports segmentation data as spatially-partitioned Arrow IPC shard files via the `export-shards` RPC command. This project converts those files into [neuroglancer precomputed](https://github.com/google/neuroglancer/tree/master/src/neuroglancer/datasource/precomputed) volumes viewable in [Neuroglancer](https://github.com/google/neuroglancer). Designed for terabyte-scale datasets using hundreds of parallel Cloud Run workers.
 
-[BRAID](braid/) (Block Records Arrow Indexed Dataset) reads shard files directly from GCS via PyArrow's native C++ filesystem — no temp files or intermediate copies.
+[BRAID](braid/) (Block Records Arrow Indexed Dataset) reads shard files directly from GCS via `google-cloud-storage` — no temp files needed.
 
 ## Getting Started
 
@@ -104,6 +104,26 @@ Options for `generate-scale`:
 
 By default, workers export **agglomerated labels** — the standard segmentation view where proofreading merges are applied. Use `--label-type supervoxels` to export the raw supervoxel IDs from the DVID blocks instead.
 
+### Checking for Errors
+
+After a job execution, check for chunk-level and shard-level errors:
+
+```bash
+# Summary of errors from the most recent execution
+pixi run export-errors
+
+# Full details of every failed chunk
+pixi run export-errors -- --details
+
+# Errors from all executions (not just the latest)
+pixi run export-errors -- --all
+
+# Errors from a specific execution
+pixi run export-errors -- --execution tensorstore-dvid-export-test1-bqblh
+```
+
+The script auto-detects the latest execution and summarizes errors by type, scale, and shard. Individual chunk failures are logged as `"Chunk failed"` events with coordinates, so they don't abort the entire shard.
+
 ### Multi-Scale Processing
 
 Workers support two sources for each scale:
@@ -143,10 +163,10 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 ```
 DVID export-shards           Cloud Run Workers              Neuroglancer Volume
   Arrow IPC + CSV        →     BRAID reads from GCS      →   precomputed on GCS
-  per-scale: s0/, s1/...       PyArrow C++ native I/O         multi-scale output
+  per-scale: s0/, s1/...       google-cloud-storage           multi-scale output
 ```
 
-BRAID reads Arrow IPC and CSV files directly from GCS using `pyarrow.fs` — data flows through Arrow's C++ runtime with zero Python-level copies. Each worker processes one shard at a time: load table into memory, decompress chunks via the DVID block decompressor, transpose ZYX→XYZ, and write to the neuroglancer precomputed volume via TensorStore.
+Each worker processes one shard at a time: download Arrow+CSV from GCS, decompress chunks via the DVID block decompressor, transpose ZYX→XYZ, and write to the neuroglancer precomputed volume via TensorStore. See [braid/docs/ARCHITECTURE.md](braid/docs/ARCHITECTURE.md) for I/O design decisions.
 
 ## Project Structure
 
@@ -157,16 +177,19 @@ tensorstore-export/
 ├── Dockerfile                       # Cloud Run container
 ├── scripts/
 │   ├── deploy.py                   # Interactive deployment
+│   ├── generate_scale.py           # Execute Cloud Run job
+│   ├── export_errors.py            # Query error logs
 │   └── setup_destination.py        # Info file setup (also called by deploy)
 ├── src/
 │   ├── worker.py                   # Cloud Run worker
 │   └── tensorstore_adapter.py      # TensorStore helpers
-├── braid/                           # BRAID library
+├── braid/                           # BRAID library (will be its own repo)
 │   ├── src/braid/
-│   │   ├── reader.py               # ShardReader (local + GCS via pyarrow.fs)
+│   │   ├── reader.py               # ShardReader (local + GCS)
 │   │   ├── decompressor.py         # DVID block decompressor
 │   │   └── exceptions.py
-│   └── tests/                      # 65 tests including ground truth verification
+│   ├── tests/                      # 66 tests including ground truth verification
+│   └── docs/ARCHITECTURE.md        # I/O design decisions
 └── docs/
     ├── mCNS-ExportAnalysis.md      # Real export data analysis
     ├── ExportObservabilityPlan.md   # DVID export error detection plan

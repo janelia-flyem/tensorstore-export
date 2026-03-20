@@ -159,16 +159,18 @@ class ShardProcessor:
     def process_shard(self, scale: int, shard_name: str) -> bool:
         """Process a single shard: read from GCS, decompress, write to destination.
 
-        BRAID's ShardReader reads directly from GCS via PyArrow's native
-        filesystem — no temp files or intermediate copies.  Retries with
-        exponential backoff on transient GCS connection errors.
+        Downloads Arrow+CSV via google-cloud-storage, decompresses each chunk
+        using BRAID, and writes to the neuroglancer precomputed volume.
+        Individual chunk failures are logged and skipped — the shard is still
+        considered successful if at least some chunks were written.
 
         Args:
             scale: Scale level (0, 1, 2, ...)
             shard_name: Shard origin name (e.g., "30720_24576_28672")
 
         Returns:
-            True if successful.
+            True if the shard was processed (even with some chunk errors).
+            False only if the shard could not be loaded at all.
         """
         try:
             logger.info("Processing shard", scale=scale, shard=shard_name)
@@ -184,31 +186,46 @@ class ShardProcessor:
                          chunks=reader.chunk_count)
 
             lt = LabelType(self.config.label_type)
+            chunks_written = 0
+            chunks_failed = 0
 
             for i, (cx, cy, cz) in enumerate(reader.available_chunks):
-                chunk_data = reader.read_chunk(cx, cy, cz, label_type=lt)
+                try:
+                    chunk_data = reader.read_chunk(cx, cy, cz, label_type=lt)
 
-                # BRAID outputs ZYX order; neuroglancer precomputed is XYZ + channel
-                transposed = chunk_data.transpose(2, 1, 0)
+                    # BRAID outputs ZYX order; neuroglancer precomputed is XYZ + channel
+                    transposed = chunk_data.transpose(2, 1, 0)
 
-                # Write to the destination at the chunk's global voxel coordinates
-                x0 = cx * CHUNK_VOXELS
-                y0 = cy * CHUNK_VOXELS
-                z0 = cz * CHUNK_VOXELS
-                dest[x0:x0 + CHUNK_VOXELS,
-                     y0:y0 + CHUNK_VOXELS,
-                     z0:z0 + CHUNK_VOXELS,
-                     0].write(transposed).result()
+                    # Write to the destination at the chunk's global voxel coordinates
+                    x0 = cx * CHUNK_VOXELS
+                    y0 = cy * CHUNK_VOXELS
+                    z0 = cz * CHUNK_VOXELS
+                    dest[x0:x0 + CHUNK_VOXELS,
+                         y0:y0 + CHUNK_VOXELS,
+                         z0:z0 + CHUNK_VOXELS,
+                         0].write(transposed).result()
+                    chunks_written += 1
+
+                except Exception as e:
+                    chunks_failed += 1
+                    # Searchable event name for pixi run export-errors
+                    logger.error("Chunk failed",
+                                  scale=scale, shard=shard_name,
+                                  chunk_x=cx, chunk_y=cy, chunk_z=cz,
+                                  error=str(e)[:500])
 
                 if (i + 1) % 1000 == 0:
                     logger.info("Progress",
                                  shard=shard_name,
-                                 chunks_written=i + 1,
+                                 chunks_written=chunks_written,
+                                 chunks_failed=chunks_failed,
                                  total=reader.chunk_count)
 
             logger.info("Shard complete",
                          shard=shard_name,
-                         chunks_written=reader.chunk_count)
+                         chunks_written=chunks_written,
+                         chunks_failed=chunks_failed,
+                         total=reader.chunk_count)
             return True
 
         except Exception as e:

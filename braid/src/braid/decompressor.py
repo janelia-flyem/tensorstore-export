@@ -95,7 +95,13 @@ class DVIDDecompressor:
                 return np.zeros(block_shape, dtype=np.uint64)
 
             try:
-                dvid_compressed_data = self._zstd_decompressor.decompress(compressed_data)
+                # max_output_size is required when the zstd frame header
+                # doesn't declare content size (valid zstd, but the
+                # zstandard library raises without it).  DVID blocks are
+                # at most ~2.1 MB decompressed; 16 MB is a safe ceiling.
+                dvid_compressed_data = self._zstd_decompressor.decompress(
+                    compressed_data, max_output_size=16 * 1024 * 1024
+                )
             except Exception as e:
                 raise DecompressionError(f"Failed to decompress zstd layer: {e}")
 
