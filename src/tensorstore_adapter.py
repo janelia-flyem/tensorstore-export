@@ -6,7 +6,6 @@ volumes on GCS via TensorStore.  The info file must already exist (created
 by scripts/setup_destination.py).
 """
 
-from typing import Optional
 import structlog
 import tensorstore as ts
 

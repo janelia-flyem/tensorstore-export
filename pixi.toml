@@ -24,9 +24,10 @@ pydantic-settings = ">=2.1.0"
 click = ">=8.1.0"
 gcsfs = ">=2024.2.0"
 
-# Testing
+# Testing and linting
 pytest = ">=8.0"
 pytest-cov = ">=4.0"
+ruff = ">=0.4.0"
 
 # Install braid as editable from local path
 braid = { path = "braid", editable = true }
@@ -35,5 +36,6 @@ braid = { path = "braid", editable = true }
 test-braid = "pytest braid/tests/ -v --no-header"
 test-e2e = "pytest braid/tests/test_e2e_precomputed.py -v --no-header"
 test-all = "pytest braid/tests/ -v --no-header"
+lint = "ruff check src/ braid/src/ scripts/"
 deploy = "python scripts/deploy.py"
 generate-scale = "python scripts/generate_scale.py"

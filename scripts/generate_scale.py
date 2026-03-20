@@ -105,7 +105,7 @@ def main():
         print(f"\nFailed (exit code {result.returncode})")
         sys.exit(1)
 
-    print(f"\nMonitor with:")
+    print("\nMonitor with:")
     print(f"  gcloud run jobs describe {job_name} --region={region} --project={project}")
     print(f"  gcloud logging read \"resource.type=cloud_run_job AND resource.labels.job_name={job_name}\" --project={project} --limit=100")
 

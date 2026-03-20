@@ -17,7 +17,6 @@ import asyncio
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 
-import numpy as np
 import structlog
 import tensorstore as ts
 from google.cloud import storage

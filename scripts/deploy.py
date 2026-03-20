@@ -12,7 +12,6 @@ Usage:
 
 import base64
 import json
-import math
 import os
 import subprocess
 import sys
@@ -423,16 +422,16 @@ def main():
             if not run_cmd(cmd, "Updating Cloud Run job"):
                 sys.exit(1)
         elif result.returncode != 0:
-            print(f"\nCreating Cloud Run job...")
+            print("\nCreating Cloud Run job...")
             print(result.stderr)
             print(f"  Failed (exit code {result.returncode})")
             sys.exit(1)
         else:
-            print(f"\nCreating Cloud Run job... done.")
+            print("\nCreating Cloud Run job... done.")
     finally:
         os.unlink(env_file)
 
-    print(f"\nDone.")
+    print("\nDone.")
     print(f"  Execute: gcloud run jobs execute {final['JOB_NAME']} --region={final['REGION']} --project={final['PROJECT_ID']}")
     print(f"  Logs:    gcloud logging read \"resource.type=cloud_run_job AND resource.labels.job_name={final['JOB_NAME']}\" --project={final['PROJECT_ID']} --limit=100")
 

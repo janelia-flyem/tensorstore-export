@@ -8,7 +8,7 @@ native filesystem abstraction.
 
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Dict, List, Tuple, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.csv as pcsv
