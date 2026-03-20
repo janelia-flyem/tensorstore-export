@@ -66,6 +66,27 @@ class TestGoProducedShardReader:
                 f"Arrow coord ({arrow_x},{arrow_y},{arrow_z})"
             )
 
+    def test_labels_supervoxels_equal_length(self, go_shard):
+        """Every chunk has equal-length labels and supervoxels lists.
+
+        The labels list contains agglomerated label IDs and the supervoxels
+        list contains the corresponding supervoxel IDs.  They must be the
+        same length so that label mapping (supervoxel → agglomerated) works
+        by positional correspondence.
+        """
+        mismatches = []
+        for (cx, cy, cz), rec_idx in go_shard._chunk_index.items():
+            labels = go_shard._table["labels"][rec_idx].as_py()
+            supervoxels = go_shard._table["supervoxels"][rec_idx].as_py()
+            if len(labels) != len(supervoxels):
+                mismatches.append(
+                    f"({cx},{cy},{cz}): labels={len(labels)}, supervoxels={len(supervoxels)}"
+                )
+        assert not mismatches, (
+            f"{len(mismatches)} chunks have mismatched list lengths:\n"
+            + "\n".join(mismatches[:10])
+        )
+
     def test_chunk_coordinates_in_shard_range(self, go_shard):
         """All chunk coordinates fall within the expected shard region.
 

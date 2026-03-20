@@ -23,39 +23,39 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 
-# Fields grouped by section for interactive prompting
+# Fields grouped by section for interactive prompting.
+# Each field is (key, default, description).
 SECTIONS = [
     (
         "GCP Settings",
         [
-            ("PROJECT_ID", "your-gcp-project"),
-            ("REGION", "us-central1"),
+            ("PROJECT_ID", "your-gcp-project", "GCP project ID"),
+            ("REGION", "us-central1", "GCP region"),
         ],
     ),
     (
         "Data Settings",
         [
-            ("SOURCE_PATH", "gs://your-bucket/path/to/shard/export"),
-            ("DEST_PATH", "gs://your-bucket/path/to/precomputed/output"),
+            ("SOURCE_PATH", "gs://your-bucket/path/to/shard/export", "GCS path to DVID export shards"),
+            ("DEST_PATH", "gs://your-bucket/path/to/precomputed/output", "GCS path for neuroglancer output"),
         ],
     ),
     (
         "Neuroglancer Volume Spec",
         [
-            ("NG_SPEC_PATH", "ng-specs.json"),
+            ("NG_SPEC_PATH", "ng-specs.json", "path to neuroglancer spec JSON"),
         ],
     ),
     (
         "Deployment",
         [
-            ("SCALES", "0,1"),
-            ("JOB_NAME", "tensorstore-dvid-export"),
-            ("PARALLELISM", "200"),
-            ("TASK_COUNT", "200"),
-            ("MAX_RETRIES", "3"),
-            ("TASK_TIMEOUT", "3600s"),
-            ("MEMORY", "2Gi"),
-            ("CPU", "2"),
+            ("SCALES", "0,1", "scales to process from DVID shards"),
+            ("JOB_NAME", "tensorstore-dvid-export", "Cloud Run job name"),
+            ("TASKS", "200", "number of parallel Cloud Run worker tasks"),
+            ("MAX_RETRIES", "3", "max retries per failed worker"),
+            ("TASK_TIMEOUT", "3600s", "timeout per worker"),
+            ("MEMORY", "2Gi", "memory per worker"),
+            ("CPU", "2", "CPUs per worker"),
         ],
     ),
 ]
@@ -96,10 +96,11 @@ def save_env(path: Path, env: dict):
     path.write_text("\n".join(lines) + "\n")
 
 
-def prompt_value(key: str, default: str) -> str:
-    """Prompt user for a value, showing the default in brackets."""
+def prompt_value(key: str, default: str, description: str = "") -> str:
+    """Prompt user for a value, showing description and default."""
+    desc = f" ({description})" if description else ""
     try:
-        raw = input(f"  {key} [{default}]: ").strip()
+        raw = input(f"  {key}{desc} [{default}]: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         sys.exit(1)
@@ -256,6 +257,15 @@ spec:
 def main():
     print("\n=== TensorStore Export — Cloud Run Deployment ===\n")
 
+    # Check for GCP credentials early, before interactive prompting
+    try:
+        import google.auth
+        google.auth.default()
+    except google.auth.exceptions.DefaultCredentialsError:
+        print("Error: GCP credentials not found.")
+        print("Run 'gcloud auth application-default login' first.")
+        sys.exit(1)
+
     # Load existing .env as defaults
     env = {}
     if ENV_FILE.exists():
@@ -273,9 +283,18 @@ def main():
 
     for section_name, fields in SECTIONS:
         print(f"\n--- {section_name} ---")
-        for key, builtin_default in fields:
+
+        # After loading the ng spec, override the SCALES default to include
+        # all scales defined in the spec (since DVID export-shards produces
+        # data for every scale it was given).
+        if section_name == "Deployment" and ng_spec:
+            all_scales = ",".join(str(i) for i in range(len(ng_spec["scales"])))
+            fields = [(k, all_scales if k == "SCALES" else d, desc)
+                      for k, d, desc in fields]
+
+        for key, builtin_default, description in fields:
             default = env.get(key, builtin_default)
-            final[key] = prompt_value(key, default)
+            final[key] = prompt_value(key, default, description)
 
         # After the NG spec section, load and display the spec
         if section_name == "Neuroglancer Volume Spec":
@@ -283,6 +302,10 @@ def main():
             print(f"\n  Reading {spec_path}...")
             ng_spec = load_ng_spec(spec_path)
             display_spec_summary(ng_spec)
+
+    # TASKS sets both parallelism and taskCount for Cloud Run
+    final["PARALLELISM"] = final["TASKS"]
+    final["TASK_COUNT"] = final["TASKS"]
 
     # Offer to save
     try:

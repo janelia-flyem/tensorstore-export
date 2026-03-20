@@ -57,6 +57,11 @@ class WorkerConfig(BaseModel):
     # than the number of scales in the spec).
     downres_scales: List[int] = []
 
+    # Label type: "labels" for agglomerated labels (default), "supervoxels"
+    # for raw supervoxel IDs.  Agglomerated labels are the standard
+    # "segmentation" view where proofreading merges are applied.
+    label_type: str = "labels"
+
     # Worker behavior
     max_processing_time_minutes: int = 55
     polling_interval_seconds: int = 10
@@ -144,8 +149,10 @@ class ShardProcessor:
                          shard=shard_name,
                          chunks=reader.chunk_count)
 
+            lt = LabelType(self.config.label_type)
+
             for i, (cx, cy, cz) in enumerate(reader.available_chunks):
-                chunk_data = reader.read_chunk(cx, cy, cz, label_type=LabelType.LABELS)
+                chunk_data = reader.read_chunk(cx, cy, cz, label_type=lt)
 
                 # BRAID outputs ZYX order; neuroglancer precomputed is XYZ + channel
                 transposed = chunk_data.transpose(2, 1, 0)
@@ -308,6 +315,7 @@ def create_config_from_env() -> WorkerConfig:
         ng_spec=ng_spec,
         scales=scales,
         downres_scales=downres_scales,
+        label_type=os.environ.get("LABEL_TYPE", "labels"),
         max_processing_time_minutes=int(os.environ.get("MAX_PROCESSING_TIME", "55")),
         polling_interval_seconds=int(os.environ.get("POLLING_INTERVAL", "10")),
     )

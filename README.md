@@ -16,6 +16,13 @@ Converts DVID `export-shards` Arrow IPC files into neuroglancer precomputed segm
 - [Docker](https://www.docker.com/) — builds Cloud Run container images
 - [gcloud CLI](https://cloud.google.com/sdk) — deploys to Cloud Run
 
+After installing gcloud, authenticate for both CLI commands and Python libraries:
+
+```bash
+gcloud auth login                        # for gcloud CLI commands
+gcloud auth application-default login    # for Python libraries (GCS, TensorStore)
+```
+
 ### Install
 
 ```bash
@@ -65,21 +72,45 @@ All values are saved to `.env` for future runs. You can also edit `.env` directl
 
 ### Generate Scales
 
-After deploying, execute the Cloud Run job to process scales:
+After deploying, execute the Cloud Run job:
 
 ```bash
+# Process scales from .env defaults (typically scales 0,1 with agglomerated labels)
 pixi run generate-scale
+
+# Process specific scales
+pixi run generate-scale --scales 0,1
+
+# Process higher scales with more memory
+pixi run generate-scale --scales 2,3 --memory 4Gi
+
+# Generate scale 10 by downsampling the already-written scale 9
+# (for scales not exported by DVID, e.g., when MaxDownresLevel < spec scale count)
+pixi run generate-scale --downres 10
+
+# Export supervoxel IDs instead of agglomerated labels
+pixi run generate-scale --scales 0 --label-type supervoxels
 ```
 
-This reads the job name, project, and region from `.env` and executes the Cloud Run job. To process different scales or adjust memory, edit `.env` first or re-run `pixi run deploy`.
+Options for `generate-scale`:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--scales` | Scales to process from DVID shards | from `.env` |
+| `--downres` | Output scales to generate by downsampling (e.g., `10` reads scale 9 to produce scale 10) | none |
+| `--label-type` | `labels` (agglomerated, default) or `supervoxels` (raw IDs) | `labels` |
+| `--memory` | Memory per worker override | from `.env` |
+| `--wait` | Block until the job completes | async (return immediately) |
+
+By default, workers export **agglomerated labels** — the standard segmentation view where proofreading merges are applied. Use `--label-type supervoxels` to export the raw supervoxel IDs from the DVID blocks instead.
 
 ### Multi-Scale Processing
 
-Workers support two modes:
+Workers support two sources for each scale:
 
-**From DVID export shards** (default): DVID pre-computes downsampled blocks at each scale. Workers ingest them directly — no computation needed, output exactly matches what DVID serves. Set `SCALES=0,1,2,...` in `.env`.
+**From DVID export shards** (default): DVID pre-computes downsampled blocks at each scale. Workers ingest them directly — no computation needed, output exactly matches what DVID serves.
 
-**From previous scale** (downres mode): For scales not materialized in DVID (e.g., `MaxDownresLevel` was lower than the spec's scale count), workers generate scale N by downsampling scale N-1 from the destination volume using majority vote. Set `DOWNRES_SCALES=10` in `.env`. Requires scale N-1 to be fully written first.
+**From previous scale** (downres mode): For scales not materialized in DVID, `--downres N` generates scale N by reading the already-written scale N-1 from the destination volume and downsampling 2× in each dimension using majority vote. Scale N-1 must be fully written first.
 
 ### Memory Sizing
 
@@ -91,7 +122,7 @@ Shard sizes grow at lower resolutions. The deploy script estimates sizes from th
 | 2–3 | 504–799 MB | 4 GiB |
 | 4+ | 1.4+ GB | 8 GiB |
 
-Deploy separate jobs per memory tier, or use a single job sized for the largest scale being processed.
+Use `--memory` on `generate-scale` to override for a specific execution, or deploy separate jobs per memory tier.
 
 ## Configuration
 
@@ -105,7 +136,7 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 | `SCALES` | Scales to ingest from DVID shards | `0,1` |
 | `DOWNRES_SCALES` | Scales to generate by downsampling previous scale | `10` |
 | `MEMORY` | Memory per Cloud Run worker | `2Gi` |
-| `PARALLELISM` | Number of parallel workers | `200` |
+| `TASKS` | Number of parallel Cloud Run worker tasks | `200` |
 
 ## Architecture
 
