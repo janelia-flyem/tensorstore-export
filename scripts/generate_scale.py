@@ -90,9 +90,9 @@ def main():
         f"--project={project}",
     ]
 
-    # Pass env var overrides
-    override_str = ",".join(f"{k}={v}" for k, v in overrides.items())
-    cmd.append(f"--update-env-vars={override_str}")
+    # Pass env var overrides.  Use ^;^ as delimiter since values contain commas.
+    override_str = ";".join(f"{k}={v}" for k, v in overrides.items())
+    cmd.append(f"--update-env-vars=^;^{override_str}")
 
     if args.wait:
         cmd.append("--wait")
