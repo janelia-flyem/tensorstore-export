@@ -15,7 +15,7 @@ import os
 import time
 import asyncio
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Dict, Any, List
 
 import structlog
 import tensorstore as ts
@@ -78,10 +78,17 @@ class ShardProcessor:
         self.source_bucket_obj = self.storage_client.bucket(self._source_bucket)
         self._dest_stores: Dict[int, ts.TensorStore] = {}
 
+        # Cloud Run task index for work partitioning.
+        # Each task processes shards where index % task_count == task_index.
+        self._task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
+        self._task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+
         logger.info("Initialized shard processor",
                      source=config.source_path,
                      dest=config.dest_path,
-                     scales=config.scales)
+                     scales=config.scales,
+                     task_index=self._task_index,
+                     task_count=self._task_count)
 
     def _open_dest_scale(self, scale: int) -> ts.TensorStore:
         """Open the destination neuroglancer precomputed volume at a given scale.
@@ -102,26 +109,36 @@ class ShardProcessor:
         logger.info("Opened destination scale", scale=scale, domain=str(store.domain))
         return store
 
-    def find_available_shard(self) -> Optional[Tuple[int, str]]:
-        """Find an available shard to process across configured scales.
+    def list_my_shards(self) -> List[Tuple[int, str]]:
+        """List all shards assigned to this task.
+
+        Each Cloud Run task gets a unique CLOUD_RUN_TASK_INDEX (0 to N-1).
+        Shards are assigned round-robin: task i processes shards where
+        shard_index % task_count == task_index.  This ensures no two tasks
+        process the same shard.
 
         Returns:
-            (scale, shard_name) tuple, or None if no work available.
-            shard_name is the stem (e.g., "0_0_0").
+            List of (scale, shard_name) tuples assigned to this task.
         """
+        all_shards = []
         for scale in self.config.scales:
             prefix = f"{self._source_prefix}/s{scale}/"
             blobs = self.source_bucket_obj.list_blobs(prefix=prefix)
-
             for blob in blobs:
-                if not blob.name.endswith(".arrow"):
-                    continue
+                if blob.name.endswith(".arrow"):
+                    shard_name = Path(blob.name).stem
+                    all_shards.append((scale, shard_name))
 
-                shard_name = Path(blob.name).stem
-                logger.debug("Found shard", scale=scale, shard=shard_name)
-                return (scale, shard_name)
+        # Partition by task index
+        my_shards = [s for i, s in enumerate(all_shards)
+                     if i % self._task_count == self._task_index]
 
-        return None
+        logger.info("Shard assignment",
+                     total_shards=len(all_shards),
+                     my_shards=len(my_shards),
+                     task_index=self._task_index,
+                     task_count=self._task_count)
+        return my_shards
 
     def process_shard(self, scale: int, shard_name: str) -> bool:
         """Process a single shard: read from GCS, decompress, write to destination.
@@ -247,19 +264,16 @@ class CloudRunWorker:
         processed_count = 0
         failed_count = 0
 
-        # Phase 1: Process DVID export shards
-        while self._should_continue():
+        # Phase 1: Process assigned DVID export shards
+        my_shards = self.processor.list_my_shards()
+
+        for scale, shard_name in my_shards:
+            if not self._should_continue():
+                logger.warning("Time limit reached, stopping",
+                                processed=processed_count, remaining=len(my_shards) - processed_count - failed_count)
+                break
+
             try:
-                result = self.processor.find_available_shard()
-
-                if result is None:
-                    if self.config.downres_scales:
-                        break  # Move on to downres phase
-                    logger.debug("No work available, sleeping")
-                    await asyncio.sleep(self.config.polling_interval_seconds)
-                    continue
-
-                scale, shard_name = result
                 success = self.processor.process_shard(scale, shard_name)
 
                 if success:
@@ -274,8 +288,9 @@ class CloudRunWorker:
                                     total_failed=failed_count)
 
             except Exception as e:
-                logger.error("Unexpected error in worker loop", error=str(e))
-                await asyncio.sleep(self.config.polling_interval_seconds)
+                failed_count += 1
+                logger.error("Unexpected error processing shard",
+                              shard=shard_name, scale=scale, error=str(e))
 
         # Phase 2: Generate downres scales from previous scale data
         for scale in sorted(self.config.downres_scales):
