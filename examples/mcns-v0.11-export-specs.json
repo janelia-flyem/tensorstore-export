@@ -1,6 +1,6 @@
 {
   "@type": "neuroglancer_multiscale_volume",
-  "data_type": "uint8",
+  "data_type": "uint64",
   "num_channels": 1,
   "scales": [
     {
@@ -321,36 +321,7 @@
         77,
         132
       ]
-    },
-    {
-      "chunk_sizes": [
-        [
-          64,
-          64,
-          64
-        ]
-      ],
-      "encoding": "jpeg",
-      "key": "16384x16384x16384",
-      "resolution": [
-        16384.0,
-        16384.0,
-        16384.0
-      ],
-      "sharding": {
-        "@type": "neuroglancer_uint64_sharded_v1",
-        "hash": "identity",
-        "minishard_bits": 0,
-        "minishard_index_encoding": "gzip",
-        "preshift_bits": 1,
-        "shard_bits": 0
-      },
-      "size": [
-        46,
-        39,
-        66
-      ]
     }
   ],
-  "type": "image"
+  "type": "segmentation"
 }
