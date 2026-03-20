@@ -45,14 +45,10 @@ def main():
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
 
     ng_spec_path = env.get("NG_SPEC_PATH", "ng-specs.json")
-    dest_bucket = env.get("DEST_BUCKET")
-    dest_path = env.get("DEST_PATH")
+    dest_uri = env.get("DEST_PATH", "")
 
-    if not dest_bucket or dest_bucket == "your-dest-bucket":
-        print("Error: DEST_BUCKET not configured. Run 'pixi run deploy' or edit .env first.")
-        sys.exit(1)
-    if not dest_path or dest_path == "path/to/precomputed/output":
-        print("Error: DEST_PATH not configured. Run 'pixi run deploy' or edit .env first.")
+    if not dest_uri.startswith("gs://"):
+        print("Error: DEST_PATH must be a gs:// URI. Run 'pixi run deploy' or edit .env first.")
         sys.exit(1)
 
     print(f"Reading ng spec from {ng_spec_path}...")
@@ -61,16 +57,21 @@ def main():
     info = adapt_spec_for_precomputed(ng_spec)
     info_json = json.dumps(info, indent=2)
 
-    gcs_path = f"gs://{dest_bucket}/{dest_path}/info"
-    print(f"Writing info file to {gcs_path}...")
+    # Parse the URI to get bucket and path for the GCS client
+    rest = dest_uri[len("gs://"):]
+    bucket_name, _, prefix = rest.partition("/")
+    prefix = prefix.rstrip("/")
+
+    info_gcs = f"{dest_uri}/info"
+    print(f"Writing info file to {info_gcs}...")
 
     from google.cloud import storage
     client = storage.Client()
-    bucket = client.bucket(dest_bucket)
-    blob = bucket.blob(f"{dest_path}/info")
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(f"{prefix}/info")
 
     if blob.exists():
-        print(f"  Info file already exists at {gcs_path}")
+        print(f"  Info file already exists at {info_gcs}")
         overwrite = input("  Overwrite? [y/N]: ").strip().lower()
         if overwrite != "y":
             print("  Skipping.")

@@ -104,16 +104,15 @@ pixi run setup-destination
 
 All deployment-specific values come from `.env` (not committed) and the ng spec JSON. Nothing is hardcoded to a specific dataset.
 
-| Variable | Description | Default |
+| Variable | Description | Example |
 |----------|-------------|---------|
-| `PROJECT_ID` | GCP project ID | required |
+| `PROJECT_ID` | GCP project ID | `my-project` |
 | `REGION` | GCP region | `us-central1` |
-| `SOURCE_BUCKET` | GCS bucket with Arrow shard files | required |
-| `SOURCE_PREFIX` | Path prefix containing s0/, s1/, ... dirs | required |
-| `DEST_BUCKET` | GCS bucket for neuroglancer output | required |
-| `DEST_PATH` | Path for precomputed volume | required |
-| `NG_SPEC_PATH` | Path to neuroglancer volume spec JSON | required |
-| `SCALES` | Comma-separated scale indices to process | `0,1` |
+| `SOURCE_PATH` | GCS URI to shard export (contains s0/, s1/, ...) | `gs://mybucket/exports/segmentation` |
+| `DEST_PATH` | GCS URI for neuroglancer precomputed output | `gs://mybucket/v1.0/precomputed` |
+| `NG_SPEC_PATH` | Local path to neuroglancer volume spec JSON | `ng-specs.json` |
+| `SCALES` | Scales to process from DVID shards | `0,1` |
+| `DOWNRES_SCALES` | Scales to generate by downsampling previous scale | `10` |
 | `PARALLELISM` | Number of parallel Cloud Run workers | `200` |
 | `MEMORY` | Memory per worker | `2Gi` |
 

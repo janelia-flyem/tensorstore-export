@@ -35,10 +35,8 @@ SECTIONS = [
     (
         "Data Settings",
         [
-            ("SOURCE_BUCKET", "your-source-bucket"),
-            ("SOURCE_PREFIX", "path/to/shard/export"),
-            ("DEST_BUCKET", "your-dest-bucket"),
-            ("DEST_PATH", "path/to/precomputed/output"),
+            ("SOURCE_PATH", "gs://your-bucket/path/to/shard/export"),
+            ("DEST_PATH", "gs://your-bucket/path/to/precomputed/output"),
         ],
     ),
     (
@@ -180,10 +178,21 @@ def run_cmd(args: list, description: str) -> bool:
     return True
 
 
-def setup_destination_info(dest_bucket: str, dest_path: str, ng_spec: dict):
+def _parse_gs_uri(uri: str):
+    """Split gs://bucket/path into (bucket, path)."""
+    if not uri.startswith("gs://"):
+        raise ValueError(f"Expected gs:// URI, got: {uri}")
+    rest = uri[len("gs://"):]
+    bucket, _, path = rest.partition("/")
+    return bucket, path.rstrip("/")
+
+
+def setup_destination_info(dest_uri: str, ng_spec: dict):
     """Write the neuroglancer info file to GCS if it doesn't already exist."""
     import copy
     from google.cloud import storage
+
+    bucket_name, prefix = _parse_gs_uri(dest_uri)
 
     info = copy.deepcopy(ng_spec)
     for scale in info.get("scales", []):
@@ -191,15 +200,15 @@ def setup_destination_info(dest_bucket: str, dest_path: str, ng_spec: dict):
         scale.pop("compressed_segmentation_block_size", None)
 
     info_json = json.dumps(info, indent=2)
-    gcs_path = f"gs://{dest_bucket}/{dest_path}/info"
+    info_uri = f"{dest_uri}/info"
 
     client = storage.Client()
-    blob = client.bucket(dest_bucket).blob(f"{dest_path}/info")
+    blob = client.bucket(bucket_name).blob(f"{prefix}/info")
 
     if blob.exists():
-        print(f"\n  Info file already exists at {gcs_path}")
+        print(f"\n  Info file already exists at {info_uri}")
     else:
-        print(f"\nWriting neuroglancer info file to {gcs_path}...")
+        print(f"\nWriting neuroglancer info file to {info_uri}...")
         blob.upload_from_string(info_json, content_type="application/json")
         print(f"  Written ({len(info_json)} bytes, {len(info['scales'])} scales)")
 
@@ -225,12 +234,8 @@ spec:
           containers:
           - image: gcr.io/{env['PROJECT_ID']}/{env['JOB_NAME']}
             env:
-            - name: SOURCE_BUCKET
-              value: "{env['SOURCE_BUCKET']}"
-            - name: SOURCE_PREFIX
-              value: "{env['SOURCE_PREFIX']}"
-            - name: DEST_BUCKET
-              value: "{env['DEST_BUCKET']}"
+            - name: SOURCE_PATH
+              value: "{env['SOURCE_PATH']}"
             - name: DEST_PATH
               value: "{env['DEST_PATH']}"
             - name: SCALES
@@ -291,7 +296,7 @@ def main():
         print(f"  Saved to {ENV_FILE}")
 
     # Setup destination info file
-    setup_destination_info(final["DEST_BUCKET"], final["DEST_PATH"], ng_spec)
+    setup_destination_info(final["DEST_PATH"], ng_spec)
 
     # Encode the ng spec for the Cloud Run env var
     ng_spec_json = json.dumps(ng_spec, separators=(",", ":"))

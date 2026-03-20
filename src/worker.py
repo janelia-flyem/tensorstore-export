@@ -29,14 +29,21 @@ logger = structlog.get_logger()
 CHUNK_VOXELS = 64  # voxels per chunk dimension
 
 
+def _parse_gs_uri(uri: str) -> Tuple[str, str]:
+    """Split gs://bucket/path into (bucket, path)."""
+    if not uri.startswith("gs://"):
+        raise ValueError(f"Expected gs:// URI, got: {uri}")
+    rest = uri[len("gs://"):]
+    bucket, _, path = rest.partition("/")
+    return bucket, path.rstrip("/")
+
+
 class WorkerConfig(BaseModel):
     """Configuration for the Cloud Run worker."""
 
-    # GCS configuration
-    source_bucket: str
-    source_prefix: str  # e.g., "dvid-exports/mCNS-98d699/segmentation"
-    dest_bucket: str
-    dest_path: str  # e.g., "v1.0/segmentation/precomputed"
+    # GCS URIs (e.g., "gs://bucket/path/to/shards", "gs://bucket/path/to/output")
+    source_path: str  # contains s0/, s1/, ... with .arrow + .csv pairs
+    dest_path: str    # neuroglancer precomputed volume root
 
     # Neuroglancer multiscale volume spec (same JSON used for DVID export-shards)
     ng_spec: Dict[str, Any] = {}
@@ -60,13 +67,15 @@ class ShardProcessor:
 
     def __init__(self, config: WorkerConfig):
         self.config = config
+        self._source_bucket, self._source_prefix = _parse_gs_uri(config.source_path)
+        self._dest_bucket, self._dest_prefix = _parse_gs_uri(config.dest_path)
         self.storage_client = storage.Client()
-        self.source_bucket_obj = self.storage_client.bucket(config.source_bucket)
+        self.source_bucket_obj = self.storage_client.bucket(self._source_bucket)
         self._dest_stores: Dict[int, ts.TensorStore] = {}
 
         logger.info("Initialized shard processor",
-                     source=f"gs://{config.source_bucket}/{config.source_prefix}",
-                     dest=f"gs://{config.dest_bucket}/{config.dest_path}",
+                     source=config.source_path,
+                     dest=config.dest_path,
                      scales=config.scales)
 
     def _open_dest_scale(self, scale: int) -> ts.TensorStore:
@@ -79,11 +88,7 @@ class ShardProcessor:
 
         spec = {
             "driver": "neuroglancer_precomputed",
-            "kvstore": {
-                "driver": "gcs",
-                "bucket": self.config.dest_bucket,
-                "path": self.config.dest_path,
-            },
+            "kvstore": self.config.dest_path,
             "scale_index": scale,
             "open": True,
         }
@@ -100,7 +105,7 @@ class ShardProcessor:
             shard_name is the stem (e.g., "0_0_0").
         """
         for scale in self.config.scales:
-            prefix = f"{self.config.source_prefix}/s{scale}/"
+            prefix = f"{self._source_prefix}/s{scale}/"
             blobs = self.source_bucket_obj.list_blobs(prefix=prefix)
 
             for blob in blobs:
@@ -131,8 +136,8 @@ class ShardProcessor:
 
             dest = self._open_dest_scale(scale)
 
-            arrow_uri = f"gs://{self.config.source_bucket}/{self.config.source_prefix}/s{scale}/{shard_name}.arrow"
-            csv_uri = f"gs://{self.config.source_bucket}/{self.config.source_prefix}/s{scale}/{shard_name}.csv"
+            arrow_uri = f"{self.config.source_path}/s{scale}/{shard_name}.arrow"
+            csv_uri = f"{self.config.source_path}/s{scale}/{shard_name}.csv"
             reader = ShardReader(arrow_uri, csv_uri)
 
             logger.info("Shard loaded",
@@ -298,9 +303,7 @@ def create_config_from_env() -> WorkerConfig:
     downres_scales = [int(s.strip()) for s in downres_str.split(",") if s.strip()]
 
     return WorkerConfig(
-        source_bucket=os.environ["SOURCE_BUCKET"],
-        source_prefix=os.environ["SOURCE_PREFIX"],
-        dest_bucket=os.environ["DEST_BUCKET"],
+        source_path=os.environ["SOURCE_PATH"],
         dest_path=os.environ["DEST_PATH"],
         ng_spec=ng_spec,
         scales=scales,
