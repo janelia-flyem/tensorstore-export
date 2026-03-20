@@ -231,7 +231,7 @@ spec:
       template:
         spec:
           maxRetries: {env['MAX_RETRIES']}
-          taskTimeoutSeconds: {env['TASK_TIMEOUT'].rstrip('s')}
+          timeout: {env['TASK_TIMEOUT']}
           containers:
           - image: gcr.io/{env['PROJECT_ID']}/{env['JOB_NAME']}
             env:
