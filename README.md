@@ -10,39 +10,130 @@ This project converts those shard files into [neuroglancer precomputed](https://
 
 ## Architecture
 
-The system has three components:
+1. **[BRAID](braid/)** (Block Records Arrow Indexed Dataset) — A standalone Python library for reading sharded Arrow IPC files with block-level random access and DVID block decompression. Reads directly from local disk or GCS via PyArrow's native filesystem — no temp files or intermediate copies.
 
-1. **[BRAID](braid/)** (Block Records Arrow Indexed Dataset) — A standalone Python library for reading sharded Arrow IPC files with block-level random access and DVID block decompression.
+2. **Cloud Run Worker** (`src/worker.py`) — Distributed worker that reads DVID shard files from GCS via BRAID, decompresses each chunk, and writes to the neuroglancer precomputed volume via TensorStore. Scale-aware: can process DVID export shards at any scale, or generate downsampled scales from the previous scale's data.
 
-2. **TensorStore Adapter** (`src/tensorstore_adapter.py`) — Bridges BRAID readers to TensorStore's `virtual_chunked` driver, enabling memory-efficient on-demand chunk loading without materializing full shard volumes.
-
-3. **Cloud Run Worker** (`src/worker.py`) — Distributed worker that polls for available shards on GCS, processes them, and writes to a shared neuroglancer precomputed volume.
+3. **Deploy Script** (`scripts/deploy.py`) — Interactive deployment tool that reads configuration from `.env`, parses the neuroglancer volume spec JSON, and creates Cloud Run jobs with appropriate memory sizing per scale.
 
 ## Data Flow
 
 ```
-DVID export-shards      Cloud Run Workers         Neuroglancer Volume
-  (Arrow IPC + CSV)  -->  (BRAID + TensorStore)  -->  (precomputed on GCS)
-       |                        |                            |
-  Per-shard files         virtual_chunked             Shared output
-  on GCS                  block-wise reads            volume on GCS
+DVID export-shards          Cloud Run Workers              Neuroglancer Volume
+  (Arrow IPC + CSV)    -->    (BRAID + TensorStore)    -->   (precomputed on GCS)
+  per-scale dirs on GCS       read directly from GCS         shared output volume
+  s0/, s1/, s2/, ...          no temp files                  multi-scale
 ```
 
-### Job Coordination
+### Multi-Scale Processing
 
-Workers self-coordinate without a central orchestrator using GCS prefix-based state:
+Workers support two modes for generating each scale:
 
-- `gs://<bucket>/unprocessed/` — shard files waiting to be processed
-- `gs://<bucket>/processing/` — claimed by a worker (atomic move acts as lock)
-- `gs://<bucket>/finished/` — successfully processed
+**From DVID export shards** (default): DVID's `export-shards` pre-computes downsampled blocks at each scale using majority-vote downres. Workers ingest these directly — no computation needed, and the output exactly matches what DVID serves.
 
-If a move fails due to contention, the worker tries the next shard.
+**From previous scale** (downres mode): For scales not materialized in DVID (e.g., if `MaxDownresLevel` was set lower than the number of scales in the spec), workers can generate scale N by reading scale N-1 from the neuroglancer precomputed volume on GCS and downsampling with `ts.downsample(method='mode')`. This requires scale N-1 to be fully written first.
+
+## Quick Start
+
+### Prerequisites
+
+- [pixi](https://pixi.sh) — package manager (handles Python, dependencies, and tasks)
+- [Docker](https://www.docker.com/) — for building Cloud Run container images
+- [gcloud CLI](https://cloud.google.com/sdk) — for deploying to Cloud Run
+
+### Install and Test
+
+```bash
+# Install all dependencies (Python, BRAID, TensorStore, etc.)
+pixi install
+
+# Run all tests (65 tests, ~55 seconds)
+pixi run test-all
+```
+
+### Configure
+
+Copy `.env.example` to `.env` and fill in your GCP project and data paths:
+
+```bash
+cp .env.example .env
+# Edit .env with your settings
+```
+
+The neuroglancer volume spec JSON (same file used for DVID's `export-shards` command) is the single source of truth for volume geometry and sharding parameters. Point `NG_SPEC_PATH` in `.env` to this file.
+
+### Deploy
+
+```bash
+# Interactive deployment — prompts for settings with .env defaults,
+# writes neuroglancer info file, builds Docker image, creates Cloud Run job
+pixi run deploy
+```
+
+The deploy script shows per-scale shard size estimates and recommends memory tiers:
+
+```
+--- Neuroglancer Volume Spec ---
+  Reading ng-specs.json...
+  Type: segmentation, data_type: uint64, 10 scale(s)
+  Scale 0: 94088x78317x134576 @ 8nm, shard_bits=19 ...
+
+  Estimated shard sizes (from sharding params):
+    Scale 0: shard=2048^3, up to 32768 chunks, ~160 MB max
+    Scale 1: shard=2048^3, up to 32768 chunks, ~320 MB max
+    ...
+```
+
+### Execute
+
+```bash
+# Run the Cloud Run job
+gcloud run jobs execute <job-name> --region=<region> --project=<project>
+```
+
+### One-Time Setup
+
+Before the first deployment, the neuroglancer `info` file must exist at the destination:
+
+```bash
+# Write info file to GCS (also done automatically by pixi run deploy)
+pixi run setup-destination
+```
+
+## Configuration
+
+All deployment-specific values come from `.env` (not committed) and the ng spec JSON. Nothing is hardcoded to a specific dataset.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PROJECT_ID` | GCP project ID | required |
+| `REGION` | GCP region | `us-central1` |
+| `SOURCE_BUCKET` | GCS bucket with Arrow shard files | required |
+| `SOURCE_PREFIX` | Path prefix containing s0/, s1/, ... dirs | required |
+| `DEST_BUCKET` | GCS bucket for neuroglancer output | required |
+| `DEST_PATH` | Path for precomputed volume | required |
+| `NG_SPEC_PATH` | Path to neuroglancer volume spec JSON | required |
+| `SCALES` | Comma-separated scale indices to process | `0,1` |
+| `PARALLELISM` | Number of parallel Cloud Run workers | `200` |
+| `MEMORY` | Memory per worker | `2Gi` |
+
+### Memory Sizing by Scale
+
+Shard sizes grow at lower resolutions because each shard covers more physical volume. Recommended memory per worker:
+
+| Scales | Typical shards | Recommended memory |
+|--------|---------------|-------------------|
+| 0–1 | 135–321 MB median | 2 GiB |
+| 2–3 | 504–799 MB median | 4 GiB |
+| 4+ | 1.4+ GB median | 8 GiB |
+
+Deploy separate Cloud Run jobs per memory tier, or use a single job sized for the largest scale.
 
 ## Shard File Format
 
-Each DVID shard consists of two files:
+Each DVID shard consists of two files written in Arrow IPC Streaming format:
 
-- **`{origin}.arrow`** — Arrow IPC file containing compressed segmentation blocks
+- **`{origin}.arrow`** — Arrow IPC stream containing compressed segmentation blocks
 - **`{origin}.csv`** — CSV index mapping chunk coordinates to Arrow record indices
 
 ### Arrow Schema
@@ -55,99 +146,39 @@ Each DVID shard consists of two files:
 | `labels` | list\<uint64\> | Agglomerated label IDs |
 | `supervoxels` | list\<uint64\> | Original supervoxel IDs |
 | `dvid_compressed_block` | binary | Zstd-compressed DVID block data |
-| `uncompressed_size` | uint32 | Size before compression |
+| `uncompressed_size` | uint32 | Size of DVID block before zstd |
 
-### CSV Index
-
-```csv
-x,y,z,rec
-0,0,0,0
-64,0,0,1
-64,64,0,2
-```
-
-## Quick Start
-
-### Prerequisites
-
-- Python >= 3.10
-- Google Cloud SDK (for deployment)
-- Docker (for Cloud Run)
-
-### Install Dependencies
-
-```bash
-# Main application
-pip install -r requirements.txt
-
-# BRAID library (for development)
-cd braid && pip install -e .[dev]
-```
-
-### Local Development
-
-```bash
-# Run BRAID tests
-cd braid && pytest -v
-
-# Run with coverage
-cd braid && pytest -v --cov=braid --cov-report=term-missing
-```
-
-### Deploy to Cloud Run
-
-Configure environment variables in `scripts/deploy.sh`, then:
-
-```bash
-# Set your GCP project
-export PROJECT_ID=your-gcp-project
-export SOURCE_BUCKET=your-source-bucket
-export DEST_BUCKET=your-dest-bucket
-
-./scripts/deploy.sh
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SOURCE_BUCKET` | GCS bucket with Arrow shard files | required |
-| `DEST_BUCKET` | GCS bucket for neuroglancer output | required |
-| `DEST_PATH` | Path within destination bucket | required |
-| `TOTAL_VOLUME_SHAPE` | Volume dimensions as "z,y,x" | required |
-| `SHARD_SHAPE` | Shard dimensions | 2048,2048,2048 |
-| `CHUNK_SHAPE` | Block dimensions | 64,64,64 |
-| `RESOLUTION` | Voxel resolution in nm | 8,8,8 |
-
-## Multi-Scale Volumes
-
-The distributed pipeline processes only full-resolution (Scale 0) data. Downsampled scales are generated in a separate post-processing step using TensorStore's built-in downsampling, reading from the completed Scale 0 data on GCS. See `docs/ShardExportDesign.md` for details.
+BRAID reads these files directly from GCS using PyArrow's native C++ filesystem — no temp files, no Python-level copies. Arrow IPC data flows through Arrow's C++ runtime; CSV indices are parsed by `pyarrow.csv`.
 
 ## Project Structure
 
 ```
 tensorstore-export/
-├── main.py                      # Cloud Run entry point
-├── requirements.txt             # Python dependencies
-├── Dockerfile                   # Container for Cloud Run
-├── scripts/deploy.sh            # Deployment script
-├── src/                         # Main application
-│   ├── worker.py               # Cloud Run worker with GCS job management
-│   ├── shard_reader.py         # DVID shard reading interface
-│   └── tensorstore_adapter.py  # TensorStore virtual_chunked integration
-├── braid/                       # BRAID library (future: github.com/JaneliaSciComp/braid)
-│   ├── src/braid/              # Library source
-│   │   ├── reader.py           # ShardReader class
-│   │   ├── decompressor.py     # DVID block decompressor
-│   │   └── exceptions.py       # Custom exceptions
-│   ├── tests/                  # Test suite
-│   └── pyproject.toml          # Package configuration
-├── docs/                        # Technical documentation
-│   ├── ShardExportDesign.md    # Distributed system architecture
-│   ├── ExportShards.md         # DVID export format specification
-│   ├── EfficientWrites.md      # Memory optimization strategies
-│   └── ArrowParallelWrite.md   # Arrow integration details
-└── config/                      # Neuroglancer volume specifications
+├── main.py                          # Cloud Run entry point
+├── pixi.toml                        # Pixi workspace (deps, tasks)
+├── Dockerfile                       # Container for Cloud Run
+├── .env.example                     # Configuration template
+├── scripts/
+│   ├── deploy.py                   # Interactive deployment
+│   └── setup_destination.py        # One-time info file setup
+├── src/
+│   ├── worker.py                   # Cloud Run worker
+│   └── tensorstore_adapter.py      # TensorStore helpers
+├── braid/                           # BRAID library
+│   ├── src/braid/
+│   │   ├── reader.py               # ShardReader (local + GCS)
+│   │   ├── decompressor.py         # DVID block decompressor
+│   │   └── exceptions.py           # Custom exceptions
+│   └── tests/
+│       ├── test_real_data.py       # Ground truth vs Go decompressor
+│       ├── test_go_produced_shard.py  # Real DVID export shard tests
+│       ├── test_e2e_precomputed.py # Full pipeline tests
+│       └── test_data/              # Real DVID test data
+└── docs/
+    ├── mCNS-ExportAnalysis.md      # Real export data analysis
+    ├── ExportObservabilityPlan.md   # DVID export error detection
+    ├── ShardExportDesign.md         # Distributed system design
+    └── ExportShards.md             # DVID export format spec
 ```
 
 ## Related Projects

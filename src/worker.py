@@ -44,6 +44,12 @@ class WorkerConfig(BaseModel):
     # Which scales to process (e.g., [0, 1])
     scales: List[int] = [0]
 
+    # Scales to generate by downsampling the previous scale's data from the
+    # destination volume rather than reading DVID export shards.  Useful for
+    # scales not materialized in DVID (e.g., MaxDownresLevel was set lower
+    # than the number of scales in the spec).
+    downres_scales: List[int] = []
+
     # Worker behavior
     max_processing_time_minutes: int = 55
     polling_interval_seconds: int = 10
@@ -164,6 +170,50 @@ class ShardProcessor:
                           scale=scale, shard=shard_name, error=str(e))
             return False
 
+    def downres_scale(self, scale: int) -> bool:
+        """Generate a scale by downsampling the previous scale from the destination.
+
+        Reads scale N-1 from the neuroglancer precomputed volume on GCS,
+        downsamples 2× in each dimension using majority vote, and writes
+        scale N.  Requires scale N-1 to be fully written.
+
+        Args:
+            scale: Scale level to generate (must be >= 1)
+
+        Returns:
+            True if successful.
+        """
+        if scale < 1:
+            logger.error("Cannot downres scale 0 — no previous scale exists")
+            return False
+
+        try:
+            logger.info("Generating scale by downres", scale=scale, source_scale=scale - 1)
+
+            source = self._open_dest_scale(scale - 1)
+            dest = self._open_dest_scale(scale)
+
+            # Create a downsampled virtual view of the source scale.
+            # 'mode' = majority vote, correct for uint64 segmentation labels.
+            # The channel dimension (last) is not downsampled.
+            downsampled = ts.downsample(source, [2, 2, 2, 1], "mode")
+
+            # Copy the downsampled view into the destination scale.
+            # TensorStore handles chunk-aligned writes internally.
+            logger.info("Starting downres copy",
+                         source_domain=str(source.domain),
+                         dest_domain=str(dest.domain))
+
+            ts.copy(downsampled, dest).result()
+
+            logger.info("Downres complete", scale=scale)
+            return True
+
+        except Exception as e:
+            logger.error("Failed to downres scale",
+                          scale=scale, error=str(e))
+            return False
+
 
 class CloudRunWorker:
     """Main Cloud Run worker that finds and processes shards until time limit."""
@@ -178,16 +228,21 @@ class CloudRunWorker:
         return elapsed_minutes < self.config.max_processing_time_minutes
 
     async def run(self):
-        logger.info("Starting worker", scales=self.config.scales)
+        logger.info("Starting worker",
+                     scales=self.config.scales,
+                     downres_scales=self.config.downres_scales)
 
         processed_count = 0
         failed_count = 0
 
+        # Phase 1: Process DVID export shards
         while self._should_continue():
             try:
                 result = self.processor.find_available_shard()
 
                 if result is None:
+                    if self.config.downres_scales:
+                        break  # Move on to downres phase
                     logger.debug("No work available, sleeping")
                     await asyncio.sleep(self.config.polling_interval_seconds)
                     continue
@@ -210,6 +265,16 @@ class CloudRunWorker:
                 logger.error("Unexpected error in worker loop", error=str(e))
                 await asyncio.sleep(self.config.polling_interval_seconds)
 
+        # Phase 2: Generate downres scales from previous scale data
+        for scale in sorted(self.config.downres_scales):
+            if not self._should_continue():
+                logger.warning("Time limit reached, skipping downres", scale=scale)
+                break
+            if self.processor.downres_scale(scale):
+                processed_count += 1
+            else:
+                failed_count += 1
+
         elapsed = (time.time() - self.start_time) / 60
         logger.info("Worker finished",
                      elapsed_minutes=round(elapsed, 1),
@@ -229,6 +294,9 @@ def create_config_from_env() -> WorkerConfig:
     scales_str = os.environ.get("SCALES", "0")
     scales = [int(s.strip()) for s in scales_str.split(",")]
 
+    downres_str = os.environ.get("DOWNRES_SCALES", "")
+    downres_scales = [int(s.strip()) for s in downres_str.split(",") if s.strip()]
+
     return WorkerConfig(
         source_bucket=os.environ["SOURCE_BUCKET"],
         source_prefix=os.environ["SOURCE_PREFIX"],
@@ -236,6 +304,7 @@ def create_config_from_env() -> WorkerConfig:
         dest_path=os.environ["DEST_PATH"],
         ng_spec=ng_spec,
         scales=scales,
+        downres_scales=downres_scales,
         max_processing_time_minutes=int(os.environ.get("MAX_PROCESSING_TIME", "55")),
         polling_interval_seconds=int(os.environ.get("POLLING_INTERVAL", "10")),
     )
