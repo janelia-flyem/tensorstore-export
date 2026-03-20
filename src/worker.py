@@ -140,11 +140,28 @@ class ShardProcessor:
                      task_count=self._task_count)
         return my_shards
 
+    def _open_shard_with_retry(self, arrow_uri: str, csv_uri: str,
+                               max_retries: int = 5) -> ShardReader:
+        """Open a shard with exponential backoff for transient GCS errors."""
+        for attempt in range(max_retries):
+            try:
+                return ShardReader(arrow_uri, csv_uri)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+                logger.warning("Shard read failed, retrying",
+                                arrow=arrow_uri, attempt=attempt + 1,
+                                wait_seconds=wait, error=str(e)[:200])
+                time.sleep(wait)
+        raise RuntimeError("unreachable")
+
     def process_shard(self, scale: int, shard_name: str) -> bool:
         """Process a single shard: read from GCS, decompress, write to destination.
 
         BRAID's ShardReader reads directly from GCS via PyArrow's native
-        filesystem — no temp files or intermediate copies.
+        filesystem — no temp files or intermediate copies.  Retries with
+        exponential backoff on transient GCS connection errors.
 
         Args:
             scale: Scale level (0, 1, 2, ...)
@@ -160,7 +177,7 @@ class ShardProcessor:
 
             arrow_uri = f"{self.config.source_path}/s{scale}/{shard_name}.arrow"
             csv_uri = f"{self.config.source_path}/s{scale}/{shard_name}.csv"
-            reader = ShardReader(arrow_uri, csv_uri)
+            reader = self._open_shard_with_retry(arrow_uri, csv_uri)
 
             logger.info("Shard loaded",
                          shard=shard_name,
