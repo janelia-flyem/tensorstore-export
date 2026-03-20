@@ -334,42 +334,63 @@ def main():
     ng_spec_json = json.dumps(ng_spec, separators=(",", ":"))
     ng_spec_b64 = base64.b64encode(ng_spec_json.encode()).decode()
 
-    # Build and push Docker image
-    image = f"gcr.io/{final['PROJECT_ID']}/{final['JOB_NAME']}"
+    # Build and push Docker image, tagged with git commit hash.
+    # Skip build if image for current commit already exists in GCR.
+    git_hash = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, cwd=str(PROJECT_ROOT),
+    ).stdout.strip() or "latest"
 
-    # Use Cloud Build if Docker is not available locally
-    try:
-        docker_ok = subprocess.run(
-            ["docker", "version"], capture_output=True, timeout=5
-        ).returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        docker_ok = False
+    image_base = f"gcr.io/{final['PROJECT_ID']}/{final['JOB_NAME']}"
+    image_tagged = f"{image_base}:{git_hash}"
+    image = image_tagged  # used in Cloud Run job spec
 
-    if args.skip_build:
-        print(f"\n  Skipping build — reusing existing image: {image}")
-    elif docker_ok:
-        if not run_cmd(
-            ["docker", "build", "-t", image, str(PROJECT_ROOT)],
-            f"Building Docker image locally: {image}",
-        ):
-            sys.exit(1)
-        if not run_cmd(
-            ["docker", "push", image],
-            f"Pushing image to {image}",
-        ):
-            sys.exit(1)
+    # Check if this exact image already exists in GCR
+    image_exists = subprocess.run(
+        ["gcloud", "container", "images", "describe", image_tagged,
+         f"--project={final['PROJECT_ID']}"],
+        capture_output=True,
+    ).returncode == 0
+
+    if args.skip_build or image_exists:
+        if image_exists:
+            print(f"\n  Image already exists for commit {git_hash} — skipping build.")
+        else:
+            print(f"\n  Skipping build (--skip-build) — reusing image: {image_base}:latest")
+            image = f"{image_base}:latest"
     else:
-        print("\n  Docker not found locally — using Google Cloud Build instead.")
-        if not run_cmd(
-            [
-                "gcloud", "builds", "submit",
-                f"--tag={image}",
-                f"--project={final['PROJECT_ID']}",
-                str(PROJECT_ROOT),
-            ],
-            f"Building and pushing image via Cloud Build: {image}",
-        ):
-            sys.exit(1)
+        # Use Cloud Build if Docker is not available locally
+        try:
+            docker_ok = subprocess.run(
+                ["docker", "version"], capture_output=True, timeout=5
+            ).returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            docker_ok = False
+
+        if docker_ok:
+            if not run_cmd(
+                ["docker", "build", "-t", image_tagged, "-t", f"{image_base}:latest",
+                 str(PROJECT_ROOT)],
+                f"Building Docker image locally: {image_tagged}",
+            ):
+                sys.exit(1)
+            if not run_cmd(
+                ["docker", "push", "--all-tags", image_base],
+                f"Pushing image to {image_base}",
+            ):
+                sys.exit(1)
+        else:
+            print("\n  Docker not found locally — using Google Cloud Build instead.")
+            if not run_cmd(
+                [
+                    "gcloud", "builds", "submit",
+                    f"--tag={image_tagged}",
+                    f"--project={final['PROJECT_ID']}",
+                    str(PROJECT_ROOT),
+                ],
+                f"Building and pushing image via Cloud Build: {image_tagged}",
+            ):
+                sys.exit(1)
 
     # Create or update Cloud Run job
     cmd = build_cloud_run_create_cmd(final, ng_spec_b64, image)
