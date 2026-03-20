@@ -254,7 +254,20 @@ spec:
 """
 
 
+# Placeholder values from .env.example that should be treated as "not configured"
+PLACEHOLDERS = {"your-gcp-project", "gs://your-bucket/path/to/shard/export",
+                "gs://your-bucket/path/to/precomputed/output", "ng-specs.json"}
+
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Deploy tensorstore-export to Cloud Run.")
+    parser.add_argument(
+        "--use-env", action="store_true",
+        help="Use all values from .env without prompting (only prompt for missing values)",
+    )
+    args = parser.parse_args()
+
     print("\n=== TensorStore Export — Cloud Run Deployment ===\n")
 
     # Check for GCP credentials early, before interactive prompting
@@ -294,7 +307,12 @@ def main():
 
         for key, builtin_default, description in fields:
             default = env.get(key, builtin_default)
-            final[key] = prompt_value(key, default, description)
+            if args.use_env and key in env and env[key] not in PLACEHOLDERS:
+                # --use-env: accept .env value silently
+                final[key] = env[key]
+                print(f"  {key} ({description}): {env[key]}")
+            else:
+                final[key] = prompt_value(key, default, description)
 
         # After the NG spec section, load and display the spec
         if section_name == "Neuroglancer Volume Spec":
