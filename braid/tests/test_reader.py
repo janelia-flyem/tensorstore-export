@@ -78,7 +78,7 @@ def test_reader_initialization(sample_shard_files):
 
 def test_reader_initialization_missing_files():
     """Test reader initialization with missing files."""
-    with pytest.raises(BraidError, match="Arrow file not found"):
+    with pytest.raises(BraidError, match="File not found"):
         ShardReader("nonexistent.arrow", "nonexistent.csv")
 
 

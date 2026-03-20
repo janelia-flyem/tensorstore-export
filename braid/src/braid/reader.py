@@ -2,8 +2,12 @@
 BRAID Shard Reader class.
 
 Provides chunk-wise access to sharded Arrow files with CSV coordinate indices.
-Supports local files and cloud storage (GCS, S3) transparently via PyArrow's
-native filesystem abstraction.
+Supports local files and GCS URIs (gs://bucket/path) transparently.
+
+GCS access uses google-cloud-storage (install with ``pip install braid[gcs]``)
+rather than PyArrow's native ``pyarrow.fs.GcsFileSystem``, which suffers from
+CURL error 81 ("Socket not ready for send/recv") on Google Cloud Run.
+See docs/GoogleCloudRunIssues.md for details.
 """
 
 from enum import Enum
@@ -12,21 +16,41 @@ from typing import Dict, List, Tuple, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.csv as pcsv
-import pyarrow.fs as pafs
 import pyarrow.ipc as ipc
 from .decompressor import DVIDDecompressor
 from .exceptions import BraidError, ChunkNotFoundError, DecompressionError, InvalidShardFormatError, InvalidCoordinateError
 
 
-def _resolve_fs(path: str) -> Tuple[pafs.FileSystem, str]:
-    """Resolve a path string to a PyArrow filesystem and normalized path.
+def _read_bytes(path: str) -> bytes:
+    """Read all bytes from a local path or GCS URI.
 
-    Handles local paths and URI schemes (gs://, s3://, etc.) transparently.
-    For local paths, resolves to absolute path for consistency.
+    For local paths, uses standard file I/O.
+    For gs:// URIs, downloads via google-cloud-storage.
     """
-    if "://" in path:
-        return pafs.FileSystem.from_uri(path)
-    return pafs.LocalFileSystem(), str(Path(path).resolve())
+    if path.startswith("gs://"):
+        return _read_gcs_bytes(path)
+    local = Path(path).resolve()
+    if not local.exists():
+        raise BraidError(f"File not found: {path}")
+    return local.read_bytes()
+
+
+def _read_gcs_bytes(uri: str) -> bytes:
+    """Download bytes from a gs:// URI using google-cloud-storage."""
+    try:
+        from google.cloud import storage
+    except ImportError:
+        raise BraidError(
+            "google-cloud-storage is required for GCS access. "
+            "Install with: pip install braid[gcs]"
+        )
+    rest = uri[len("gs://"):]
+    bucket_name, _, blob_path = rest.partition("/")
+    client = storage.Client()
+    blob = client.bucket(bucket_name).blob(blob_path)
+    if not blob.exists():
+        raise BraidError(f"GCS file not found: {uri}")
+    return blob.download_as_bytes()
 
 
 class LabelType(Enum):
@@ -40,14 +64,14 @@ class ShardReader:
     BRAID shard reader for Arrow files with CSV coordinate indices.
 
     Reads Arrow IPC shard files and CSV chunk indices from local disk or
-    cloud storage (GCS, S3) using PyArrow's native filesystem layer.
-    All I/O stays in Arrow's C++ runtime for efficiency.
+    GCS (gs:// URIs).  GCS access uses google-cloud-storage for reliability
+    on Cloud Run (see docs/GoogleCloudRunIssues.md).
 
     Example:
         >>> # Local files
         >>> reader = ShardReader("shard_0_0_0.arrow", "shard_0_0_0.csv")
 
-        >>> # GCS files (zero temp files, C++ native I/O)
+        >>> # GCS files (downloaded via google-cloud-storage)
         >>> reader = ShardReader(
         ...     "gs://bucket/shards/s0/0_0_0.arrow",
         ...     "gs://bucket/shards/s0/0_0_0.csv",
@@ -82,18 +106,7 @@ class ShardReader:
         self.arrow_path = str(arrow_path)
         self.csv_path = str(csv_path)
 
-        # Resolve filesystems and check existence
-        self._arrow_fs, self._arrow_resolved = _resolve_fs(self.arrow_path)
-        info = self._arrow_fs.get_file_info(self._arrow_resolved)
-        if info.type == pafs.FileType.NotFound:
-            raise BraidError(f"Arrow file not found: {self.arrow_path}")
-
-        self._csv_fs, self._csv_resolved = _resolve_fs(self.csv_path)
-        info = self._csv_fs.get_file_info(self._csv_resolved)
-        if info.type == pafs.FileType.NotFound:
-            raise BraidError(f"CSV file not found: {self.csv_path}")
-
-        # Load data during initialization
+        # Load data during initialization (existence checked during read)
         self._table = self._load_arrow_data()
         self._chunk_index = self._load_csv_index()
         self._decompressor = DVIDDecompressor()
@@ -102,25 +115,22 @@ class ShardReader:
         self._validate_data()
 
     def _load_arrow_data(self) -> pa.Table:
-        """Load Arrow IPC table via PyArrow's native filesystem.
+        """Load Arrow IPC table from bytes.
 
-        Data flows through Arrow's C++ runtime (NativeFile → IPC reader → Table).
-        Tries File format first (seekable, random access) then falls back to
+        Downloads the file (local or GCS), then parses via PyArrow IPC.
+        Tries File format first (random access) then falls back to
         Streaming format (sequential) which DVID's export-shards writes.
         """
         try:
-            # Try File format first — needs seekable input (open_input_file)
-            f = self._arrow_fs.open_input_file(self._arrow_resolved)
+            data = _read_bytes(self.arrow_path)
+            buf = pa.BufferReader(data)
             try:
-                reader = ipc.open_file(f)
+                reader = ipc.open_file(buf)
                 return reader.read_all()
             except pa.ArrowInvalid:
-                pass
-
-            # Fall back to Streaming format — sequential read is fine
-            f = self._arrow_fs.open_input_stream(self._arrow_resolved)
-            reader = ipc.open_stream(f)
-            return reader.read_all()
+                buf = pa.BufferReader(data)
+                reader = ipc.open_stream(buf)
+                return reader.read_all()
         except Exception as e:
             if isinstance(e, BraidError):
                 raise
@@ -129,12 +139,12 @@ class ShardReader:
     def _load_csv_index(self) -> Dict[Tuple[int, int, int], int]:
         """Load CSV chunk index using PyArrow's CSV reader.
 
-        Parses entirely in C++ via pyarrow.csv.read_csv(), then builds
-        the Python lookup dict from Arrow columns.
+        Downloads the file (local or GCS), parses via pyarrow.csv in C++,
+        then builds the Python lookup dict from Arrow columns.
         """
         try:
-            f = self._csv_fs.open_input_stream(self._csv_resolved)
-            table = pcsv.read_csv(f)
+            data = _read_bytes(self.csv_path)
+            table = pcsv.read_csv(pa.BufferReader(data))
 
             # Validate columns
             expected = {"x", "y", "z", "rec"}
