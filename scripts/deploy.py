@@ -16,7 +16,6 @@ import math
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -214,44 +213,30 @@ def setup_destination_info(dest_uri: str, ng_spec: dict):
         print(f"  Written ({len(info_json)} bytes, {len(info['scales'])} scales)")
 
 
-def build_cloud_run_yaml(env: dict, ng_spec_b64: str) -> str:
-    """Generate the Cloud Run job YAML spec."""
-    return f"""\
-apiVersion: run.googleapis.com/v1
-kind: Job
-metadata:
-  name: {env['JOB_NAME']}
-  labels:
-    cloud.googleapis.com/location: {env['REGION']}
-spec:
-  template:
-    spec:
-      parallelism: {env['PARALLELISM']}
-      taskCount: {env['TASK_COUNT']}
-      template:
-        spec:
-          maxRetries: {env['MAX_RETRIES']}
-          timeout: {env['TASK_TIMEOUT']}
-          containers:
-          - image: gcr.io/{env['PROJECT_ID']}/{env['JOB_NAME']}
-            env:
-            - name: SOURCE_PATH
-              value: "{env['SOURCE_PATH']}"
-            - name: DEST_PATH
-              value: "{env['DEST_PATH']}"
-            - name: SCALES
-              value: "{env['SCALES']}"
-            - name: NG_SPEC
-              value: "{ng_spec_b64}"
-            - name: MAX_PROCESSING_TIME
-              value: "55"
-            - name: POLLING_INTERVAL
-              value: "10"
-            resources:
-              limits:
-                cpu: "{env['CPU']}"
-                memory: "{env['MEMORY']}"
-"""
+def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str) -> list:
+    """Build the gcloud run jobs create/update CLI command."""
+    env_vars = ",".join([
+        f"SOURCE_PATH={env['SOURCE_PATH']}",
+        f"DEST_PATH={env['DEST_PATH']}",
+        f"SCALES={env['SCALES']}",
+        f"NG_SPEC={ng_spec_b64}",
+        "MAX_PROCESSING_TIME=55",
+        "POLLING_INTERVAL=10",
+    ])
+
+    return [
+        "gcloud", "run", "jobs", "create", env["JOB_NAME"],
+        f"--image={image}",
+        f"--region={env['REGION']}",
+        f"--project={env['PROJECT_ID']}",
+        f"--tasks={env['TASK_COUNT']}",
+        f"--parallelism={env['PARALLELISM']}",
+        f"--max-retries={env['MAX_RETRIES']}",
+        f"--task-timeout={env['TASK_TIMEOUT']}",
+        f"--memory={env['MEMORY']}",
+        f"--cpu={env['CPU']}",
+        f"--set-env-vars={env_vars}",
+    ]
 
 
 # Placeholder values from .env.example that should be treated as "not configured"
@@ -380,25 +365,22 @@ def main():
         ):
             sys.exit(1)
 
-    # Create/update Cloud Run job
-    yaml_content = build_cloud_run_yaml(final, ng_spec_b64)
+    # Create or update Cloud Run job
+    cmd = build_cloud_run_create_cmd(final, ng_spec_b64, image)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_content)
-        yaml_path = f.name
-
-    try:
-        if not run_cmd(
-            [
-                "gcloud", "run", "jobs", "replace", yaml_path,
-                f"--region={final['REGION']}",
-                f"--project={final['PROJECT_ID']}",
-            ],
-            "Creating/updating Cloud Run job",
-        ):
+    # Try create first; if job already exists, update it instead
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 and "already exists" in result.stderr:
+        cmd[3] = "update"  # replace "create" with "update"
+        if not run_cmd(cmd, "Updating Cloud Run job"):
             sys.exit(1)
-    finally:
-        os.unlink(yaml_path)
+    elif result.returncode != 0:
+        print(f"\nCreating Cloud Run job...")
+        print(result.stderr)
+        print(f"  Failed (exit code {result.returncode})")
+        sys.exit(1)
+    else:
+        print(f"\nCreating Cloud Run job... done.")
 
     print(f"\nDone.")
     print(f"  Execute: gcloud run jobs execute {final['JOB_NAME']} --region={final['REGION']} --project={final['PROJECT_ID']}")
