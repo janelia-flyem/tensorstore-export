@@ -70,14 +70,14 @@ Done.
 
 All values are saved to `.env` for future runs. You can also edit `.env` directly (see `.env.example` for all options).
 
-### Precompute Manifests
+### Export
 
-Before running workers, precompute task manifests that assign shards to
-memory-appropriate tiers. This scans all Arrow source files and groups them
-by estimated memory requirement:
+After deploying, run the export. This single command scans all Arrow source
+files, assigns shards to memory tiers, writes per-task manifests to GCS,
+and launches a Cloud Run job per tier:
 
 ```bash
-pixi run precompute-manifest
+pixi run export
 ```
 
 ```
@@ -92,63 +92,35 @@ Tier assignments:
   16Gi (cpu=4):    8 shards,    8 tasks, total=30.2GB, max_arrow=4050MB
   32Gi (cpu=8):    2 shards,    2 tasks, total=13.3GB, max_arrow=6647MB
 
-Execution commands:
-  pixi run generate-scale ... --manifest-uri gs://mybucket/exports/seg/manifests/tier-2gi
-  pixi run generate-scale ... --manifest-uri gs://mybucket/exports/seg/manifests/tier-4gi
+Writing per-task manifests...
+  2Gi: 2000 task manifests → gs://mybucket/exports/seg/manifests/tier-2gi/
+  4Gi: 2600 task manifests → gs://mybucket/exports/seg/manifests/tier-4gi/
+  ...
+
+Launching 5 tier job(s)...
+  export-tier-2gi: launched (2000 tasks, 2Gi, cpu=1)
+  export-tier-4gi: launched (2600 tasks, 4Gi, cpu=2)
+  export-tier-8gi: launched (22 tasks, 8Gi, cpu=2)
   ...
 ```
 
-Each tier directory contains one small JSON file per task
-(`task-0.json`, `task-1.json`, ...) listing only that task's assigned
-shards. Workers read their own file using `CLOUD_RUN_TASK_INDEX` —
-no need to download the full tier manifest.
+Each task reads only its own small manifest file
+(`task-0.json`, `task-1.json`, ...) listing the shards it should process.
+Tasks within a tier are load-balanced by total Arrow file bytes.
 
-The formula `2.5 × arrow_size + 1 GiB` estimates the total memory needed:
-Arrow file (fully in RAM) + neuroglancer shard transaction buffer
-(compressed_segmentation Cords) + Python/TensorStore overhead.  This ensures
-both the Arrow data and the full output shard fit in memory, so each shard
-writes to GCS in a single operation.
-
-Memory tiers are selected automatically from 1, 2, 4, 8, 16, and 32 GiB,
-each with the minimum CPUs required by Cloud Run (e.g., 16Gi needs cpu=4).
-
-### Generate Scales
-
-Execute Cloud Run jobs by tier. Each tier runs shards at the appropriate
-memory level:
-
-```bash
-# Execute all tiers (see examples/run-all-scales.sh)
-pixi run generate-scale --scales 0,1,2,3,4,5,6,7,8,9 \
-    --tasks 2600 --memory 4Gi --cpu 2 \
-    --manifest-uri gs://mybucket/exports/seg/manifests/tier-4gi
-
-pixi run generate-scale --scales 0,1,2,3,4,5,6,7,8,9 \
-    --tasks 22 --memory 8Gi --cpu 2 \
-    --manifest-uri gs://mybucket/exports/seg/manifests/tier-8gi
-
-# ... higher tiers for the few large shards
-```
-
-You can still run per-scale without a manifest (legacy mode):
-
-```bash
-pixi run generate-scale --scales 0 --tasks 800
-pixi run generate-scale --scales 3 --tasks 50 --memory 16Gi
-```
-
-Options for `generate-scale`:
+Options for `export`:
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--scales` | Scales to process from DVID shards | from `.env` |
-| `--downres` | Output scales to generate by downsampling (e.g., `10` reads scale 9 to produce scale 10) | none |
+| `--scales` | Scales to include | from `.env` |
 | `--label-type` | `labels` (agglomerated, default) or `supervoxels` (raw IDs) | `labels` |
-| `--tasks` | Number of parallel worker tasks | from `.env` |
-| `--memory` | Memory per worker (e.g., `8Gi`) | from `.env` |
-| `--cpu` | CPUs per worker | from `.env` |
-| `--manifest-uri` | GCS URI prefix to per-task manifests (from `precompute-manifest`). Each task reads `{uri}/task-{index}.json`. | none (self-partition) |
-| `--wait` | Block until the job completes | async (return immediately) |
+| `--downres` | Scales to generate by downsampling previous scale | none |
+| `--tiers` | Override max tasks per tier (e.g., `4:3000,8:50`) | auto |
+| `--dry-run` | Scan and show tiers without writing manifests or launching | |
+| `--wait` | Block until all jobs complete | async |
+
+Use `pixi run precompute-manifest --dry-run` to preview tier assignments
+without launching any jobs.
 
 By default, workers export **agglomerated labels** — the standard segmentation view where proofreading merges are applied. Use `--label-type supervoxels` to export the raw supervoxel IDs from the DVID blocks instead.
 
@@ -289,11 +261,12 @@ GCS.  Without this, each chunk triggers a full shard read-modify-write
 (O(N²) I/O).  Workers monitor container memory via cgroup and commit early
 only if approaching the memory limit.
 
-**Tier-based task assignment**: `precompute-manifest` scans Arrow file sizes,
+**Tier-based task assignment**: `pixi run export` scans Arrow file sizes,
 estimates memory requirements (`2.5 × arrow_size + 1 GiB`), and assigns
 shards to memory tiers (1–32 GiB).  Each tier gets its own Cloud Run job
-with appropriate memory and CPU.  Tasks within a tier are load-balanced by
-Arrow file size.
+with appropriate memory and CPU.  Each task downloads only its own small
+manifest file listing the shards it should process.  Tasks within a tier
+are load-balanced by Arrow file size.
 
 See [braid/docs/ARCHITECTURE.md](braid/docs/ARCHITECTURE.md) for I/O design decisions.
 
@@ -305,11 +278,11 @@ tensorstore-export/
 ├── .env.example                     # Configuration template
 ├── Dockerfile                       # Cloud Run container
 ├── scripts/
-│   ├── deploy.py                   # Interactive deployment
-│   ├── precompute_manifest.py      # Tier-based task manifest generation
-│   ├── generate_scale.py           # Execute Cloud Run job
+│   ├── deploy.py                   # Interactive deployment (image, info file, base job)
+│   ├── export.py                   # Scan, manifest, launch (single command)
+│   ├── precompute_manifest.py      # Tier assignment and manifest generation
 │   ├── export_errors.py            # Query error logs
-│   └── setup_destination.py        # Info file setup (also called by deploy)
+│   └── export_status.py            # Job status overview
 ├── src/
 │   ├── worker.py                   # Cloud Run worker
 │   └── tensorstore_adapter.py      # TensorStore helpers
