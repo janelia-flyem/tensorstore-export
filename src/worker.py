@@ -198,13 +198,17 @@ class ShardProcessor:
 
                     # Write to the destination at the chunk's global voxel coordinates.
                     # Clip to volume bounds for boundary chunks where the volume
-                    # size isn't a multiple of the chunk size.
+                    # size isn't a multiple of the chunk size.  Skip chunks
+                    # entirely outside the domain (can happen when DVID exports
+                    # chunks beyond the declared volume extent).
                     x0 = cx * CHUNK_VOXELS
                     y0 = cy * CHUNK_VOXELS
                     z0 = cz * CHUNK_VOXELS
                     x1 = min(x0 + CHUNK_VOXELS, dest.shape[0])
                     y1 = min(y0 + CHUNK_VOXELS, dest.shape[1])
                     z1 = min(z0 + CHUNK_VOXELS, dest.shape[2])
+                    if x1 <= x0 or y1 <= y0 or z1 <= z0:
+                        continue  # chunk entirely outside volume
                     dest[x0:x1, y0:y1, z0:z1, 0].write(
                         transposed[:x1 - x0, :y1 - y0, :z1 - z0]
                     ).result()
