@@ -105,9 +105,12 @@ def main():
         print(f"\nFailed (exit code {result.returncode})")
         sys.exit(1)
 
-    print("\nMonitor with:")
-    print(f"  gcloud run jobs describe {job_name} --region={region} --project={project}")
-    print(f"  gcloud logging read \"resource.type=cloud_run_job AND resource.labels.job_name={job_name}\" --project={project} --limit=100")
+    print("\nCheck for errors (works during or after execution):")
+    print("  pixi run export-errors")
+    print("  pixi run export-errors -- --details")
+    print()
+    print("Monitor job status:")
+    print(f"  gcloud run jobs executions list --job={job_name} --region={region} --project={project}")
 
 
 if __name__ == "__main__":
