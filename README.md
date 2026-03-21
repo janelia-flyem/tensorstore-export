@@ -99,7 +99,9 @@ Options for `generate-scale`:
 | `--scales` | Scales to process from DVID shards | from `.env` |
 | `--downres` | Output scales to generate by downsampling (e.g., `10` reads scale 9 to produce scale 10) | none |
 | `--label-type` | `labels` (agglomerated, default) or `supervoxels` (raw IDs) | `labels` |
-| `--memory` | Memory per worker override | from `.env` |
+| `--tasks` | Number of parallel worker tasks | from `.env` |
+| `--memory` | Memory per worker (e.g., `8Gi`) | from `.env` |
+| `--cpu` | CPUs per worker | from `.env` |
 | `--wait` | Block until the job completes | async (return immediately) |
 
 By default, workers export **agglomerated labels** — the standard segmentation view where proofreading merges are applied. Use `--label-type supervoxels` to export the raw supervoxel IDs from the DVID blocks instead.

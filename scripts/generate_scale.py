@@ -8,8 +8,8 @@ the .env file.
 
 Usage:
     pixi run generate-scale
-    pixi run generate-scale -- --scales 0,1
-    pixi run generate-scale -- --scales 2,3 --memory 4Gi
+    pixi run generate-scale -- --scales 0 --tasks 400
+    pixi run generate-scale -- --scales 2,3 --memory 8Gi --cpu 2
     pixi run generate-scale -- --label-type supervoxels
     pixi run generate-scale -- --downres 10
 """
@@ -43,6 +43,14 @@ def main():
     parser.add_argument(
         "--memory",
         help="Memory per worker (e.g., 4Gi) — overrides .env MEMORY for this execution",
+    )
+    parser.add_argument(
+        "--tasks", type=int,
+        help="Number of parallel worker tasks (overrides .env TASKS)",
+    )
+    parser.add_argument(
+        "--cpu", type=int,
+        help="CPUs per worker (overrides .env CPU)",
     )
     parser.add_argument(
         "--wait", action="store_true",
@@ -80,14 +88,36 @@ def main():
     if downres:
         print(f"  Downres:    {downres}")
     print(f"  Label type: {label_type}")
-    if args.memory:
-        print(f"  Memory:     {args.memory} (override)")
+    tasks = args.tasks or int(env.get("TASKS", "200"))
+    cpu = args.cpu or int(env.get("CPU", "2"))
+    memory = args.memory or env.get("MEMORY", "4Gi")
+
+    print(f"  Tasks:      {tasks}" + (" (override)" if args.tasks else ""))
+    print(f"  CPU:        {cpu}" + (" (override)" if args.cpu else ""))
+    print(f"  Memory:     {memory}" + (" (override)" if args.memory else ""))
     print()
+
+    # CPU and memory are job-level settings — update the job definition first
+    # if either was overridden.
+    if args.cpu or args.memory:
+        update_cmd = [
+            "gcloud", "run", "jobs", "update", job_name,
+            f"--region={region}",
+            f"--project={project}",
+            f"--cpu={cpu}",
+            f"--memory={memory}",
+        ]
+        print("Updating job resource limits...")
+        result = subprocess.run(update_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Failed to update job: {result.stderr}")
+            sys.exit(1)
 
     cmd = [
         "gcloud", "run", "jobs", "execute", job_name,
         f"--region={region}",
         f"--project={project}",
+        f"--tasks={tasks}",
     ]
 
     # Pass env var overrides.  Use ^;^ as delimiter since values contain commas.
