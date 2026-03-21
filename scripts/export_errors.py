@@ -7,9 +7,9 @@ a single scale or aggregate across all scales.
 
 Usage:
     pixi run export-errors                     # all scales, latest execution each
-    pixi run export-errors -- --scale 0        # just s0
-    pixi run export-errors -- --details        # full error details
-    pixi run export-errors -- --all            # all executions, not just latest
+    pixi run export-errors --scale 0        # just s0
+    pixi run export-errors --details        # full error details
+    pixi run export-errors --all            # all executions, not just latest
 """
 
 import argparse

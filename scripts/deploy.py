@@ -443,11 +443,11 @@ def main():
 
     print("\nDone.")
     print("\nExecute scales with:")
-    print("  pixi run generate-scale -- --scales 0 --tasks 800")
-    print("  pixi run generate-scale -- --scales 0,1,2 --tasks 200")
+    print("  pixi run generate-scale --scales 0 --tasks 800")
+    print("  pixi run generate-scale --scales 0,1,2 --tasks 200")
     print("\nCheck errors:")
     print("  pixi run export-errors")
-    print("  pixi run export-errors -- --scale 0")
+    print("  pixi run export-errors --scale 0")
 
 
 if __name__ == "__main__":

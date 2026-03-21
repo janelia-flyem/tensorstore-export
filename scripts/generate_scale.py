@@ -8,11 +8,11 @@ optionally overriding resource settings per invocation.
 
 Usage:
     pixi run generate-scale
-    pixi run generate-scale -- --scales 0 --tasks 800
-    pixi run generate-scale -- --scales 0,1,2 --tasks 200
-    pixi run generate-scale -- --scales 3 --tasks 50 --memory 16Gi
-    pixi run generate-scale -- --label-type supervoxels
-    pixi run generate-scale -- --downres 10
+    pixi run generate-scale --scales 0 --tasks 800
+    pixi run generate-scale --scales 0,1,2 --tasks 200
+    pixi run generate-scale --scales 3 --tasks 50 --memory 16Gi
+    pixi run generate-scale --label-type supervoxels
+    pixi run generate-scale --downres 10
 """
 
 import argparse

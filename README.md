@@ -85,19 +85,19 @@ resource profiles:
 pixi run generate-scale
 
 # Process s0 with 800 parallel workers
-pixi run generate-scale -- --scales 0 --tasks 800
+pixi run generate-scale --scales 0 --tasks 800
 
 # Process multiple scales simultaneously
-pixi run generate-scale -- --scales 0,1,2 --tasks 200
+pixi run generate-scale --scales 0,1,2 --tasks 200
 
 # Higher scales need more memory (larger blocks)
-pixi run generate-scale -- --scales 3 --tasks 50 --memory 16Gi
+pixi run generate-scale --scales 3 --tasks 50 --memory 16Gi
 
 # Generate scale 10 by downsampling the already-written scale 9
-pixi run generate-scale -- --downres 10
+pixi run generate-scale --downres 10
 
 # Export supervoxel IDs instead of agglomerated labels
-pixi run generate-scale -- --scales 0 --label-type supervoxels
+pixi run generate-scale --scales 0 --label-type supervoxels
 ```
 
 Options for `generate-scale`:
@@ -123,13 +123,13 @@ Check for errors at any time — during execution for a live snapshot, or after 
 pixi run export-errors
 
 # Errors for a specific scale only
-pixi run export-errors -- --scale 0
+pixi run export-errors --scale 0
 
 # Full details of every failed chunk
-pixi run export-errors -- --details
+pixi run export-errors --details
 
 # Errors from all executions (not just the latest)
-pixi run export-errors -- --all
+pixi run export-errors --all
 ```
 
 The script queries per-scale Cloud Run jobs (`{BASE_JOB_NAME}-s0`, `-s1`, ...),
