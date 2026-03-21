@@ -33,10 +33,12 @@ ruff = ">=0.4.0"
 braid = { path = "braid", editable = true }
 
 [tasks]
-test-braid = "pytest braid/tests/ -v --no-header"
+test-braid = "pytest braid/tests/ -v --no-header --ignore=braid/tests/test_bench_decompressor.py"
+test-bench = "pytest braid/tests/test_bench_decompressor.py -v -s --no-header"
 test-e2e = "pytest braid/tests/test_e2e_precomputed.py -v --no-header"
 test-all = "pytest braid/tests/ -v --no-header"
 lint = "ruff check src/ braid/src/ scripts/"
+build-braid-c = "make -C braid/csrc"
 deploy = "python scripts/deploy.py"
 generate-scale = "python scripts/generate_scale.py"
 export-errors = "python scripts/export_errors.py"
