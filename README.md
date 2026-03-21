@@ -6,7 +6,7 @@ Converts DVID `export-shards` Arrow IPC files into neuroglancer precomputed segm
 
 [DVID](https://github.com/janelia-flyem/dvid) exports segmentation data as spatially-partitioned Arrow IPC shard files via the `export-shards` RPC command. This project converts those files into [neuroglancer precomputed](https://github.com/google/neuroglancer/tree/master/src/neuroglancer/datasource/precomputed) volumes viewable in [Neuroglancer](https://github.com/google/neuroglancer). Designed for terabyte-scale datasets using hundreds of parallel Cloud Run workers.
 
-[BRAID](braid/) (Block Records Arrow Indexed Dataset) reads shard files directly from GCS via `google-cloud-storage` — no temp files needed.
+[BRAID](braid/) (Block Records Arrow Indexed Dataset) reads and decompresses the shard files, with a C extension for high-throughput DVID block decompression.
 
 ## Getting Started
 

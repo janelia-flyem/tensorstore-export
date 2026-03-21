@@ -1,6 +1,6 @@
-# Example Neuroglancer Volume Specs
+# Example Neuroglancer Volume Data & Script
 
-These are dataset-specific neuroglancer multiscale volume spec JSON files used with DVID's `export-shards` command. They serve as reference examples — copy and adapt for your own dataset.
+These are dataset-specific run script and neuroglancer multiscale volume spec JSON files used with DVID's `export-shards` command. They serve as reference examples — copy and adapt for your own dataset.
 
 ## Files
 
@@ -9,6 +9,7 @@ These are dataset-specific neuroglancer multiscale volume spec JSON files used w
 | `mcns-v0.11-export-specs.json` | Male CNS (mCNS) segmentation | Correct sharding params per scale |
 | `mcns-v0.9-ng-specs-INCORRECT.json` | Male CNS segmentation (v0.9) | **Incorrect** — shard_bits/minishard_bits/preshift_bits are identical across all scales instead of decreasing. Do not use for export. |
 | `mcns-v0.9-grayscale-ng-specs.json` | Male CNS grayscale (v0.9) | Grayscale (uint8) volume spec |
+| `run-all-scales.sh` | Male CNS | Correct sizing of Google Cloud Run tasks to process in hours |
 
 ## Usage
 
