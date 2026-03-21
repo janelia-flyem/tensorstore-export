@@ -33,7 +33,7 @@ pixi run test-all       # 66 tests
 
 ### Deploy
 
-Run `pixi run deploy` to be guided through all required configuration. It prompts for GCS paths, reads the neuroglancer volume spec JSON, writes the destination `info` file, builds the Docker image, and creates the Cloud Run job.
+Run `pixi run deploy` to be guided through all required configuration. It prompts for GCS paths, reads the neuroglancer volume spec JSON, writes the destination `info` file (with `compressed_segmentation` encoding), builds the Docker image, and creates the Cloud Run job.
 
 ```bash
 pixi run deploy
@@ -64,40 +64,77 @@ pixi run deploy
 
 Writing neuroglancer info file ...
 Building Docker image ...
-Creating 10 per-scale Cloud Run jobs...
-  tensorstore-dvid-export-s0: created
-  tensorstore-dvid-export-s1: created
-  ...
-
+Creating per-scale Cloud Run jobs...
 Done.
 ```
 
 All values are saved to `.env` for future runs. You can also edit `.env` directly (see `.env.example` for all options).
 
-### Generate Scales
+### Precompute Manifests
 
-After deploying, execute per-scale Cloud Run jobs. Each scale has its own job
-(`{BASE_JOB_NAME}-s0`, `-s1`, ...) so they can run in parallel with independent
-resource profiles:
+Before running workers, precompute task manifests that assign shards to
+memory-appropriate tiers. This scans all Arrow source files and groups them
+by estimated memory requirement:
 
 ```bash
-# Process all scales from .env defaults
-pixi run generate-scale
+pixi run precompute-manifest
+```
 
-# Process s0 with 800 parallel workers
+```
+Scanning Arrow files across 10 scales...
+  Found 26128 Arrow files
+  Memory formula: 2.5 * arrow_size + 1 GiB
+
+Tier assignments:
+  2Gi (cpu=1): 10181 shards, 2000 tasks, total=372.1GB, max_arrow=99MB
+  4Gi (cpu=2): 15915 shards, 2600 tasks, total=2804.5GB, max_arrow=1200MB
+  8Gi (cpu=2):    22 shards,   22 tasks, total=43.8GB, max_arrow=1900MB
+  16Gi (cpu=4):    8 shards,    8 tasks, total=30.2GB, max_arrow=4050MB
+  32Gi (cpu=8):    2 shards,    2 tasks, total=13.3GB, max_arrow=6647MB
+
+Execution commands:
+  pixi run generate-scale ... --manifest-uri gs://mybucket/exports/seg/manifests/tier-2gi
+  pixi run generate-scale ... --manifest-uri gs://mybucket/exports/seg/manifests/tier-4gi
+  ...
+```
+
+Each tier directory contains one small JSON file per task
+(`task-0.json`, `task-1.json`, ...) listing only that task's assigned
+shards. Workers read their own file using `CLOUD_RUN_TASK_INDEX` —
+no need to download the full tier manifest.
+
+The formula `2.5 × arrow_size + 1 GiB` estimates the total memory needed:
+Arrow file (fully in RAM) + neuroglancer shard transaction buffer
+(compressed_segmentation Cords) + Python/TensorStore overhead.  This ensures
+both the Arrow data and the full output shard fit in memory, so each shard
+writes to GCS in a single operation.
+
+Memory tiers are selected automatically from 1, 2, 4, 8, 16, and 32 GiB,
+each with the minimum CPUs required by Cloud Run (e.g., 16Gi needs cpu=4).
+
+### Generate Scales
+
+Execute Cloud Run jobs by tier. Each tier runs shards at the appropriate
+memory level:
+
+```bash
+# Execute all tiers (see examples/run-all-scales.sh)
+pixi run generate-scale --scales 0,1,2,3,4,5,6,7,8,9 \
+    --tasks 2600 --memory 4Gi --cpu 2 \
+    --manifest-uri gs://mybucket/exports/seg/manifests/tier-4gi
+
+pixi run generate-scale --scales 0,1,2,3,4,5,6,7,8,9 \
+    --tasks 22 --memory 8Gi --cpu 2 \
+    --manifest-uri gs://mybucket/exports/seg/manifests/tier-8gi
+
+# ... higher tiers for the few large shards
+```
+
+You can still run per-scale without a manifest (legacy mode):
+
+```bash
 pixi run generate-scale --scales 0 --tasks 800
-
-# Process multiple scales simultaneously
-pixi run generate-scale --scales 0,1,2 --tasks 200
-
-# Higher scales need more memory (larger blocks)
 pixi run generate-scale --scales 3 --tasks 50 --memory 16Gi
-
-# Generate scale 10 by downsampling the already-written scale 9
-pixi run generate-scale --downres 10
-
-# Export supervoxel IDs instead of agglomerated labels
-pixi run generate-scale --scales 0 --label-type supervoxels
 ```
 
 Options for `generate-scale`:
@@ -110,6 +147,7 @@ Options for `generate-scale`:
 | `--tasks` | Number of parallel worker tasks | from `.env` |
 | `--memory` | Memory per worker (e.g., `8Gi`) | from `.env` |
 | `--cpu` | CPUs per worker | from `.env` |
+| `--manifest-uri` | GCS URI prefix to per-task manifests (from `precompute-manifest`). Each task reads `{uri}/task-{index}.json`. | none (self-partition) |
 | `--wait` | Block until the job completes | async (return immediately) |
 
 By default, workers export **agglomerated labels** — the standard segmentation view where proofreading merges are applied. Use `--label-type supervoxels` to export the raw supervoxel IDs from the DVID blocks instead.
@@ -147,6 +185,36 @@ auto-detects the latest execution for each, and aggregates results. Individual
 chunk failures are logged as `"Chunk failed"` events with coordinates, so they
 don't abort the entire shard.
 
+### Mining Memory Profiles
+
+After an export, mine the structured logs to understand actual memory
+usage per shard and tune tier boundaries for future runs:
+
+```bash
+# Memory profile summary per shard (peak RSS, batches, elapsed time)
+pixi run export-errors -- --details | grep "Shard memory profile"
+
+# Wall-clock progress snapshots (memory trajectory over time)
+pixi run export-errors -- --details | grep "Shard progress"
+
+# Memory pressure events (transaction forced to commit early)
+pixi run export-errors -- --details | grep "memory pressure"
+```
+
+Key fields in `"Shard memory profile"` events:
+
+| Field | Description |
+|-------|-------------|
+| `peak_memory_gib` | Maximum cgroup memory usage during shard processing |
+| `memory_limit_gib` | Container memory limit (from Cloud Run `--memory`) |
+| `batches` | Number of transaction commits (1 = ideal single-write) |
+| `uncompressed_gib` | Total uncompressed chunk data written |
+| `elapsed_s` | Wall-clock time to process the shard |
+
+If `batches > 1` for many shards, increase the memory tier. If
+`peak_memory_gib` is well below `memory_limit_gib` for all shards in a
+tier, you can safely reduce the tier to save cost.
+
 ### Multi-Scale Processing
 
 Workers support two sources for each scale:
@@ -157,19 +225,37 @@ Workers support two sources for each scale:
 
 ### Memory Sizing
 
-Arrow shard file sizes grow at coarser scales (from mCNS export data):
+BRAID's ShardReader fully downloads the Arrow IPC file into memory (not
+lazy/streamed — pyarrow's native GCS filesystem is unreliable on Cloud Run).
+The Arrow file size is the dominant memory variable.
 
-| Scale | Mean shard size | Max shard size | Recommended memory |
-|-------|----------------|---------------|-------------------|
-| 0     | 135 MB         | 470 MB        | 4 GiB             |
-| 1     | 321 MB         | 898 MB        | 4 GiB             |
-| 2     | 504 MB         | 1.8 GB        | 8 GiB             |
-| 3     | 800 MB         | 3.8 GB        | 16 GiB            |
-| 4+    | 1.4 GB         | 6.2 GB        | 16 GiB            |
+Memory needed per shard ≈ `2.5 × arrow_file_size + 1 GiB`:
 
-Use `--memory` on `generate-scale` to set per-scale memory. Since each scale
-has its own Cloud Run job, different scales can run simultaneously with
-different memory profiles.
+| Component | Size | Notes |
+|-----------|------|-------|
+| Arrow file (BRAID ShardReader) | 1× arrow_size | Fully in RAM via `blob.download_as_bytes()` |
+| Transaction buffer (TensorStore Cords) | ~1-1.5× arrow_size | compressed_segmentation encoded chunks |
+| Python, TensorStore, OS overhead | ~1 GiB | Runtime, encoding buffers, etc. |
+
+The `precompute-manifest` command uses this formula to assign shards to
+memory tiers automatically.  Workers monitor actual container memory via
+cgroup (`/sys/fs/cgroup/memory.current`) and will commit the transaction
+early if memory pressure is detected, so the estimate doesn't need to be
+exact — the cgroup safety valve prevents OOM.
+
+Arrow shard file sizes from the mCNS dataset:
+
+| Scale | Count  | Mean   | Max     |
+|-------|--------|--------|---------|
+| 0     | 21,994 | 142 MB | 493 MB  |
+| 1     | 3,364  | 337 MB | 898 MB  |
+| 2     | 606    | 528 MB | 1.9 GB  |
+| 3     | 123    | 838 MB | 4.1 GB  |
+| 4     | 25     | 1.5 GB | 6.6 GB  |
+| 5     | 8      | 1.6 GB | 6.6 GB  |
+| 6+    | 9      | ≤1.6 GB| 3.1 GB  |
+
+99.9% of shards (26,096 of 26,128) fit in 4 GiB workers.
 
 ## Configuration
 
@@ -192,10 +278,24 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 ```
 DVID export-shards           Cloud Run Workers              Neuroglancer Volume
   Arrow IPC + CSV        →     BRAID reads from GCS      →   precomputed on GCS
-  per-scale: s0/, s1/...       google-cloud-storage           multi-scale output
+  per-scale: s0/, s1/...       google-cloud-storage           compressed_segmentation
 ```
 
-Each worker processes one shard at a time: download Arrow+CSV from GCS, decompress chunks via the DVID block decompressor, transpose ZYX→XYZ, and write to the neuroglancer precomputed volume via TensorStore. See [braid/docs/ARCHITECTURE.md](braid/docs/ARCHITECTURE.md) for I/O design decisions.
+Each worker processes one shard at a time: download Arrow+CSV from GCS, decompress chunks via the DVID block decompressor, transpose ZYX→XYZ, and write to the neuroglancer precomputed volume via TensorStore.
+
+**Transaction batching**: All chunk writes for a shard are accumulated in a
+single explicit TensorStore transaction and committed as one shard write to
+GCS.  Without this, each chunk triggers a full shard read-modify-write
+(O(N²) I/O).  Workers monitor container memory via cgroup and commit early
+only if approaching the memory limit.
+
+**Tier-based task assignment**: `precompute-manifest` scans Arrow file sizes,
+estimates memory requirements (`2.5 × arrow_size + 1 GiB`), and assigns
+shards to memory tiers (1–32 GiB).  Each tier gets its own Cloud Run job
+with appropriate memory and CPU.  Tasks within a tier are load-balanced by
+Arrow file size.
+
+See [braid/docs/ARCHITECTURE.md](braid/docs/ARCHITECTURE.md) for I/O design decisions.
 
 ## Project Structure
 
@@ -206,6 +306,7 @@ tensorstore-export/
 ├── Dockerfile                       # Cloud Run container
 ├── scripts/
 │   ├── deploy.py                   # Interactive deployment
+│   ├── precompute_manifest.py      # Tier-based task manifest generation
 │   ├── generate_scale.py           # Execute Cloud Run job
 │   ├── export_errors.py            # Query error logs
 │   └── setup_destination.py        # Info file setup (also called by deploy)
@@ -219,6 +320,8 @@ tensorstore-export/
 │   │   └── exceptions.py
 │   ├── tests/                      # 66 tests including ground truth verification
 │   └── docs/ARCHITECTURE.md        # I/O design decisions
+├── examples/
+│   └── run-all-scales.sh           # Full export example (tier-based)
 └── docs/
     ├── mCNS-ExportAnalysis.md      # Real export data analysis
     ├── ExportObservabilityPlan.md   # DVID export error detection plan

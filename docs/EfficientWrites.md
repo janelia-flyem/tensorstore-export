@@ -201,9 +201,10 @@ txn.commit_async().result()
 ### Practical Considerations
 
 - **Memory**: all chunks in the transaction are held in memory until commit.
-  A 32K-chunk shard with 64³ × 8 bytes per chunk = ~8.6 GB.  May exceed
-  worker memory — use batched transactions (e.g., 1000 chunks per commit)
-  to trade GCS round-trips for memory.
+  With `compressed_segmentation` encoding, TensorStore compresses each chunk
+  during the apply phase before buffering the compressed `absl::Cord` in the
+  transaction.  Actual transaction memory ≈ the compressed shard file size,
+  not the raw uncompressed data.
 
 - **1:1 shard mapping**: the DVID export-shards command partitions chunks
   so that each Arrow shard file maps to exactly one neuroglancer precomputed
@@ -215,29 +216,29 @@ txn.commit_async().result()
   internal write scheduling which may batch writes to the same shard
   automatically.  This has not been tested.
 
-### Batched Transaction Approach
+### Current Approach: Cgroup-Monitored Transactions
 
-For workers with limited memory, batch the transaction commits:
+Workers default to one transaction per shard (ideal: one GCS write).
+Container memory is monitored via cgroup (`/sys/fs/cgroup/memory.current`).
+If memory usage approaches the limit (checked every 100 chunks), the
+transaction is committed early and a new one started.  This adapts
+automatically to the worker's memory allocation without a fixed batch size.
 
 ```python
-WRITE_BATCH_SIZE = 1000  # tune based on available memory
-
 txn = ts.Transaction()
-batch_count = 0
 
 for cx, cy, cz in reader.available_chunks:
     dest.with_transaction(txn)[...].write(transposed)
-    batch_count += 1
 
-    if batch_count >= WRITE_BATCH_SIZE:
+    # Commit early if running out of memory
+    if should_check and cgroup_memory_current > commit_threshold:
         txn.commit_async().result()
         txn = ts.Transaction()
-        batch_count = 0
 
-if batch_count > 0:
-    txn.commit_async().result()
+txn.commit_async().result()
 ```
 
-- Memory: 1000 × 2 MB = ~2 GB per batch
-- GCS round-trips: ~33 for a 32K-chunk shard (vs 32K without batching)
-- Expected time: ~33 × 10s = ~5.5 minutes per shard (vs 15+ days)
+Workers are assigned to memory tiers (1–32 GiB) based on the Arrow source
+file size: `memory_needed ≈ 2.5 × arrow_size + 1 GiB`.  This ensures both
+the Arrow data (fully in RAM) and the transaction buffer fit in memory for
+a single-write commit in the common case.

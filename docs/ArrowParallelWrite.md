@@ -60,7 +60,7 @@ spec = {
     'scale_metadata': {
         'size': [94088, 78317, 134576],
         'resolution': [8, 8, 8],
-        'encoding': 'raw',  # Use 'raw' for uint64 segmentation data.
+        'encoding': 'compressed_segmentation',  # Standard for uint64 segmentation.
         'chunk_size': [64, 64, 64],
         'sharding': {
             '@type': 'neuroglancer_uint64_sharded_v1',

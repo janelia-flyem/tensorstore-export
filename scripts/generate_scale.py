@@ -24,6 +24,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE
 
 
+def _parse_memory_gib(memory_str: str) -> float:
+    """Parse Cloud Run memory string to GiB. E.g., '4Gi' → 4.0, '512Mi' → 0.5."""
+    s = memory_str.strip()
+    if s.endswith("Gi"):
+        return float(s[:-2])
+    if s.endswith("Mi"):
+        return float(s[:-2]) / 1024
+    return float(s)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Execute Cloud Run jobs to generate neuroglancer precomputed scales.",
@@ -52,6 +62,11 @@ def main():
     parser.add_argument(
         "--memory",
         help="Memory per worker (e.g., 4Gi, 16Gi)",
+    )
+    parser.add_argument(
+        "--manifest-uri",
+        help="GCS URI to a manifest JSON (from precompute-manifest). "
+             "Workers read task assignments from this instead of self-partitioning.",
     )
     parser.add_argument(
         "--wait", action="store_true",
@@ -113,9 +128,14 @@ def main():
         job_name = f"{base_name}-s{scale}"
 
         # Build env var overrides
-        overrides = {"LABEL_TYPE": label_type}
+        overrides = {
+            "LABEL_TYPE": label_type,
+            "WORKER_MEMORY_GIB": str(_parse_memory_gib(memory)),
+        }
         if downres:
             overrides["DOWNRES_SCALES"] = downres
+        if args.manifest_uri:
+            overrides["MANIFEST_URI"] = args.manifest_uri
 
         cmd = [
             "gcloud", "run", "jobs", "execute", job_name,
