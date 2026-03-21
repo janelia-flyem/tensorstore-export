@@ -161,23 +161,32 @@ def main():
         print("Error: BASE_JOB_NAME and PROJECT_ID must be configured in .env")
         sys.exit(1)
 
-    # Determine which scale jobs to query
+    # Determine which jobs to query
     if args.scale is not None:
         job_names = [f"{base_name}-s{args.scale}"]
     else:
-        # Find all existing per-scale jobs
+        # Find all existing jobs: tier-based and per-scale
         job_names = []
-        for s in range(20):  # check up to s19
-            jn = f"{base_name}-s{s}"
-            if job_exists(jn, project, region):
-                job_names.append(jn)
+        cmd = [
+            "gcloud", "run", "jobs", "list",
+            f"--region={region}",
+            f"--project={project}",
+            f"--filter=metadata.name~^{base_name}",
+            "--format=value(metadata.name)",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            for name in result.stdout.strip().splitlines():
+                name = name.strip()
+                if name and name != base_name:
+                    job_names.append(name)
         if not job_names:
-            # Fall back to legacy single-job name
             if job_exists(base_name, project, region):
                 job_names = [base_name]
             else:
-                print(f"No jobs found matching {base_name}-s*")
+                print(f"No jobs found matching {base_name}-*")
                 sys.exit(1)
+        job_names.sort()
 
     print(f"Querying errors for {len(job_names)} job(s)")
     print(f"  Project: {project}")

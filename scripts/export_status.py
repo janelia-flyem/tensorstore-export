@@ -1,28 +1,63 @@
 #!/usr/bin/env python3
 """
-Show status of all per-scale Cloud Run job executions.
+Show status of Cloud Run export job executions.
 
-Displays elapsed time, task completion counts, and overall progress
-for each scale's latest execution.
+Discovers both tier-based jobs ({BASE_JOB_NAME}-tier-{N}gi) and legacy
+per-scale jobs ({BASE_JOB_NAME}-s{N}).  Optionally queries memory profile
+logs for peak memory, batch counts, and throughput stats.
 
 Usage:
     pixi run export-status
-    pixi run export-status --scale 0
+    pixi run export-status --memory
 """
 
 import argparse
 import json
 import subprocess
 import sys
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE
 
 
+def discover_jobs(base_name: str, project: str, region: str) -> list:
+    """Find all Cloud Run jobs matching the base name.
+
+    Returns list of (label, job_name) tuples, preferring tier jobs over
+    scale jobs.
+    """
+    # List all jobs in the project/region
+    cmd = [
+        "gcloud", "run", "jobs", "list",
+        f"--region={region}",
+        f"--project={project}",
+        f"--filter=metadata.name~^{base_name}",
+        "--format=value(metadata.name)",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+
+    jobs = []
+    for name in result.stdout.strip().splitlines():
+        name = name.strip()
+        if not name:
+            continue
+        if name.startswith(f"{base_name}-tier-"):
+            tier = name.replace(f"{base_name}-tier-", "")
+            jobs.append((f"tier-{tier}", name))
+        elif name.startswith(f"{base_name}-s"):
+            scale = name.replace(f"{base_name}-s", "")
+            jobs.append((f"s{scale}", name))
+
+    return sorted(jobs)
+
+
 def get_execution_info(job_name: str, project: str, region: str) -> dict:
     """Get the latest execution details for a Cloud Run job."""
-    # Find latest execution
     cmd = [
         "gcloud", "run", "jobs", "executions", "list",
         f"--job={job_name}",
@@ -56,7 +91,6 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
     completion_time = status.get("completionTime", "")
     start_time = status.get("startTime", create_time)
 
-    # Parse conditions for overall status
     conditions = status.get("conditions", [])
     running = status.get("runningCount", 0)
     succeeded = status.get("succeededCount", 0)
@@ -81,10 +115,8 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
     running = status.get("runningCount", 0)
     task_count = ex.get("spec", {}).get("taskCount", 0)
 
-    # Calculate elapsed time
     elapsed_str = ""
     if start_time:
-        from datetime import datetime, timezone
         try:
             start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
             if completion_time:
@@ -112,29 +144,97 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
         "failed": failed,
         "running": running,
         "elapsed": elapsed_str,
-        "start_time": start_time,
-        "completion_time": completion_time,
     }
 
 
-def job_exists(job_name: str, project: str, region: str) -> bool:
-    """Check if a Cloud Run job exists."""
+def query_memory_profiles(job_name: str, project: str, region: str,
+                          execution: str = "", limit: int = 5000) -> list:
+    """Query 'Shard memory profile' log events for a job."""
+    parts = [
+        'resource.type="cloud_run_job"',
+        f'resource.labels.job_name="{job_name}"',
+        'textPayload=~"Shard memory profile"',
+    ]
+    if execution:
+        parts.append(f'labels."run.googleapis.com/execution_name"="{execution}"')
+
     cmd = [
-        "gcloud", "run", "jobs", "describe", job_name,
+        "gcloud", "logging", "read", " AND ".join(parts),
+        f"--project={project}",
+        f"--limit={limit}",
+        "--format=json",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+
+    profiles = []
+    try:
+        entries = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    for entry in entries:
+        text = entry.get("textPayload", "")
+        idx = text.find("{")
+        if idx == -1:
+            continue
+        try:
+            payload = json.loads(text[idx:])
+            profiles.append(payload)
+        except json.JSONDecodeError:
+            pass
+
+    return profiles
+
+
+def summarize_memory(profiles: list) -> dict:
+    """Summarize memory profile events into a stats dict."""
+    if not profiles:
+        return {}
+
+    peaks = [p.get("peak_memory_gib", 0) for p in profiles]
+    limits = [p.get("memory_limit_gib", 0) for p in profiles]
+    batches = [p.get("batches", 1) for p in profiles]
+    elapsed = [p.get("elapsed_s", 0) for p in profiles]
+    multi_batch = sum(1 for b in batches if b > 1)
+
+    return {
+        "shards_profiled": len(profiles),
+        "peak_memory_avg": sum(peaks) / len(peaks),
+        "peak_memory_max": max(peaks),
+        "memory_limit": max(limits) if limits else 0,
+        "rewrites": multi_batch,
+        "avg_elapsed_s": sum(elapsed) / len(elapsed) if elapsed else 0,
+        "max_elapsed_s": max(elapsed) if elapsed else 0,
+    }
+
+
+def get_latest_execution(job_name: str, project: str, region: str) -> str:
+    """Get the most recent execution name for a Cloud Run job."""
+    cmd = [
+        "gcloud", "run", "jobs", "executions", "list",
+        f"--job={job_name}",
         f"--region={region}",
         f"--project={project}",
+        "--limit=1",
+        "--sort-by=~createTime",
         "--format=value(name)",
     ]
-    return subprocess.run(cmd, capture_output=True).returncode == 0
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    name = result.stdout.strip()
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Show status of per-scale Cloud Run job executions.",
+        description="Show status of Cloud Run export job executions.",
     )
     parser.add_argument(
-        "--scale", type=int,
-        help="Show only this scale (default: all scales)",
+        "--memory", action="store_true",
+        help="Query logs for memory profile stats (slower — reads Cloud Logging)",
     )
     args = parser.parse_args()
 
@@ -147,40 +247,31 @@ def main():
         print("Error: BASE_JOB_NAME and PROJECT_ID must be configured in .env")
         sys.exit(1)
 
-    # Find scale jobs
-    if args.scale is not None:
-        job_names = [(args.scale, f"{base_name}-s{args.scale}")]
-    else:
-        job_names = []
-        for s in range(20):
-            jn = f"{base_name}-s{s}"
-            if job_exists(jn, project, region):
-                job_names.append((s, jn))
-        if not job_names:
-            print(f"No jobs found matching {base_name}-s*")
-            sys.exit(1)
+    jobs = discover_jobs(base_name, project, region)
+    if not jobs:
+        print(f"No jobs found matching {base_name}-*")
+        sys.exit(1)
 
-    print(f"{'Scale':<7s} {'Status':<12s} {'Tasks':>14s} {'Elapsed':>10s}  Execution")
-    print("-" * 75)
+    print(f"{'Job':<16s} {'Status':<12s} {'Tasks':>14s} {'Elapsed':>10s}  Execution")
+    print("-" * 78)
 
     total_succeeded = 0
     total_failed = 0
     total_running = 0
     total_tasks = 0
 
-    for scale, jn in job_names:
-        info = get_execution_info(jn, project, region)
+    job_executions = {}  # job_name -> execution_name for memory queries
+
+    for label, job_name in jobs:
+        info = get_execution_info(job_name, project, region)
         if not info:
-            print(f"s{scale:<5d} {'No execution':<12s}")
+            print(f"{label:<16s} {'No execution':<12s}")
             continue
 
         succeeded = info["succeeded"]
         failed = info["failed"]
         running = info["running"]
         tasks = info["tasks"]
-        status = info["status"]
-        elapsed = info["elapsed"]
-        execution = info["execution"]
 
         total_succeeded += succeeded
         total_failed += failed
@@ -194,20 +285,53 @@ def main():
             task_str += f"+{running}run"
         task_str += f"/{tasks}"
 
-        print(f"s{scale:<5d} {status:<12s} {task_str:>14s} {elapsed:>10s}  {execution}")
+        print(f"{label:<16s} {info['status']:<12s} {task_str:>14s} "
+              f"{info['elapsed']:>10s}  {info['execution']}")
 
-    if len(job_names) > 1:
-        print("-" * 75)
+        job_executions[job_name] = info["execution"]
+
+    if len(jobs) > 1:
+        print("-" * 78)
         summary = f"{total_succeeded}"
         if total_failed:
             summary += f"+{total_failed}err"
         if total_running:
             summary += f"+{total_running}run"
         summary += f"/{total_tasks}"
-        print(f"{'Total':<7s} {'':12s} {summary:>14s}")
+        print(f"{'Total':<16s} {'':12s} {summary:>14s}")
+
+    # Memory profile stats
+    if args.memory:
+        print()
+        print(f"{'Job':<16s} {'Shards':>7s} {'PeakAvg':>8s} {'PeakMax':>8s} "
+              f"{'Limit':>6s} {'Rewrites':>8s} {'AvgTime':>8s} {'MaxTime':>8s}")
+        print("-" * 78)
+
+        for label, job_name in jobs:
+            execution = job_executions.get(job_name, "")
+            if not execution:
+                continue
+
+            profiles = query_memory_profiles(job_name, project, region, execution)
+            stats = summarize_memory(profiles)
+            if not stats:
+                print(f"{label:<16s} {'(no data)':>7s}")
+                continue
+
+            print(f"{label:<16s} {stats['shards_profiled']:>7d} "
+                  f"{stats['peak_memory_avg']:>7.1f}G {stats['peak_memory_max']:>7.1f}G "
+                  f"{stats['memory_limit']:>5.0f}G {stats['rewrites']:>8d} "
+                  f"{stats['avg_elapsed_s']:>7.0f}s {stats['max_elapsed_s']:>7.0f}s")
+
+        print()
+        print("  PeakAvg/PeakMax: average/maximum peak cgroup memory across shards")
+        print("  Rewrites: shards that needed >1 transaction commit (memory pressure)")
+        print("  AvgTime/MaxTime: wall-clock seconds per shard")
 
     print()
     print("Check chunk-level errors: pixi run export-errors")
+    if not args.memory:
+        print("Memory profile stats:    pixi run export-status --memory")
 
 
 if __name__ == "__main__":
