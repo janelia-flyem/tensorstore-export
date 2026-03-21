@@ -92,21 +92,21 @@ def main():
     print(f"  Memory:     {memory}")
     print()
 
-    # Update job resource limits if overridden
-    if args.cpu or args.memory:
-        for scale in scales:
-            job_name = f"{base_name}-s{scale}"
-            update_cmd = [
-                "gcloud", "run", "jobs", "update", job_name,
-                f"--region={region}",
-                f"--project={project}",
-                f"--cpu={cpu}",
-                f"--memory={memory}",
-                "--parallelism=0",
-            ]
-            result = subprocess.run(update_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"Warning: failed to update {job_name}: {result.stderr.strip()}")
+    # Update job definition: always sync parallelism to match tasks,
+    # and update CPU/memory if overridden.
+    for scale in scales:
+        job_name = f"{base_name}-s{scale}"
+        update_cmd = [
+            "gcloud", "run", "jobs", "update", job_name,
+            f"--region={region}",
+            f"--project={project}",
+            f"--parallelism={tasks}",
+            f"--cpu={cpu}",
+            f"--memory={memory}",
+        ]
+        result = subprocess.run(update_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Warning: failed to update {job_name}: {result.stderr.strip()}")
 
     # Execute each scale job
     for scale in scales:
