@@ -147,3 +147,97 @@ print("Copy complete!")
 -   **Separation of Concerns:** TensorStore handles the complex scheduling and I/O, allowing you to provide a clean function that decodes a single chunk.
 -   **Performance:** By using the Arrow IPC File Format with a metadata index, the `read_single_shard_chunk` function can perform fast, random-access reads, which is critical for performance.
 -   **Flexibility:** This pattern is incredibly flexible and forms the core of the highly parallel worker design described in `ShardExportDesign.md`.
+
+---
+
+## Lessons Learned: TensorStore Sharded Write Performance (March 2026)
+
+### The Per-Chunk Write Trap
+
+The initial worker implementation wrote chunks one at a time using:
+
+```python
+dest[x0:x1, y0:y1, z0:z1, 0].write(transposed).result()
+```
+
+This caused catastrophic performance with the sharded neuroglancer_precomputed
+driver. Measured: **41 seconds per chunk** for a growing ~2 GB shard file,
+making a 32K-chunk shard take 15+ days.
+
+### Root Cause (from TensorStore source code)
+
+TensorStore's sharded neuroglancer_precomputed driver uses a **read-modify-write
+at the shard level**, confirmed in:
+- `tensorstore/kvstore/neuroglancer_uint64_sharded/neuroglancer_uint64_sharded.cc`
+- `tensorstore/kvstore/neuroglancer_uint64_sharded/uint64_sharded_encoder.cc`
+
+The write path:
+1. Each `.write().result()` creates an **implicit transaction** that commits
+   immediately (`MakeImplicit()` + `RequestCommit()` in lines 738-740)
+2. At commit, `MergeForWriteback()` (lines 751-853) reads the existing shard
+   from GCS, merges the one new chunk, and `EncodeShard()` (lines 151-165)
+   writes the complete shard back
+3. As the shard file grows, each read-modify-write transfers more data
+
+For a 2 GB shard file at ~200 MB/s GCS throughput: each chunk write does
+~4 GB of I/O (read + write), taking ~20-40 seconds.
+
+### TensorStore's Built-in Solution: Explicit Transactions
+
+TensorStore **does** support batching writes via explicit transactions.
+Multiple chunk writes within one transaction are accumulated in memory
+and merged into a single shard read-modify-write at commit time:
+
+```python
+txn = ts.Transaction()
+
+for cx, cy, cz in reader.available_chunks:
+    dest.with_transaction(txn)[x0:x1, y0:y1, z0:z1, 0].write(transposed)
+
+# One shard write to GCS at commit (not 32K)
+txn.commit_async().result()
+```
+
+### Practical Considerations
+
+- **Memory**: all chunks in the transaction are held in memory until commit.
+  A 32K-chunk shard with 64³ × 8 bytes per chunk = ~8.6 GB.  May exceed
+  worker memory — use batched transactions (e.g., 1000 chunks per commit)
+  to trade GCS round-trips for memory.
+
+- **1:1 shard mapping**: the DVID export-shards command partitions chunks
+  so that each Arrow shard file maps to exactly one neuroglancer precomputed
+  shard file.  Confirmed by checking compressed Morton codes.  This means
+  a transaction per DVID shard produces exactly one neuroglancer shard write.
+
+- **`virtual_chunked` + `ts.copy`**: the approach described above in this
+  document may also solve the problem, since `ts.copy` would use TensorStore's
+  internal write scheduling which may batch writes to the same shard
+  automatically.  This has not been tested.
+
+### Batched Transaction Approach
+
+For workers with limited memory, batch the transaction commits:
+
+```python
+WRITE_BATCH_SIZE = 1000  # tune based on available memory
+
+txn = ts.Transaction()
+batch_count = 0
+
+for cx, cy, cz in reader.available_chunks:
+    dest.with_transaction(txn)[...].write(transposed)
+    batch_count += 1
+
+    if batch_count >= WRITE_BATCH_SIZE:
+        txn.commit_async().result()
+        txn = ts.Transaction()
+        batch_count = 0
+
+if batch_count > 0:
+    txn.commit_async().result()
+```
+
+- Memory: 1000 × 2 MB = ~2 GB per batch
+- GCS round-trips: ~33 for a 32K-chunk shard (vs 32K without batching)
+- Expected time: ~33 × 10s = ~5.5 minutes per shard (vs 15+ days)
