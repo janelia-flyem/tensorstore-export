@@ -106,7 +106,7 @@ By default, workers export **agglomerated labels** — the standard segmentation
 
 ### Checking for Errors
 
-After a job execution, check for chunk-level and shard-level errors:
+Check for errors at any time — during execution for a live snapshot, or after completion for the final summary:
 
 ```bash
 # Summary of errors from the most recent execution

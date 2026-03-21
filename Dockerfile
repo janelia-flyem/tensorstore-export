@@ -17,7 +17,11 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy and install BRAID library first for better layer caching
+# Build BRAID C extension (dvid_decompress.so)
+COPY braid/csrc/ braid/csrc/
+RUN make -C braid/csrc
+
+# Copy and install BRAID library
 COPY braid/pyproject.toml braid/README.md braid/
 COPY braid/src/ braid/src/
 RUN pip install --no-cache-dir braid/
