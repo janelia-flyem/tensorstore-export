@@ -2,15 +2,14 @@
 """
 Query Cloud Run job logs for export errors and produce a summary.
 
-Searches for "Chunk failed" and "Failed to process shard" events,
-aggregates by error type, scale, and shard, and optionally prints
-full details.
+With per-scale jobs ({BASE_JOB_NAME}-s0, -s1, ...), this script can query
+a single scale or aggregate across all scales.
 
 Usage:
-    pixi run export-errors
-    pixi run export-errors -- --details
-    pixi run export-errors -- --limit 500
-    pixi run export-errors -- --execution tensorstore-dvid-export-test1-bqblh
+    pixi run export-errors                     # all scales, latest execution each
+    pixi run export-errors -- --scale 0        # just s0
+    pixi run export-errors -- --details        # full error details
+    pixi run export-errors -- --all            # all executions, not just latest
 """
 
 import argparse
@@ -45,7 +44,7 @@ def query_logs(job_name: str, project: str, region: str,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"Error querying logs: {result.stderr}", file=sys.stderr)
+        print(f"Error querying logs for {job_name}: {result.stderr}", file=sys.stderr)
         return []
     try:
         return json.loads(result.stdout) if result.stdout.strip() else []
@@ -57,7 +56,6 @@ def query_logs(job_name: str, project: str, region: str,
 def parse_structured_payload(entry: dict) -> dict:
     """Extract structured fields from a textPayload JSON log line."""
     text = entry.get("textPayload", "")
-    # structlog lines look like: "ERROR:src.worker:{...json...}"
     idx = text.find("{")
     if idx == -1:
         return {"raw": text}
@@ -94,16 +92,47 @@ def get_latest_execution(job_name: str, project: str, region: str) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return ""
-    # Output is the full resource name; extract just the execution name
     name = result.stdout.strip()
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     return name
 
 
+def job_exists(job_name: str, project: str, region: str) -> bool:
+    """Check if a Cloud Run job exists."""
+    cmd = [
+        "gcloud", "run", "jobs", "describe", job_name,
+        f"--region={region}",
+        f"--project={project}",
+        "--format=value(name)",
+    ]
+    return subprocess.run(cmd, capture_output=True).returncode == 0
+
+
+def query_scale_logs(job_name: str, project: str, region: str,
+                     limit: int, use_all: bool, execution: str = ""):
+    """Query all log types for a single scale job. Returns (chunks, shards, successes)."""
+    # Resolve execution for this specific job
+    exec_filter = execution
+    if not exec_filter and not use_all:
+        exec_filter = get_latest_execution(job_name, project, region)
+
+    chunk_entries = query_logs(job_name, project, region,
+                               "Chunk failed", limit, exec_filter)
+    shard_entries = query_logs(job_name, project, region,
+                               "Failed to process shard", limit, exec_filter)
+    success_entries = query_logs(job_name, project, region,
+                                 "Shard complete", limit, exec_filter)
+    return chunk_entries, shard_entries, success_entries, exec_filter
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Query Cloud Run job logs for export errors.",
+    )
+    parser.add_argument(
+        "--scale", type=int,
+        help="Query only this scale (default: all scales)",
     )
     parser.add_argument(
         "--limit", type=int, default=1000,
@@ -115,7 +144,7 @@ def main():
     )
     parser.add_argument(
         "--execution",
-        help="Filter to a specific execution name (e.g., tensorstore-dvid-export-test1-bqblh)",
+        help="Filter to a specific execution name",
     )
     parser.add_argument(
         "--all", action="store_true",
@@ -124,51 +153,59 @@ def main():
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
-    job_name = env.get("JOB_NAME", "")
+    base_name = env.get("BASE_JOB_NAME", env.get("JOB_NAME", ""))
     project = env.get("PROJECT_ID", "")
     region = env.get("REGION", "us-central1")
 
-    if not job_name or not project:
-        print("Error: JOB_NAME and PROJECT_ID must be configured in .env")
+    if not base_name or not project:
+        print("Error: BASE_JOB_NAME and PROJECT_ID must be configured in .env")
         sys.exit(1)
 
-    # Resolve execution: explicit > latest > all
-    execution = args.execution
-    if not execution and not args.all:
-        execution = get_latest_execution(job_name, project, region)
-        if not execution:
-            print("Warning: could not determine latest execution, showing all")
-
-    print(f"Querying errors for job: {job_name}")
-    print(f"  Project:   {project}")
-    print(f"  Region:    {region}")
-    if execution:
-        print(f"  Execution: {execution}")
+    # Determine which scale jobs to query
+    if args.scale is not None:
+        job_names = [f"{base_name}-s{args.scale}"]
     else:
-        print("  Execution: (all)")
+        # Find all existing per-scale jobs
+        job_names = []
+        for s in range(20):  # check up to s19
+            jn = f"{base_name}-s{s}"
+            if job_exists(jn, project, region):
+                job_names.append(jn)
+        if not job_names:
+            # Fall back to legacy single-job name
+            if job_exists(base_name, project, region):
+                job_names = [base_name]
+            else:
+                print(f"No jobs found matching {base_name}-s*")
+                sys.exit(1)
+
+    print(f"Querying errors for {len(job_names)} job(s)")
+    print(f"  Project: {project}")
+    print(f"  Region:  {region}")
+    print(f"  Jobs:    {', '.join(job_names)}")
     print()
 
-    # Query chunk-level failures
-    print("Fetching chunk errors...")
-    chunk_entries = query_logs(
-        job_name, project, region,
-        "Chunk failed", args.limit, execution,
-    )
+    # Aggregate results across all scale jobs
+    all_chunk_entries = []
+    all_shard_entries = []
+    all_success_entries = []
+    executions = {}
 
-    # Query shard-level failures
-    print("Fetching shard errors...")
-    shard_entries = query_logs(
-        job_name, project, region,
-        "Failed to process shard", args.limit, execution,
-    )
+    for jn in job_names:
+        chunks, shards, successes, exec_name = query_scale_logs(
+            jn, project, region, args.limit, args.all, args.execution
+        )
+        all_chunk_entries.extend(chunks)
+        all_shard_entries.extend(shards)
+        all_success_entries.extend(successes)
+        if exec_name:
+            executions[jn] = exec_name
 
-    # Query successes for context
-    print("Fetching shard successes...")
-    success_entries = query_logs(
-        job_name, project, region,
-        "Shard complete", args.limit, execution,
-    )
-    print()
+    if executions:
+        print("Executions:")
+        for jn, ex in executions.items():
+            print(f"  {jn}: {ex}")
+        print()
 
     # Parse chunk errors
     error_types = Counter()
@@ -176,7 +213,7 @@ def main():
     errors_by_scale = Counter()
     all_errors = []
 
-    for entry in chunk_entries:
+    for entry in all_chunk_entries:
         payload = parse_structured_payload(entry)
         error_str = payload.get("error", payload.get("raw", "unknown"))
         shard = payload.get("shard", "unknown")
@@ -198,11 +235,10 @@ def main():
             "category": category, "error": error_str,
         })
 
-    # Parse shard-level failures (entire shard couldn't load)
+    # Parse shard-level failures
     shard_load_failures = []
-    for entry in shard_entries:
+    for entry in all_shard_entries:
         payload = parse_structured_payload(entry)
-        # Only count entries that aren't also chunk-level (the old format)
         if "chunk_x" not in payload:
             shard_load_failures.append({
                 "shard": payload.get("shard", "unknown"),
@@ -214,7 +250,7 @@ def main():
     success_chunks = 0
     success_shards = 0
     failed_chunks_in_success = 0
-    for entry in success_entries:
+    for entry in all_success_entries:
         payload = parse_structured_payload(entry)
         success_shards += 1
         success_chunks += payload.get("chunks_written", 0)
@@ -247,7 +283,6 @@ def main():
 
     if errors_by_shard:
         print(f"Shards with chunk errors: {len(errors_by_shard)}")
-        # Show top 10 worst shards
         worst = sorted(errors_by_shard.items(), key=lambda x: -len(x[1]))[:10]
         for shard, errs in worst:
             print(f"  {shard:30s} {len(errs):>4d} failed chunks")

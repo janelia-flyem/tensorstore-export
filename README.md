@@ -27,7 +27,8 @@ gcloud auth application-default login    # for Python libraries (GCS, TensorStor
 
 ```bash
 pixi install
-pixi run test-all   # 65 tests, ~55 seconds
+pixi run build-braid-c  # build C decompressor extension
+pixi run test-all       # 66 tests
 ```
 
 ### Deploy
@@ -63,7 +64,10 @@ pixi run deploy
 
 Writing neuroglancer info file ...
 Building Docker image ...
-Creating Cloud Run job ...
+Creating 10 per-scale Cloud Run jobs...
+  tensorstore-dvid-export-s0: created
+  tensorstore-dvid-export-s1: created
+  ...
 
 Done.
 ```
@@ -72,24 +76,28 @@ All values are saved to `.env` for future runs. You can also edit `.env` directl
 
 ### Generate Scales
 
-After deploying, execute the Cloud Run job:
+After deploying, execute per-scale Cloud Run jobs. Each scale has its own job
+(`{BASE_JOB_NAME}-s0`, `-s1`, ...) so they can run in parallel with independent
+resource profiles:
 
 ```bash
-# Process scales from .env defaults (typically scales 0,1 with agglomerated labels)
+# Process all scales from .env defaults
 pixi run generate-scale
 
-# Process specific scales
-pixi run generate-scale --scales 0,1
+# Process s0 with 800 parallel workers
+pixi run generate-scale -- --scales 0 --tasks 800
 
-# Process higher scales with more memory
-pixi run generate-scale --scales 2,3 --memory 4Gi
+# Process multiple scales simultaneously
+pixi run generate-scale -- --scales 0,1,2 --tasks 200
+
+# Higher scales need more memory (larger blocks)
+pixi run generate-scale -- --scales 3 --tasks 50 --memory 16Gi
 
 # Generate scale 10 by downsampling the already-written scale 9
-# (for scales not exported by DVID, e.g., when MaxDownresLevel < spec scale count)
-pixi run generate-scale --downres 10
+pixi run generate-scale -- --downres 10
 
 # Export supervoxel IDs instead of agglomerated labels
-pixi run generate-scale --scales 0 --label-type supervoxels
+pixi run generate-scale -- --scales 0 --label-type supervoxels
 ```
 
 Options for `generate-scale`:
@@ -111,20 +119,23 @@ By default, workers export **agglomerated labels** — the standard segmentation
 Check for errors at any time — during execution for a live snapshot, or after completion for the final summary:
 
 ```bash
-# Summary of errors from the most recent execution
+# Summary of errors across all scales (latest execution each)
 pixi run export-errors
+
+# Errors for a specific scale only
+pixi run export-errors -- --scale 0
 
 # Full details of every failed chunk
 pixi run export-errors -- --details
 
 # Errors from all executions (not just the latest)
 pixi run export-errors -- --all
-
-# Errors from a specific execution
-pixi run export-errors -- --execution tensorstore-dvid-export-test1-bqblh
 ```
 
-The script auto-detects the latest execution and summarizes errors by type, scale, and shard. Individual chunk failures are logged as `"Chunk failed"` events with coordinates, so they don't abort the entire shard.
+The script queries per-scale Cloud Run jobs (`{BASE_JOB_NAME}-s0`, `-s1`, ...),
+auto-detects the latest execution for each, and aggregates results. Individual
+chunk failures are logged as `"Chunk failed"` events with coordinates, so they
+don't abort the entire shard.
 
 ### Multi-Scale Processing
 
@@ -136,15 +147,19 @@ Workers support two sources for each scale:
 
 ### Memory Sizing
 
-Shard sizes grow at lower resolutions. The deploy script estimates sizes from the sharding params and suggests memory per worker:
+Arrow shard file sizes grow at coarser scales (from mCNS export data):
 
-| Scales | Typical shard size | Recommended memory |
-|--------|-------------------|-------------------|
-| 0–1 | 135–321 MB | 2 GiB |
-| 2–3 | 504–799 MB | 4 GiB |
-| 4+ | 1.4+ GB | 8 GiB |
+| Scale | Mean shard size | Max shard size | Recommended memory |
+|-------|----------------|---------------|-------------------|
+| 0     | 135 MB         | 470 MB        | 4 GiB             |
+| 1     | 321 MB         | 898 MB        | 4 GiB             |
+| 2     | 504 MB         | 1.8 GB        | 8 GiB             |
+| 3     | 800 MB         | 3.8 GB        | 16 GiB            |
+| 4+    | 1.4 GB         | 6.2 GB        | 16 GiB            |
 
-Use `--memory` on `generate-scale` to override for a specific execution, or deploy separate jobs per memory tier.
+Use `--memory` on `generate-scale` to set per-scale memory. Since each scale
+has its own Cloud Run job, different scales can run simultaneously with
+different memory profiles.
 
 ## Configuration
 
@@ -155,10 +170,12 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 | `SOURCE_PATH` | GCS URI to DVID shard export (contains s0/, s1/, ...) | `gs://mybucket/exports/seg` |
 | `DEST_PATH` | GCS URI for neuroglancer precomputed output | `gs://mybucket/v1.0/precomputed` |
 | `NG_SPEC_PATH` | Neuroglancer volume spec JSON (same as DVID export-shards) | `cns3-ng-specs.json` |
-| `SCALES` | Scales to ingest from DVID shards | `0,1` |
+| `BASE_JOB_NAME` | Cloud Run job name prefix (per-scale: `{name}-s0`, `-s1`, ...) | `tensorstore-dvid-export` |
+| `SCALES` | Scales to ingest from DVID shards | `0,1,2,3` |
 | `DOWNRES_SCALES` | Scales to generate by downsampling previous scale | `10` |
-| `MEMORY` | Memory per Cloud Run worker | `2Gi` |
-| `TASKS` | Number of parallel Cloud Run worker tasks | `200` |
+| `TASKS` | Default parallel worker tasks per scale | `200` |
+| `MEMORY` | Default memory per worker | `4Gi` |
+| `CPU` | Default CPUs per worker | `2` |
 
 ## Architecture
 

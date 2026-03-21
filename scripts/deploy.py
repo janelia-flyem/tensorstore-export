@@ -48,9 +48,9 @@ SECTIONS = [
     (
         "Deployment",
         [
-            ("SCALES", "0,1", "scales to process from DVID shards"),
-            ("JOB_NAME", "tensorstore-dvid-export", "Cloud Run job name"),
-            ("TASKS", "200", "number of parallel Cloud Run worker tasks"),
+            ("SCALES", "0,1", "scales to create jobs for (one Cloud Run job per scale)"),
+            ("BASE_JOB_NAME", "tensorstore-dvid-export", "Cloud Run job name prefix (per-scale jobs: {name}-s0, -s1, ...)"),
+            ("TASKS", "200", "default number of parallel Cloud Run worker tasks"),
             ("MAX_RETRIES", "3", "max retries per failed worker"),
             ("TASK_TIMEOUT", "3600s", "timeout per worker"),
             ("MEMORY", "2Gi", "memory per worker"),
@@ -213,17 +213,22 @@ def setup_destination_info(dest_uri: str, ng_spec: dict):
         print(f"  Written ({len(info_json)} bytes, {len(info['scales'])} scales)")
 
 
-def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str) -> tuple:
-    """Build the gcloud run jobs create/update CLI command.
+def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str,
+                               scale: int) -> tuple:
+    """Build the gcloud run jobs create/update CLI command for a single scale.
+
+    Each scale gets its own job: {BASE_JOB_NAME}-s{scale}.
 
     Returns (cmd_list, env_vars_file_path).  The env vars are written to a
     temp YAML file because the base64-encoded NG_SPEC contains characters
     that break gcloud's --set-env-vars comma-separated format.
     """
+    job_name = f"{env['BASE_JOB_NAME']}-s{scale}"
+
     env_vars = {
         "SOURCE_PATH": env["SOURCE_PATH"],
         "DEST_PATH": env["DEST_PATH"],
-        "SCALES": env["SCALES"],
+        "SCALES": str(scale),
         "NG_SPEC": ng_spec_b64,
         "MAX_PROCESSING_TIME": "55",
         "POLLING_INTERVAL": "10",
@@ -238,13 +243,15 @@ def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str) -> tuple
         env_file.write(f"{k}: '{v}'\n")
     env_file.close()
 
+    tasks = env.get("TASK_COUNT", env.get("TASKS", "200"))
+
     cmd = [
-        "gcloud", "run", "jobs", "create", env["JOB_NAME"],
+        "gcloud", "run", "jobs", "create", job_name,
         f"--image={image}",
         f"--region={env['REGION']}",
         f"--project={env['PROJECT_ID']}",
-        f"--tasks={env['TASK_COUNT']}",
-        f"--parallelism={env['PARALLELISM']}",
+        f"--tasks={tasks}",
+        f"--parallelism={tasks}",
         f"--max-retries={env['MAX_RETRIES']}",
         f"--task-timeout={env['TASK_TIMEOUT']}",
         f"--memory={env['MEMORY']}",
@@ -325,12 +332,8 @@ def main():
             ng_spec = load_ng_spec(spec_path)
             display_spec_summary(ng_spec)
 
-    # TASKS sets both parallelism and taskCount for Cloud Run
-    final["PARALLELISM"] = final["TASKS"]
-    final["TASK_COUNT"] = final["TASKS"]
-
     # Offer to save — skip if --use-env and nothing changed
-    changed = any(final.get(k) != env.get(k) for k in final if k not in ("PARALLELISM", "TASK_COUNT"))
+    changed = any(final.get(k) != env.get(k) for k in final)
     if changed:
         try:
             save_answer = input("Save updated values to .env? [Y/n]: ").strip().lower()
@@ -355,12 +358,12 @@ def main():
     import hashlib
     content_hash_input = subprocess.run(
         ["git", "log", "-1", "--format=%H", "--",
-         "Dockerfile", "requirements.txt", "main.py", "src/", "braid/src/", "braid/pyproject.toml"],
+         "Dockerfile", "requirements.txt", "main.py", "src/", "braid/src/", "braid/csrc/", "braid/pyproject.toml"],
         capture_output=True, text=True, cwd=str(PROJECT_ROOT),
     ).stdout.strip()
     content_tag = hashlib.sha256(content_hash_input.encode()).hexdigest()[:12] if content_hash_input else "latest"
 
-    image_base = f"gcr.io/{final['PROJECT_ID']}/{final['JOB_NAME']}"
+    image_base = f"gcr.io/{final['PROJECT_ID']}/{final['BASE_JOB_NAME']}"
     image_tagged = f"{image_base}:{content_tag}"
     image = image_tagged
 
@@ -411,29 +414,40 @@ def main():
             ):
                 sys.exit(1)
 
-    # Create or update Cloud Run job
-    cmd, env_file = build_cloud_run_create_cmd(final, ng_spec_b64, image)
+    # Create or update per-scale Cloud Run jobs
+    scales = [int(s.strip()) for s in final["SCALES"].split(",")]
+    base_name = final["BASE_JOB_NAME"]
 
-    try:
-        # Try create first; if job already exists, update it instead
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0 and "already exists" in result.stderr:
-            cmd[3] = "update"  # replace "create" with "update"
-            if not run_cmd(cmd, "Updating Cloud Run job"):
-                sys.exit(1)
-        elif result.returncode != 0:
-            print("\nCreating Cloud Run job...")
-            print(result.stderr)
-            print(f"  Failed (exit code {result.returncode})")
-            sys.exit(1)
-        else:
-            print("\nCreating Cloud Run job... done.")
-    finally:
-        os.unlink(env_file)
+    print(f"\nCreating {len(scales)} per-scale Cloud Run jobs...")
+    for scale in scales:
+        job_name = f"{base_name}-s{scale}"
+        cmd, env_file = build_cloud_run_create_cmd(final, ng_spec_b64, image, scale)
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0 and "already exists" in result.stderr:
+                cmd[3] = "update"  # replace "create" with "update"
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  {job_name}: FAILED to update")
+                    print(f"    {result.stderr.strip()}")
+                else:
+                    print(f"  {job_name}: updated")
+            elif result.returncode != 0:
+                print(f"  {job_name}: FAILED to create")
+                print(f"    {result.stderr.strip()}")
+            else:
+                print(f"  {job_name}: created")
+        finally:
+            os.unlink(env_file)
 
     print("\nDone.")
-    print(f"  Execute: gcloud run jobs execute {final['JOB_NAME']} --region={final['REGION']} --project={final['PROJECT_ID']}")
-    print(f"  Logs:    gcloud logging read \"resource.type=cloud_run_job AND resource.labels.job_name={final['JOB_NAME']}\" --project={final['PROJECT_ID']} --limit=100")
+    print("\nExecute scales with:")
+    print("  pixi run generate-scale -- --scales 0 --tasks 800")
+    print("  pixi run generate-scale -- --scales 0,1,2 --tasks 200")
+    print("\nCheck errors:")
+    print("  pixi run export-errors")
+    print("  pixi run export-errors -- --scale 0")
 
 
 if __name__ == "__main__":
