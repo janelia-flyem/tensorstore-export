@@ -62,8 +62,9 @@ class WorkerConfig(BaseModel):
     # "segmentation" view where proofreading merges are applied.
     label_type: str = "labels"
 
-    # Worker behavior
-    max_processing_time_minutes: int = 55
+    # Worker behavior — set high so tasks run to completion.
+    # Cloud Run TASK_TIMEOUT is the hard limit.
+    max_processing_time_minutes: int = 1440  # 24 hours
     polling_interval_seconds: int = 10
 
 
@@ -373,7 +374,7 @@ def create_config_from_env() -> WorkerConfig:
         scales=scales,
         downres_scales=downres_scales,
         label_type=os.environ.get("LABEL_TYPE", "labels"),
-        max_processing_time_minutes=int(os.environ.get("MAX_PROCESSING_TIME", "55")),
+        max_processing_time_minutes=int(os.environ.get("MAX_PROCESSING_TIME", "1440")),
         polling_interval_seconds=int(os.environ.get("POLLING_INTERVAL", "10")),
     )
 

@@ -52,7 +52,7 @@ SECTIONS = [
             ("BASE_JOB_NAME", "tensorstore-dvid-export", "Cloud Run job name prefix (per-scale jobs: {name}-s0, -s1, ...)"),
             ("TASKS", "200", "default number of parallel Cloud Run worker tasks"),
             ("MAX_RETRIES", "3", "max retries per failed worker"),
-            ("TASK_TIMEOUT", "3600s", "timeout per worker"),
+            ("TASK_TIMEOUT", "86400s", "timeout per worker (max 24h)"),
             ("MEMORY", "2Gi", "memory per worker"),
             ("CPU", "2", "CPUs per worker"),
         ],
