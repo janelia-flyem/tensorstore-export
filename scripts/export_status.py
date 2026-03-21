@@ -207,6 +207,9 @@ def main():
         summary += f"/{total_tasks}"
         print(f"{'Total':<7s} {'':12s} {summary:>14s}")
 
+    print()
+    print("Check chunk-level errors: pixi run export-errors")
+
 
 if __name__ == "__main__":
     main()

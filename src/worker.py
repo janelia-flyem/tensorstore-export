@@ -196,14 +196,18 @@ class ShardProcessor:
                     # BRAID outputs ZYX order; neuroglancer precomputed is XYZ + channel
                     transposed = chunk_data.transpose(2, 1, 0)
 
-                    # Write to the destination at the chunk's global voxel coordinates
+                    # Write to the destination at the chunk's global voxel coordinates.
+                    # Clip to volume bounds for boundary chunks where the volume
+                    # size isn't a multiple of the chunk size.
                     x0 = cx * CHUNK_VOXELS
                     y0 = cy * CHUNK_VOXELS
                     z0 = cz * CHUNK_VOXELS
-                    dest[x0:x0 + CHUNK_VOXELS,
-                         y0:y0 + CHUNK_VOXELS,
-                         z0:z0 + CHUNK_VOXELS,
-                         0].write(transposed).result()
+                    x1 = min(x0 + CHUNK_VOXELS, dest.shape[0])
+                    y1 = min(y0 + CHUNK_VOXELS, dest.shape[1])
+                    z1 = min(z0 + CHUNK_VOXELS, dest.shape[2])
+                    dest[x0:x1, y0:y1, z0:z1, 0].write(
+                        transposed[:x1 - x0, :y1 - y0, :z1 - z0]
+                    ).result()
                     chunks_written += 1
 
                 except Exception as e:

@@ -114,6 +114,16 @@ Options for `generate-scale`:
 
 By default, workers export **agglomerated labels** — the standard segmentation view where proofreading merges are applied. Use `--label-type supervoxels` to export the raw supervoxel IDs from the DVID blocks instead.
 
+### Monitoring Progress
+
+```bash
+# Status of all per-scale jobs (elapsed time, task counts)
+pixi run export-status
+
+# Status of a specific scale
+pixi run export-status --scale 0
+```
+
 ### Checking for Errors
 
 Check for errors at any time — during execution for a live snapshot, or after completion for the final summary:

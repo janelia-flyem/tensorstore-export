@@ -243,7 +243,7 @@ def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str,
         env_file.write(f"{k}: '{v}'\n")
     env_file.close()
 
-    tasks = env.get("TASK_COUNT", env.get("TASKS", "200"))
+    tasks = env.get("TASKS", "200")
 
     cmd = [
         "gcloud", "run", "jobs", "create", job_name,
