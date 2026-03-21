@@ -102,6 +102,7 @@ def main():
                 f"--project={project}",
                 f"--cpu={cpu}",
                 f"--memory={memory}",
+                "--parallelism=0",
             ]
             result = subprocess.run(update_cmd, capture_output=True, text=True)
             if result.returncode != 0:
