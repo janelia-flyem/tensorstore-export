@@ -24,12 +24,12 @@ RUN make -C braid/csrc
 # Copy and install BRAID library
 COPY braid/pyproject.toml braid/README.md braid/
 COPY braid/src/ braid/src/
-RUN pip install --no-cache-dir braid/
+RUN pip install --no-cache-dir --root-user-action=ignore braid/
 
 # Copy and install main app dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip \
+    && pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 
 # Copy application code
 COPY src/ src/
