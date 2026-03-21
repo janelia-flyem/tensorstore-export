@@ -58,6 +58,9 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
 
     # Parse conditions for overall status
     conditions = status.get("conditions", [])
+    running = status.get("runningCount", 0)
+    succeeded = status.get("succeededCount", 0)
+
     overall_status = "Unknown"
     for cond in conditions:
         if cond.get("type") == "Completed":
@@ -65,13 +68,9 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
                 overall_status = "Completed"
             elif cond.get("reason") == "ContainerFailed":
                 overall_status = "Failed"
-            else:
-                overall_status = cond.get("reason", "Unknown")
             break
-    else:
-        # No Completed condition yet
-        running = status.get("runningCount", 0)
-        succeeded = status.get("succeededCount", 0)
+
+    if overall_status == "Unknown":
         if running > 0:
             overall_status = "Running"
         elif succeeded > 0:
