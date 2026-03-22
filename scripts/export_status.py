@@ -147,13 +147,14 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
     }
 
 
-def query_memory_profiles(job_name: str, project: str, region: str,
-                          execution: str = "", limit: int = 5000) -> list:
-    """Query 'Shard memory profile' log events for a job."""
+def _query_log_events(job_name: str, project: str, region: str,
+                      event_name: str, execution: str = "",
+                      limit: int = 5000) -> list:
+    """Query structured log events by event name for a job."""
     parts = [
         'resource.type="cloud_run_job"',
         f'resource.labels.job_name="{job_name}"',
-        'textPayload=~"Shard memory profile"',
+        f'textPayload=~"{event_name}"',
     ]
     if execution:
         parts.append(f'labels."run.googleapis.com/execution_name"="{execution}"')
@@ -168,7 +169,7 @@ def query_memory_profiles(job_name: str, project: str, region: str,
     if result.returncode != 0 or not result.stdout.strip():
         return []
 
-    profiles = []
+    events = []
     try:
         entries = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -181,11 +182,11 @@ def query_memory_profiles(job_name: str, project: str, region: str,
             continue
         try:
             payload = json.loads(text[idx:])
-            profiles.append(payload)
+            events.append(payload)
         except json.JSONDecodeError:
             pass
 
-    return profiles
+    return events
 
 
 def summarize_memory(profiles: list) -> dict:
@@ -231,10 +232,6 @@ def get_latest_execution(job_name: str, project: str, region: str) -> str:
 def main():
     parser = argparse.ArgumentParser(
         description="Show status of Cloud Run export job executions.",
-    )
-    parser.add_argument(
-        "--memory", action="store_true",
-        help="Query logs for memory profile stats (slower — reads Cloud Logging)",
     )
     args = parser.parse_args()
 
@@ -300,38 +297,95 @@ def main():
         summary += f"/{total_tasks}"
         print(f"{'Total':<16s} {'':12s} {summary:>14s}")
 
-    # Memory profile stats
-    if args.memory:
-        print()
-        print(f"{'Job':<16s} {'Shards':>7s} {'PeakAvg':>8s} {'PeakMax':>8s} "
-              f"{'Limit':>6s} {'Rewrites':>8s} {'AvgTime':>8s} {'MaxTime':>8s}")
-        print("-" * 78)
-
-        for label, job_name in jobs:
-            execution = job_executions.get(job_name, "")
-            if not execution:
-                continue
-
-            profiles = query_memory_profiles(job_name, project, region, execution)
-            stats = summarize_memory(profiles)
-            if not stats:
-                print(f"{label:<16s} {'(no data)':>7s}")
-                continue
-
-            print(f"{label:<16s} {stats['shards_profiled']:>7d} "
-                  f"{stats['peak_memory_avg']:>7.1f}G {stats['peak_memory_max']:>7.1f}G "
-                  f"{stats['memory_limit']:>5.0f}G {stats['rewrites']:>8d} "
-                  f"{stats['avg_elapsed_s']:>7.0f}s {stats['max_elapsed_s']:>7.0f}s")
-
-        print()
-        print("  PeakAvg/PeakMax: average/maximum peak cgroup memory across shards")
-        print("  Rewrites: shards that needed >1 transaction commit (memory pressure)")
-        print("  AvgTime/MaxTime: wall-clock seconds per shard")
-
+    # Query Cloud Logging for progress and memory stats per tier
     print()
+    for label, job_name in jobs:
+        execution = job_executions.get(job_name, "")
+        if not execution:
+            continue
+
+        # Query in-flight progress and completed shard events
+        progress = _query_log_events(
+            job_name, project, region, "Shard progress", execution)
+        completed = _query_log_events(
+            job_name, project, region, "Shard memory profile", execution)
+
+        # Deduplicate progress: keep latest per (scale, shard)
+        latest = {}
+        for p in progress:
+            key = (p.get("scale"), p.get("shard"))
+            latest[key] = p  # entries are newest-first from gcloud
+
+        # Completed shards
+        completed_keys = set()
+        for c in completed:
+            completed_keys.add((c.get("scale"), c.get("shard")))
+
+        in_flight = {k: v for k, v in latest.items()
+                     if k not in completed_keys}
+
+        total_chunks_inflight = sum(
+            p.get("chunks_written", 0) for p in in_flight.values())
+        total_chunks_total = sum(
+            p.get("total", 0) for p in in_flight.values())
+
+        print(f"{label}:")
+        print(f"  Completed shards: {len(completed_keys)}")
+
+        # Memory stats for completed shards
+        stats = summarize_memory(completed)
+        if stats:
+            print(f"  Memory: avg {stats['peak_memory_avg']:.1f}G, "
+                  f"max {stats['peak_memory_max']:.1f}G / "
+                  f"{stats['memory_limit']:.0f}G limit, "
+                  f"rewrites: {stats['rewrites']}")
+            print(f"  Timing: avg {stats['avg_elapsed_s']:.0f}s, "
+                  f"max {stats['max_elapsed_s']:.0f}s per shard")
+
+        # In-flight shards sorted by % complete
+        if in_flight:
+            print(f"  In-flight shards: {len(in_flight)}, "
+                  f"chunks: {total_chunks_inflight:,}/{total_chunks_total:,}")
+
+            def _pct(item):
+                p = item[1]
+                t = p.get("total", 0)
+                return p.get("chunks_written", 0) / t if t else 0
+
+            by_pct = sorted(in_flight.items(), key=_pct, reverse=True)
+
+            def _print_shard(item):
+                (scale, shard), p = item
+                written = p.get("chunks_written", 0)
+                total_c = p.get("total", 0)
+                mem = p.get("memory_gib", 0)
+                elapsed = p.get("elapsed_s", 0)
+                pct = 100 * written / total_c if total_c else 0
+                print(f"    s{scale}/{shard}: "
+                      f"{written:,}/{total_c:,} ({pct:.0f}%), "
+                      f"{mem:.1f}G, {elapsed:.0f}s")
+
+            top5 = by_pct[:5]
+            bottom5 = by_pct[-5:]
+            middle = len(by_pct) - 10
+
+            for item in top5:
+                _print_shard(item)
+            if middle > 0:
+                print(f"    ... {middle} more ...")
+                for item in bottom5:
+                    _print_shard(item)
+            elif len(by_pct) > 5:
+                # 6-10 shards: just show the rest that weren't in top5
+                for item in by_pct[5:]:
+                    _print_shard(item)
+
+        if not completed and not in_flight:
+            print("  (no log data yet)")
+
+        print()
+
     print("Check chunk-level errors: pixi run export-errors")
-    if not args.memory:
-        print("Memory profile stats:    pixi run export-status --memory")
 
 
 if __name__ == "__main__":
