@@ -10,12 +10,10 @@ Usage:
     pixi run deploy
 """
 
-import base64
 import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -48,13 +46,10 @@ SECTIONS = [
     (
         "Deployment",
         [
-            ("SCALES", "0,1", "scales to create jobs for (one Cloud Run job per scale)"),
-            ("BASE_JOB_NAME", "tensorstore-dvid-export", "Cloud Run job name prefix (per-scale jobs: {name}-s0, -s1, ...)"),
-            ("TASKS", "200", "default number of parallel Cloud Run worker tasks"),
+            ("SCALES", "0,1", "scales to export (comma-separated)"),
+            ("BASE_JOB_NAME", "tensorstore-dvid-export", "Cloud Run job name prefix"),
             ("MAX_RETRIES", "3", "max retries per failed worker"),
             ("TASK_TIMEOUT", "86400s", "timeout per worker (max 24h)"),
-            ("MEMORY", "2Gi", "memory per worker"),
-            ("CPU", "2", "CPUs per worker"),
         ],
     ),
 ]
@@ -213,53 +208,6 @@ def setup_destination_info(dest_uri: str, ng_spec: dict):
         print(f"  Written ({len(info_json)} bytes, {len(info['scales'])} scales)")
 
 
-def build_cloud_run_create_cmd(env: dict, ng_spec_b64: str, image: str,
-                               scale: int) -> tuple:
-    """Build the gcloud run jobs create/update CLI command for a single scale.
-
-    Each scale gets its own job: {BASE_JOB_NAME}-s{scale}.
-
-    Returns (cmd_list, env_vars_file_path).  The env vars are written to a
-    temp YAML file because the base64-encoded NG_SPEC contains characters
-    that break gcloud's --set-env-vars comma-separated format.
-    """
-    job_name = f"{env['BASE_JOB_NAME']}-s{scale}"
-
-    env_vars = {
-        "SOURCE_PATH": env["SOURCE_PATH"],
-        "DEST_PATH": env["DEST_PATH"],
-        "SCALES": str(scale),
-        "NG_SPEC": ng_spec_b64,
-        "MAX_PROCESSING_TIME": "55",
-        "POLLING_INTERVAL": "10",
-    }
-
-    # Write env vars to a temp YAML file for --env-vars-file
-    env_file = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", delete=False, prefix="cloudrun-env-"
-    )
-    # gcloud --env-vars-file expects KEY: VALUE yaml
-    for k, v in env_vars.items():
-        env_file.write(f"{k}: '{v}'\n")
-    env_file.close()
-
-    tasks = env.get("TASKS", "200")
-
-    cmd = [
-        "gcloud", "run", "jobs", "create", job_name,
-        f"--image={image}",
-        f"--region={env['REGION']}",
-        f"--project={env['PROJECT_ID']}",
-        f"--tasks={tasks}",
-        f"--parallelism={tasks}",
-        f"--max-retries={env['MAX_RETRIES']}",
-        f"--task-timeout={env['TASK_TIMEOUT']}",
-        f"--memory={env['MEMORY']}",
-        f"--cpu={env['CPU']}",
-        f"--env-vars-file={env_file.name}",
-    ]
-    return cmd, env_file.name
-
 
 # Placeholder values from .env.example that should be treated as "not configured"
 PLACEHOLDERS = {"your-gcp-project", "gs://your-bucket/path/to/shard/export",
@@ -308,9 +256,7 @@ def main():
     for section_name, fields in SECTIONS:
         print(f"\n--- {section_name} ---")
 
-        # After loading the ng spec, override the SCALES default to include
-        # all scales defined in the spec (since DVID export-shards produces
-        # data for every scale it was given).
+        # Default SCALES to all scales defined in the ng spec.
         if section_name == "Deployment" and ng_spec:
             all_scales = ",".join(str(i) for i in range(len(ng_spec["scales"])))
             fields = [(k, all_scales if k == "SCALES" else d, desc)
@@ -347,10 +293,6 @@ def main():
 
     # Setup destination info file
     setup_destination_info(final["DEST_PATH"], ng_spec)
-
-    # Encode the ng spec for the Cloud Run env var
-    ng_spec_json = json.dumps(ng_spec, separators=(",", ":"))
-    ng_spec_b64 = base64.b64encode(ng_spec_json.encode()).decode()
 
     # Build and push Docker image.
     # Tag with a hash of the files that go into the Docker image so we
@@ -414,40 +356,10 @@ def main():
             ):
                 sys.exit(1)
 
-    # Create or update per-scale Cloud Run jobs
-    scales = [int(s.strip()) for s in final["SCALES"].split(",")]
-    base_name = final["BASE_JOB_NAME"]
-
-    print(f"\nCreating {len(scales)} per-scale Cloud Run jobs...")
-    for scale in scales:
-        job_name = f"{base_name}-s{scale}"
-        cmd, env_file = build_cloud_run_create_cmd(final, ng_spec_b64, image, scale)
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0 and "already exists" in result.stderr:
-                cmd[3] = "update"  # replace "create" with "update"
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"  {job_name}: FAILED to update")
-                    print(f"    {result.stderr.strip()}")
-                else:
-                    print(f"  {job_name}: updated")
-            elif result.returncode != 0:
-                print(f"  {job_name}: FAILED to create")
-                print(f"    {result.stderr.strip()}")
-            else:
-                print(f"  {job_name}: created")
-        finally:
-            os.unlink(env_file)
-
-    print("\nDone.")
-    print("\nExecute scales with:")
-    print("  pixi run generate-scale --scales 0 --tasks 800")
-    print("  pixi run generate-scale --scales 0,1,2 --tasks 200")
-    print("\nCheck errors:")
-    print("  pixi run export-errors")
-    print("  pixi run export-errors --scale 0")
+    print(f"\nDone. Image: {image}")
+    print("\nNext steps:")
+    print("  pixi run export            # scan shards, create tier jobs, launch")
+    print("  pixi run export --dry-run  # preview tier assignments without launching")
 
 
 if __name__ == "__main__":
