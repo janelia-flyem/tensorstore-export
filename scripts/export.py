@@ -34,19 +34,9 @@ from scripts.precompute_manifest import (
 )
 
 
-def _get_image_from_job(base_name: str, project: str, region: str) -> str:
-    """Read the Docker image URI from an existing Cloud Run job."""
-    # Try the first scale job (created by deploy)
-    for suffix in ["s0", "s1", "s0"]:
-        result = subprocess.run(
-            ["gcloud", "run", "jobs", "describe", f"{base_name}-{suffix}",
-             f"--region={region}", f"--project={project}",
-             "--format=value(template.template.containers[0].image)"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    return ""
+def _get_image(env: dict) -> str:
+    """Get the Docker image URI from .env (set by deploy)."""
+    return env.get("DOCKER_IMAGE", "")
 
 
 def _create_or_update_job(job_name: str, image: str, env: dict,
@@ -258,10 +248,10 @@ def main():
         tier_uri, num_tasks = tier_info[gib]
         print(f"  {gib}Gi: {num_tasks} tasks → {tier_uri}/")
 
-    # --- Step 4: Get Docker image from existing job ---
-    image = _get_image_from_job(base_name, project, region)
+    # --- Step 4: Get Docker image ---
+    image = _get_image(env)
     if not image:
-        print("Error: Could not find Docker image. Run 'pixi run deploy' first.")
+        print("Error: DOCKER_IMAGE not set in .env. Run 'pixi run deploy' first.")
         sys.exit(1)
     print(f"\nUsing image: {image}")
 

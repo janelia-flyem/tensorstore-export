@@ -356,6 +356,10 @@ def main():
             ):
                 sys.exit(1)
 
+    # Save image URI to .env so export.py can find it.
+    final["DOCKER_IMAGE"] = image
+    save_env(ENV_FILE, final)
+
     print(f"\nDone. Image: {image}")
     print("\nNext steps:")
     print("  pixi run export            # scan shards, create tier jobs, launch")
