@@ -149,7 +149,7 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
 
 def _query_log_events(job_name: str, project: str, region: str,
                       event_name: str, execution: str = "",
-                      limit: int = 5000) -> list:
+                      limit: int = 50000) -> list:
     """Query structured log events by event name for a job."""
     parts = [
         'resource.type="cloud_run_job"',
@@ -330,7 +330,8 @@ def main():
             p.get("total", 0) for p in in_flight.values())
 
         print(f"{label}:")
-        print(f"  Completed shards: {len(completed_keys)}")
+        completed_note = "+" if len(completed) >= 50000 else ""
+        print(f"  Completed shards: {len(completed_keys)}{completed_note}")
 
         # Memory stats for completed shards
         stats = summarize_memory(completed)

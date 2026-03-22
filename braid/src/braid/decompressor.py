@@ -10,12 +10,15 @@ is not available.  See braid/docs/DVID-block-decompression.md for details.
 """
 
 import ctypes
+import logging
 import struct
 from pathlib import Path
 from typing import List, Tuple, Optional
 import numpy as np
 import zstandard as zstd
 from .exceptions import DecompressionError
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # C extension loading
@@ -50,9 +53,11 @@ def _load_c_lib():
                     ctypes.c_int,          # gz
                 ]
                 _c_lib = lib
+                logger.info("DVID decompressor: C extension loaded from %s", path)
                 return lib
             except OSError:
                 continue
+    logger.warning("DVID decompressor: C extension not found, using pure Python (slow)")
     return None
 
 

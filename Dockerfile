@@ -26,6 +26,11 @@ COPY braid/pyproject.toml braid/README.md braid/
 COPY braid/src/ braid/src/
 RUN pip install --no-cache-dir --root-user-action=ignore braid/
 
+# Copy the C extension .so into the installed braid package so the
+# decompressor can find it (search path is relative to __file__).
+RUN cp braid/csrc/libdvid_decompress.so \
+    $(python -c "from pathlib import Path; import braid; print(Path(braid.__file__).parent)")/
+
 # Copy and install main app dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip \
