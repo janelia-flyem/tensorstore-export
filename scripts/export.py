@@ -208,13 +208,17 @@ def main():
         return
 
     # --- Step 3: Write per-task manifests to GCS ---
-    print(f"\nWriting per-task manifests...")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from google.cloud import storage
     storage_client = storage.Client()
     bucket_name, source_prefix = source_path.replace("gs://", "").split("/", 1)
     gcs_bucket = storage_client.bucket(bucket_name)
 
     tier_info = {}  # gib -> (manifest_uri, num_tasks)
+    total_manifests = 0
+
+    # Prepare all manifest uploads across tiers
+    all_uploads = []  # (gib, task_idx, blob_path, json_bytes)
     for gib in sorted(tier_map.keys()):
         shards = tier_map[gib]
         tier_max = max_tasks.get(gib, 1000)
@@ -223,16 +227,36 @@ def main():
 
         tier_prefix = f"{source_prefix}/manifests/tier-{gib}gi"
         tier_uri = f"{source_path}/manifests/tier-{gib}gi"
+        tier_info[gib] = (tier_uri, num_tasks)
 
         for task_idx, shard_list in tasks.items():
-            blob = gcs_bucket.blob(f"{tier_prefix}/task-{task_idx}.json")
-            blob.upload_from_string(
-                json.dumps(shard_list, separators=(",", ":")),
-                content_type="application/json",
-            )
+            blob_path = f"{tier_prefix}/task-{task_idx}.json"
+            json_bytes = json.dumps(shard_list, separators=(",", ":"))
+            all_uploads.append((gib, blob_path, json_bytes))
 
-        print(f"  {gib}Gi: {num_tasks} task manifests → {tier_uri}/")
-        tier_info[gib] = (tier_uri, num_tasks)
+    print(f"\nWriting {len(all_uploads)} task manifests to GCS...")
+
+    def _upload_one(blob_path_and_data):
+        blob_path, data = blob_path_and_data
+        gcs_bucket.blob(blob_path).upload_from_string(
+            data, content_type="application/json",
+        )
+
+    uploaded = 0
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        futures = {
+            pool.submit(_upload_one, (blob_path, data)): gib
+            for gib, blob_path, data in all_uploads
+        }
+        for future in as_completed(futures):
+            future.result()  # propagate exceptions
+            uploaded += 1
+            if uploaded % 500 == 0 or uploaded == len(all_uploads):
+                print(f"  {uploaded}/{len(all_uploads)} manifests written")
+
+    for gib in sorted(tier_info.keys()):
+        tier_uri, num_tasks = tier_info[gib]
+        print(f"  {gib}Gi: {num_tasks} tasks → {tier_uri}/")
 
     # --- Step 4: Get Docker image from existing job ---
     image = _get_image_from_job(base_name, project, region)
