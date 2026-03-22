@@ -4,138 +4,96 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a catch-all development repository containing three main components:
+Converts DVID `export-shards` Arrow IPC files into neuroglancer precomputed segmentation volumes on GCS using massively parallel Cloud Run jobs.
 
-1. **research/**: Code and documentation for AI-driven development and analysis
-2. **braid/**: Initial formulation of the BRAID library (will be committed to https://github.com/JaneliaSciComp/braid)
-3. **src/**: The main tensorstore-export application for massively parallel processing of Arrow shard files
+Two main components:
+1. **src/**: The Cloud Run worker application (TensorStore + BRAID)
+2. **braid/**: Python library for reading DVID's spatially-partitioned Arrow shard files (installed as an editable dependency)
 
-The primary application (`src/`) uses TensorStore and BRAID to run Google Cloud Run tasks that export Arrow shard files (with CSV indices) from GCS to Neuroglancer precomputed segmentation volumes.
+Supporting directories: `scripts/` (deployment and orchestration), `examples/` (export spec files), `docs/` (design documents).
 
 ## Development Commands
 
-### BRAID Library Development (braid/)
+This project uses [pixi](https://prefix.dev/) for dependency management and task running.
+
 ```bash
-# Navigate to braid directory
-cd braid
+pixi run test-braid          # Unit tests for braid library
+pixi run test-bench           # Benchmark tests for braid decompressor
+pixi run test-e2e             # End-to-end precomputed output test
+pixi run test-all             # All braid tests
+pixi run lint                 # Ruff linter on src/, braid/, scripts/
+pixi run build-braid-c        # Build braid C extension (decompressor)
 
-# Install in development mode
-pip install -e .[dev]
-
-# Run tests
-pytest
-
-# Format code
-black src/ tests/
-isort src/ tests/
-
-# Type checking
-mypy src/
-
-# Run tests with coverage
-pytest -v --cov=braid --cov-report=term-missing
-```
-
-### TensorStore Export Application (src/)
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run locally (requires environment variables)
-python main.py
-
-# Docker build
-docker build -t tensorstore-export .
-
-# Deploy to Cloud Run
-./scripts/deploy.sh
+pixi run deploy               # Build Docker image and push to GCR
+pixi run export               # Full export: manifest + Cloud Run jobs
+pixi run export --dry-run     # Show what would be launched
+pixi run export-status        # Monitor running Cloud Run jobs
+pixi run export-errors        # Scan logs for export errors
+pixi run precompute-manifest  # Generate per-task shard manifests
 ```
 
 ## Architecture
 
-### TensorStore Export System (`src/`)
-The main application creates massively parallel Cloud Run workers that:
+### Worker (`src/worker.py`)
 
-1. **Poll GCS**: Workers look for available shards in `unprocessed/` directory
-2. **Process Shards**: Each worker takes one shard (Arrow + CSV files) and processes it completely
-3. **Export to Neuroglancer**: Outputs neuroglancer precomputed segmentation volume shards
-4. **Job Management**: Uses atomic file movement (`unprocessed/` → `processing/` → `finished/`) to prevent race conditions
+Each Cloud Run task:
+1. Reads its shard assignments from a pre-computed manifest on GCS (or self-partitions via task index)
+2. For each assigned shard, reads the Arrow IPC file and CSV index from GCS
+3. Decompresses DVID blocks using the BRAID library
+4. Writes chunks into a TensorStore transaction (neuroglancer precomputed with compressed_segmentation encoding)
+5. Commits the transaction, which writes the output shard file to GCS
+6. Optionally generates downres scales by reading the previous scale from the destination volume
 
-#### Key Components
-- `worker.py`: Main Cloud Run worker with GCS polling and job queue management
-- `shard_reader.py`: Interface for reading DVID Arrow shard files
-- `tensorstore_adapter.py`: TensorStore integration using `virtual_chunked` driver for memory efficiency
+### Key Source Files
+- `src/worker.py`: Cloud Run worker — shard processing, transaction management, cgroup memory monitoring
+- `src/tensorstore_adapter.py`: Helper for opening neuroglancer precomputed volumes via TensorStore
+- `braid/src/braid/reader.py`: Arrow shard reader with CSV index lookup
+- `braid/src/braid/decompressor.py`: DVID block decompression (zstd + label encoding)
+- `scripts/export.py`: Orchestrator — scans shards, builds tier-based manifests, launches Cloud Run jobs
+- `scripts/deploy.py`: Docker build and GCR push
+- `scripts/precompute_manifest.py`: Generates per-task manifest files partitioned into memory tiers
+- `scripts/setup_destination.py`: Creates the neuroglancer precomputed info file on GCS
+
+### Export Pipeline
+
+```
+pixi run deploy    →  builds Docker image, pushes to GCR, stores URI in .env
+pixi run export    →  scans source shards → groups into memory tiers →
+                      writes per-task manifests to GCS → launches one
+                      Cloud Run job per tier
+```
+
+Tier-based manifests group shards by estimated memory so that small-shard tasks use less memory (and cost less) than large-shard tasks.
 
 ### BRAID Library (`braid/`)
-A standalone Python library for efficient reading of segmentation data from spatially-partitioned sharded Arrow files. Features:
 
-- **Block-wise Access**: Read individual 64x64x64 chunks by coordinates
-- **Dual Label Support**: Both agglomerated labels and supervoxel data
-- **Memory Efficient**: Decompresses only requested blocks
-- **DVID Compression**: Handles custom DVID block compression with zstd
-
-### Data Flow Architecture
-1. **Input**: DVID exports produce paired files per shard:
-   - `.arrow`: Arrow IPC file with compressed segmentation blocks
-   - `.csv`: Coordinate index mapping (x,y,z,rec)
-2. **Processing**: Cloud Run workers use BRAID + TensorStore's `virtual_chunked` driver
-3. **Output**: Neuroglancer precomputed volume shards in target GCS location
-
-## File Structure
-
-```
-├── main.py                    # Cloud Run entry point
-├── requirements.txt           # Dependencies for tensorstore-export
-├── Dockerfile                 # Container for Cloud Run deployment
-├── src/                       # TensorStore export application
-│   ├── worker.py             # Main worker with GCS job management
-│   ├── shard_reader.py       # DVID shard reading interface
-│   └── tensorstore_adapter.py # TensorStore virtual_chunked integration
-├── braid/                     # BRAID library (future separate repo)
-│   ├── src/braid/            # Library source code
-│   ├── pyproject.toml        # Build configuration
-│   ├── README.md             # Library documentation
-│   └── tests/                # Unit tests
-├── research/                  # AI development tools and analysis
-├── docs/                     # Technical documentation
-│   ├── ShardExportDesign.md  # Distributed system architecture
-│   ├── EfficientWrites.md    # Memory optimization strategies
-│   └── ArrowParallelWrite.md # Arrow integration details
-└── scripts/deploy.sh         # Cloud Run deployment script
-```
-
-## Distributed Processing Strategy
-
-### Job Queue Management
-- Workers continuously poll GCS `unprocessed/` prefix for available shards
-- Atomic file movement prevents race conditions between workers
-- Each worker processes exactly one shard before polling for the next
-- Failed processing moves shards to `failed/` prefix for debugging
-
-### Scalability
-- Designed for thousands of parallel Cloud Run workers
-- Each worker has minimal memory requirements due to block-wise processing
-- No central coordinator required - workers self-organize via GCS file operations
+Pure Python (with optional C extension) for reading DVID Arrow shard files:
+- Block-wise access: reads individual 64x64x64 chunks by coordinate
+- Dual label support: agglomerated labels and supervoxel data
+- DVID block decompression: zstd + custom label encoding
+- CSV index: maps (x,y,z) to Arrow record offsets
 
 ## Configuration
 
-### Environment Variables (Cloud Run Workers)
-- `SOURCE_BUCKET`: GCS bucket containing Arrow shard files in `unprocessed/`
-- `DEST_BUCKET`: Target GCS bucket for Neuroglancer volume
-- `DEST_PATH`: Path within destination bucket
-- `TOTAL_VOLUME_SHAPE`: Volume dimensions as "z,y,x"
-- `SHARD_SHAPE`: Shard dimensions (default: 2048,2048,2048)
-- `CHUNK_SHAPE`: Block dimensions (default: 64,64,64)
+All configuration lives in `.env` (not committed; see `.env.example` for the template). Key variables:
 
-### Data Formats
-- **Arrow Schema**: `chunk_x`, `chunk_y`, `chunk_z`, `labels`, `supervoxels`, `dvid_compressed_block`, `uncompressed_size`
-- **CSV Index**: `x,y,z,rec` mapping chunk coordinates to Arrow record indices
-- **Output**: Neuroglancer precomputed format with info files and shard data
+| Variable | Description |
+|----------|-------------|
+| `SOURCE_PATH` | GCS URI to DVID Arrow shard export (contains `s0/`, `s1/`, ...) |
+| `DEST_PATH` | GCS URI for neuroglancer precomputed output |
+| `NG_SPEC_PATH` | Local path to neuroglancer multiscale JSON spec |
+| `SCALES` | Comma-separated scale indices to process (e.g., `0,1,2,3`) |
+| `DOWNRES_SCALES` | Scales to generate by downsampling (optional) |
+| `PROJECT_ID` | GCP project |
+| `REGION` | GCP region |
+| `BASE_JOB_NAME` | Prefix for Cloud Run job names |
 
-## Memory Efficiency Design
+The worker itself reads `SOURCE_PATH`, `DEST_PATH`, `NG_SPEC` (base64-encoded), `SCALES`, `MANIFEST_URI`, `LABEL_TYPE`, `WORKER_MEMORY_GIB` from its environment (set by `scripts/export.py`).
 
-The system prioritizes minimal memory usage for high parallelism:
-- TensorStore `virtual_chunked` driver provides on-demand chunk loading
-- BRAID library decompresses only requested 64x64x64 blocks
-- Workers avoid loading entire 2048³ shards into memory
-- Supports processing TB-scale datasets with modest Cloud Run memory allocations
+## TensorStore Pitfall: Always `.result()` Writes in Transactions
+
+`ts.TensorStore.write()` returns a `Future`, not a completed operation. Inside a
+transaction, you **must** call `.result()` on every write to ensure it is staged
+before `txn.commit_async().result()`. Without it, the commit silently drops any
+writes whose futures haven't resolved yet — producing partial/empty output with
+no errors logged.

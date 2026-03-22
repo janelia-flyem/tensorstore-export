@@ -319,7 +319,7 @@ class ShardProcessor:
                     clipped = transposed[:x1 - x0, :y1 - y0, :z1 - z0]
                     dest.with_transaction(txn)[x0:x1, y0:y1, z0:z1, 0].write(
                         clipped
-                    )
+                    ).result()
                     chunks_written += 1
                     batch_chunks += 1
                     shard_uncompressed_bytes += clipped.nbytes
