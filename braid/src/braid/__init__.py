@@ -14,13 +14,15 @@ __author__ = "BRAID Development Team"
 
 from .reader import ShardReader, LabelType
 from .decompressor import DVIDDecompressor
+from .cseg_encoder import CSEGEncoder
 from .exceptions import BraidError, ChunkNotFoundError, DecompressionError
 
 __all__ = [
     "ShardReader",
-    "LabelType", 
+    "LabelType",
     "DVIDDecompressor",
+    "CSEGEncoder",
     "BraidError",
-    "ChunkNotFoundError", 
-    "DecompressionError"
+    "ChunkNotFoundError",
+    "DecompressionError",
 ]

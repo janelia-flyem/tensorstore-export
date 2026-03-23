@@ -41,7 +41,7 @@ Each Cloud Run task:
 2. For each assigned shard, reads the Arrow IPC file and CSV index from GCS
 3. Decompresses DVID blocks using the BRAID library
 4. Writes chunks into a TensorStore transaction (neuroglancer precomputed with compressed_segmentation encoding)
-5. Commits the transaction, which writes the output shard file to GCS
+5. Commits the transaction, which writes the output shard file to local staging (tmpfs — consumes memory), then uploads to GCS
 6. Optionally generates downres scales by reading the previous scale from the destination volume
 
 ### Key Source Files

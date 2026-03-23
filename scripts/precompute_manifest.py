@@ -77,26 +77,60 @@ def list_arrow_files(source_path: str, scales: list) -> list:
     return all_files
 
 
-def estimate_memory_gib(arrow_size_bytes: int, chunk_count: int = 0) -> float:
+def estimate_memory_gib(arrow_size_bytes: int, chunk_count: int = 0,
+                        scale: int = 0) -> float:
     """Estimate total memory needed to process a shard.
 
-    With local-disk staging, TensorStore's transaction buffer is flushed to
-    disk every BATCH_SIZE chunks, but memory still grows ~1 GiB per 10K
-    chunks due to TensorStore's internal caching during RMW.
+    Cloud Run Gen 2 uses an in-memory filesystem (tmpfs), NOT disk-backed
+    storage.  Writes to /mnt/staging consume the container's memory budget.
+    The output neuroglancer shard file lives on tmpfs and grows as chunks are
+    committed via TensorStore's batched read-modify-write.
 
-    Memory = 2.0 × Arrow file
-           + (chunk_count / 10000) GiB  (RMW memory growth)
-           + 5.0 GiB                    (runtime + upload overhead)
+    Memory components:
+      - Arrow file loaded into RAM by BRAID (~1× file size)
+      - Output shard file on tmpfs (chunks × compressed_KB_per_chunk)
+      - TensorStore RMW overhead (~0.3× shard size during commit)
+      - Python runtime + libraries baseline
+
+    The compressed output size per chunk depends on the scale: coarser scales
+    have denser label data that compresses less.  KB/chunk rates below are
+    empirical maximums from the mCNS v0.11 export (March 2026).
     """
+    # Empirical max compressed KB per chunk in output shard, by scale.
+    # Measured from successful Cloud Run tasks (uploaded_mib / chunks_written).
+    # These are conservative (max, not mean) values.
+    KB_PER_CHUNK = {
+        0: 150,   # scale 0: sparse chunks, high compression
+        1: 200,   # scale 1
+        2: 280,   # scale 2
+        3: 400,   # scale 3: dense chunks, lower compression
+        4: 530,   # scale 4
+        5: 630,   # scale 5: densest
+        6: 750,   # scale 6 (extrapolated)
+        7: 530,   # scale 7
+        8: 570,   # scale 8
+        9: 430,   # scale 9
+    }
+    kb_per_chunk = KB_PER_CHUNK.get(scale, 400)
+
     arrow_gib = arrow_size_bytes / (1 << 30)
-    chunk_gib = chunk_count / 10000.0
-    return 2.0 * arrow_gib + chunk_gib + 6.0
+    shard_gib = chunk_count * kb_per_chunk / (1024 * 1024)
+
+    # Memory = Arrow_in_RAM + shard_on_tmpfs × 1.3 (RMW overhead) + baseline
+    # 1.3× accounts for TensorStore reading old shard + writing new during RMW.
+    # 1.5 GiB baseline: Python runtime, libraries, decompression buffers.
+    # Final 1.3× safety margin on the total.
+    return (arrow_gib + 1.3 * shard_gib + 1.5) * 1.3
 
 
-def pick_tier(mem_needed_gib: float) -> int:
-    """Return the smallest tier (GiB) that fits the estimated memory need."""
+def pick_tier(mem_needed_gib: float, min_tier: int = 4) -> int:
+    """Return the smallest tier (GiB) that fits the estimated memory need.
+
+    min_tier enforces a floor: even tiny shards need memory for the Python
+    runtime, TensorStore, pyarrow, and the output shard file on tmpfs.
+    """
     for gib in sorted(TIER_CPU.keys()):
-        if mem_needed_gib <= gib:
+        if gib >= min_tier and mem_needed_gib <= gib:
             return gib
     return max(TIER_CPU.keys())  # largest available
 
@@ -117,7 +151,7 @@ def assign_tiers(files: list, max_tasks: dict) -> dict:
     for entry in files:
         scale, name, size_bytes = entry[0], entry[1], entry[2]
         chunk_count = entry[3] if len(entry) > 3 else 0
-        mem_needed = estimate_memory_gib(size_bytes, chunk_count)
+        mem_needed = estimate_memory_gib(size_bytes, chunk_count, scale=scale)
         gib = pick_tier(mem_needed)
         tier_map.setdefault(gib, []).append((scale, name, size_bytes))
 
@@ -195,7 +229,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: 2 * arrow + chunks/10K + 6 GiB (local-disk staging)")
+    print(f"  Memory formula: (arrow + 1.3 * shard_on_tmpfs + 1.5) * 1.3")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")

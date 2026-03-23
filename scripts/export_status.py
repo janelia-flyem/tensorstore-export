@@ -42,16 +42,17 @@ def discover_jobs(base_name: str, project: str, region: str) -> list:
         return []
 
     jobs = []
+    prefix = f"{base_name}-"
     for name in result.stdout.strip().splitlines():
         name = name.strip()
-        if not name:
+        if not name or not name.startswith(prefix):
             continue
-        if name.startswith(f"{base_name}-tier-"):
-            tier = name.replace(f"{base_name}-tier-", "")
-            jobs.append((f"tier-{tier}", name))
-        elif name.startswith(f"{base_name}-s"):
-            scale = name.replace(f"{base_name}-s", "")
-            jobs.append((f"s{scale}", name))
+        # Derive label from everything after the base name prefix.
+        # Handles tier jobs ({base_name}-tier-8gi),
+        # retry jobs ({base_name}-retry-tier-16gi),
+        # and legacy per-scale jobs ({base_name}-s0).
+        label = name[len(prefix):]
+        jobs.append((label, name))
 
     return sorted(jobs)
 

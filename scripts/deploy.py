@@ -192,7 +192,7 @@ def setup_destination_info(dest_uri: str, ng_spec: dict):
     info = copy.deepcopy(ng_spec)
     for scale in info.get("scales", []):
         scale["encoding"] = "compressed_segmentation"
-        scale["compressed_segmentation_block_size"] = [8, 8, 8]
+        scale.setdefault("compressed_segmentation_block_size", [8, 8, 8])
 
     info_json = json.dumps(info, indent=2)
     info_uri = f"{dest_uri}/info"

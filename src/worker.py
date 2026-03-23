@@ -34,8 +34,9 @@ CHUNK_VOXELS = 64  # voxels per chunk dimension
 # flushed to the local staging disk via read-modify-write and memory is freed.
 BATCH_SIZE = 100
 
-# Default local staging directory.  On Cloud Run Gen 2 this is an emptyDir
-# volume (disk-backed, not RAM).  Falls back to a temp dir if unavailable.
+# Default local staging directory.  On Cloud Run Gen 2 this is part of the
+# in-memory container filesystem (tmpfs) — writes consume the memory budget.
+# Falls back to a temp dir if unavailable.
 DEFAULT_STAGING_PATH = "/mnt/staging"
 
 
@@ -107,8 +108,9 @@ class WorkerConfig(BaseModel):
     label_type: str = "labels"
 
     # Local staging directory for TensorStore writes.  On Cloud Run Gen 2,
-    # this should be an emptyDir volume (disk-backed, not RAM).  If the path
-    # doesn't exist, falls back to a temp dir.
+    # this is part of the in-memory container filesystem (tmpfs) — writes
+    # consume the memory budget.  If the path doesn't exist, falls back to
+    # a temp dir.
     staging_path: str = DEFAULT_STAGING_PATH
 
     # Cloud Run worker memory allocation in GiB.  Must match the --memory flag
@@ -146,7 +148,7 @@ class ShardProcessor:
         self._task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
 
         # Set up local staging directory.  On Cloud Run Gen 2 this is an
-        # emptyDir volume (disk-backed).  For local dev, use a temp dir.
+        # in-memory filesystem (tmpfs — consumes memory).  For local dev, use a temp dir.
         staging_base = config.staging_path
         if not os.path.isdir(staging_base):
             import tempfile
@@ -163,7 +165,7 @@ class ShardProcessor:
         if ng_spec:
             for scale in ng_spec.get("scales", []):
                 if scale.get("encoding") == "compressed_segmentation":
-                    scale.setdefault("compressed_segmentation_block_size", [64, 64, 64])
+                    scale.setdefault("compressed_segmentation_block_size", [8, 8, 8])
             self._info_json = json.dumps(ng_spec)
         else:
             # Fallback: download from GCS if ng_spec wasn't provided

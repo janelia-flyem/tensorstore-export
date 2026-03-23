@@ -79,9 +79,11 @@ def _create_or_update_job(job_name: str, image: str, env: dict,
         f"--memory={memory}",
         f"--cpu={cpu}",
         f"--env-vars-file={env_file.name}",
-        # Gen 2 execution environment: container filesystem is disk-backed
-        # (not tmpfs).  Writes to /mnt/staging use disk, not RAM — critical
-        # for TensorStore batched RMW that would otherwise OOM.
+        # Gen 2 execution environment: required for full Linux compatibility
+        # (cgroups, namespaces).  NOTE: the container filesystem is tmpfs
+        # (in-memory), NOT disk-backed — writes to /mnt/staging consume
+        # the container's memory budget.  The memory formula accounts for
+        # the output shard file living on tmpfs.
         "--execution-environment=gen2",
     ]
 
@@ -119,6 +121,113 @@ def _parse_memory_gib(memory_str: str) -> float:
     return float(s)
 
 
+def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
+                      project, region, label_type, downres, wait,
+                      job_suffix=""):
+    """Create/update and execute Cloud Run jobs for each tier.
+
+    Args:
+        tier_info: dict mapping gib -> (manifest_uri, num_tasks)
+        job_suffix: optional suffix inserted before '-tier-', e.g. 'retry'
+                    produces job names like {base_name}-retry-tier-{N}gi.
+    """
+    suffix_part = f"-{job_suffix}" if job_suffix else ""
+    print(f"\nLaunching {len(tier_info)} tier job(s)...")
+    for gib in sorted(tier_info.keys()):
+        manifest_uri, num_tasks = tier_info[gib]
+        cpu = TIER_CPU.get(gib, 2)
+        memory = f"{gib}Gi"
+        job_name = f"{base_name}{suffix_part}-tier-{gib}gi"
+
+        ok = _create_or_update_job(
+            job_name, image, env, ng_spec_b64,
+            memory, cpu, num_tasks, manifest_uri,
+            label_type, downres,
+        )
+        if not ok:
+            print(f"  {job_name}: FAILED to create/update")
+            continue
+
+        ok = _execute_job(job_name, project, region, num_tasks, wait)
+        if ok:
+            print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
+        else:
+            print(f"  {job_name}: FAILED to execute")
+
+    print("\nMonitor progress:")
+    print("  pixi run export-status")
+    print("  pixi run export-errors")
+
+
+def _launch_from_manifests(args, env, source_path, project, region,
+                           base_name, label_type, downres, ng_spec_b64):
+    """Launch jobs from pre-built manifests (retry flow).
+
+    Reads manifest files from {SOURCE_PATH}/{manifest_dir}/tier-{N}gi/
+    to detect tiers and task counts, then creates and executes jobs.
+    """
+    from google.cloud import storage
+
+    manifest_dir = args.manifest_dir.strip("/")
+    bucket_name, source_prefix = source_path.replace("gs://", "").split("/", 1)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    manifest_prefix = f"{source_prefix}/{manifest_dir}/"
+    blobs = list(bucket.list_blobs(prefix=manifest_prefix))
+
+    # Detect tiers and count tasks from manifest file names
+    tier_info = {}  # gib -> (manifest_uri, num_tasks)
+    for blob in blobs:
+        if not blob.name.endswith(".json"):
+            continue
+        # Parse: .../manifests-retry/tier-16gi/task-42.json
+        parts = blob.name.split("/")
+        for p in parts:
+            if p.startswith("tier-") and p.endswith("gi"):
+                gib = int(p.replace("tier-", "").replace("gi", ""))
+                uri = f"{source_path}/{manifest_dir}/tier-{gib}gi"
+                if gib not in tier_info:
+                    tier_info[gib] = [uri, 0]
+                tier_info[gib][1] += 1
+                break
+
+    if not tier_info:
+        print(f"No manifest files found under {source_path}/{manifest_dir}/")
+        sys.exit(1)
+
+    tier_info = {gib: (uri, count) for gib, (uri, count) in tier_info.items()}
+
+    # Derive job name suffix from manifest dir
+    suffix = args.job_suffix
+    if not suffix:
+        suffix = manifest_dir.replace("manifests-", "").replace("manifests", "retry")
+        if not suffix:
+            suffix = "retry"
+
+    print(f"Using pre-built manifests from {manifest_dir}/:")
+    for gib in sorted(tier_info.keys()):
+        uri, num_tasks = tier_info[gib]
+        cpu = TIER_CPU.get(gib, 2)
+        print(f"  {gib}Gi (cpu={cpu}): {num_tasks} tasks")
+
+    if args.dry_run:
+        print("\n(dry run — no jobs launched)")
+        return
+
+    # Get Docker image
+    image = _get_image(env)
+    if not image:
+        print("Error: DOCKER_IMAGE not set in .env. Run 'pixi run deploy' first.")
+        sys.exit(1)
+    print(f"\nUsing image: {image}")
+
+    _launch_tier_jobs(
+        tier_info, env, image, ng_spec_b64, base_name, project, region,
+        label_type, downres, args.wait, job_suffix=suffix,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export DVID shards to neuroglancer precomputed via Cloud Run.",
@@ -149,6 +258,17 @@ def main():
         "--wait", action="store_true",
         help="Block until all jobs complete (default: launch async)",
     )
+    parser.add_argument(
+        "--manifest-dir",
+        help="Use pre-built manifests from this GCS subdirectory instead of "
+             "scanning and partitioning shards. E.g., 'manifests-retry'. "
+             "Created by 'pixi run find-failed -- --retry-tier <N>'.",
+    )
+    parser.add_argument(
+        "--job-suffix",
+        help="Suffix for Cloud Run job names (default: derived from --manifest-dir). "
+             "E.g., 'retry' produces jobs named {BASE_JOB_NAME}-retry-tier-{N}gi.",
+    )
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
@@ -174,11 +294,31 @@ def main():
             gib_s, _, tasks_s = pair.partition(":")
             max_tasks[int(gib_s)] = int(tasks_s) if tasks_s else 1000
 
+    # --- Load NG_SPEC (needed by both paths) ---
+    ng_spec_path = env.get("NG_SPEC_PATH", "")
+    if ng_spec_path:
+        spec_path = Path(ng_spec_path)
+        if not spec_path.is_absolute():
+            spec_path = Path(__file__).resolve().parent.parent / spec_path
+        ng_spec_b64 = base64.b64encode(
+            json.dumps(json.loads(spec_path.read_text()), separators=(",", ":")).encode()
+        ).decode()
+    else:
+        ng_spec_b64 = ""
+
+    # --- Pre-built manifest path (retry flow) ---
+    if args.manifest_dir:
+        _launch_from_manifests(
+            args, env, source_path, project, region, base_name,
+            label_type, downres, ng_spec_b64,
+        )
+        return
+
     # --- Step 1: Scan Arrow files ---
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: 2 * arrow + chunks/10K + 6 GiB (local-disk staging)")
+    print(f"  Memory formula: (arrow + 1.3 * shard_on_tmpfs + 1.5) * 1.3")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")
@@ -210,12 +350,16 @@ def main():
     gcs_bucket = storage_client.bucket(bucket_name)
 
     # Delete stale manifests from previous runs
-    manifest_prefix = f"{source_prefix}/manifests/"
-    stale = list(gcs_bucket.list_blobs(prefix=manifest_prefix))
-    if stale:
-        print(f"\nDeleting {len(stale)} stale manifest files...")
-        gcs_bucket.delete_blobs(stale)
+    manifest_uri = f"{source_path}/manifests/"
+    print(f"\nDeleting stale manifests under {manifest_uri} ...")
+    result = subprocess.run(
+        ["gsutil", "-m", "-q", "rm", "-r", f"{manifest_uri}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
         print(f"  Deleted.")
+    elif "No URLs matched" in result.stderr or "CommandException" in result.stderr:
+        print(f"  No stale manifests found.")
 
     tier_info = {}  # gib -> (manifest_uri, num_tasks)
     total_manifests = 0
@@ -268,45 +412,11 @@ def main():
         sys.exit(1)
     print(f"\nUsing image: {image}")
 
-    # Load NG_SPEC for env vars
-    ng_spec_path = env.get("NG_SPEC_PATH", "")
-    if ng_spec_path:
-        spec_path = Path(ng_spec_path)
-        if not spec_path.is_absolute():
-            spec_path = Path(__file__).resolve().parent.parent / spec_path
-        ng_spec_b64 = base64.b64encode(
-            json.dumps(json.loads(spec_path.read_text()), separators=(",", ":")).encode()
-        ).decode()
-    else:
-        ng_spec_b64 = ""
-
     # --- Step 5: Create/update and execute per-tier jobs ---
-    print(f"\nLaunching {len(tier_info)} tier job(s)...")
-    for gib in sorted(tier_info.keys()):
-        manifest_uri, num_tasks = tier_info[gib]
-        cpu = TIER_CPU.get(gib, 2)
-        memory = f"{gib}Gi"
-        job_name = f"{base_name}-tier-{gib}gi"
-
-        ok = _create_or_update_job(
-            job_name, image, env, ng_spec_b64,
-            memory, cpu, num_tasks, manifest_uri,
-            label_type, downres,
-        )
-        if not ok:
-            print(f"  {job_name}: FAILED to create/update")
-            continue
-
-        ok = _execute_job(job_name, project, region, num_tasks, args.wait)
-        if ok:
-            print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
-        else:
-            print(f"  {job_name}: FAILED to execute")
-
-    print(f"\nMonitor progress:")
-    print(f"  pixi run export-status")
-    print(f"  pixi run export-errors")
-    print(f"  pixi run export-errors -- --details | grep 'memory profile'")
+    _launch_tier_jobs(
+        tier_info, env, image, ng_spec_b64, base_name, project, region,
+        label_type, downres, args.wait,
+    )
 
 
 if __name__ == "__main__":
