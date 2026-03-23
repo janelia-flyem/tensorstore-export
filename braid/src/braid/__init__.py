@@ -12,13 +12,14 @@ individual block records are "braided" together into indexed datasets.
 __version__ = "1.0.0"
 __author__ = "BRAID Development Team"
 
-from .reader import ShardReader, LabelType
+from .reader import ShardReader, ShardRangeReader, LabelType
 from .decompressor import DVIDDecompressor
 from .cseg_encoder import CSEGEncoder
 from .exceptions import BraidError, ChunkNotFoundError, DecompressionError
 
 __all__ = [
     "ShardReader",
+    "ShardRangeReader",
     "LabelType",
     "DVIDDecompressor",
     "CSEGEncoder",
