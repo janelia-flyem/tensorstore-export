@@ -78,12 +78,10 @@ def _create_or_update_job(job_name: str, image: str, env: dict,
         f"--memory={memory}",
         f"--cpu={cpu}",
         f"--env-vars-file={env_file.name}",
-        # Gen 2 execution environment with disk-backed emptyDir volume.
-        # Writes to /mnt/staging use disk, not RAM — critical for TensorStore
-        # batched RMW that would otherwise OOM.
+        # Gen 2 execution environment: container filesystem is disk-backed
+        # (not tmpfs).  Writes to /mnt/staging use disk, not RAM — critical
+        # for TensorStore batched RMW that would otherwise OOM.
         "--execution-environment=gen2",
-        "--add-volume=name=staging-disk,type=emptyDir,size-limit=10Gi",
-        "--add-volume-mount=volume=staging-disk,mount-path=/mnt/staging",
     ]
 
     try:
