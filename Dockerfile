@@ -40,9 +40,12 @@ RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip \
 COPY src/ src/
 COPY main.py .
 
+# Create staging mount point for local-disk shard writes
+RUN mkdir -p /mnt/staging
+
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app \
-    && chown -R app:app /app
+    && chown -R app:app /app /mnt/staging
 USER app
 
 ENV PYTHONPATH=/app

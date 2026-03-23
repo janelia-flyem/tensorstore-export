@@ -12,6 +12,7 @@ Each worker processes shards one at a time until the time limit is reached.
 import base64
 import json
 import os
+import shutil
 import time
 import asyncio
 from pathlib import Path
@@ -28,11 +29,14 @@ logger = structlog.get_logger()
 
 CHUNK_VOXELS = 64  # voxels per chunk dimension
 
-# Safety margin below the memory limit.  We commit the current transaction
-# batch when cgroup memory usage exceeds (limit - safety margin).  Memory is
-# checked every chunk (cgroup sysfs read, ~microseconds), so this only needs
-# to absorb one chunk's encoding spike plus commit overhead.
-MEMORY_SAFETY_GIB = 0.5
+# Number of chunks to write per transaction batch.  Each batch accumulates
+# ~2MB/chunk in TensorStore's transaction buffer; on commit the buffer is
+# flushed to the local staging disk via read-modify-write and memory is freed.
+BATCH_SIZE = 100
+
+# Default local staging directory.  On Cloud Run Gen 2 this is an emptyDir
+# volume (disk-backed, not RAM).  Falls back to a temp dir if unavailable.
+DEFAULT_STAGING_PATH = "/mnt/staging"
 
 
 def _read_cgroup_memory() -> tuple:
@@ -102,6 +106,11 @@ class WorkerConfig(BaseModel):
     # "segmentation" view where proofreading merges are applied.
     label_type: str = "labels"
 
+    # Local staging directory for TensorStore writes.  On Cloud Run Gen 2,
+    # this should be an emptyDir volume (disk-backed, not RAM).  If the path
+    # doesn't exist, falls back to a temp dir.
+    staging_path: str = DEFAULT_STAGING_PATH
+
     # Cloud Run worker memory allocation in GiB.  Must match the --memory flag
     # passed to `gcloud run jobs create`.  Used as a fallback for the
     # transaction memory budget when cgroup memory accounting is unavailable.
@@ -128,6 +137,7 @@ class ShardProcessor:
         self._dest_bucket, self._dest_prefix = _parse_gs_uri(config.dest_path)
         self.storage_client = storage.Client()
         self.source_bucket_obj = self.storage_client.bucket(self._source_bucket)
+        self.dest_bucket_obj = self.storage_client.bucket(self._dest_bucket)
         self._dest_stores: Dict[int, ts.TensorStore] = {}
 
         # Cloud Run task index for work partitioning.
@@ -135,9 +145,26 @@ class ShardProcessor:
         self._task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
         self._task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
 
+        # Set up local staging directory.  On Cloud Run Gen 2 this is an
+        # emptyDir volume (disk-backed).  For local dev, use a temp dir.
+        staging_base = config.staging_path
+        if not os.path.isdir(staging_base):
+            import tempfile
+            staging_base = tempfile.mkdtemp(prefix="ng-staging-")
+            logger.info("Staging path not found, using temp dir",
+                         configured=config.staging_path, actual=staging_base)
+        self._staging_base = staging_base
+
+        # Download the info file from GCS once — needed to open local
+        # TensorStore volumes.
+        self._info_json = self.dest_bucket_obj.blob(
+            f"{self._dest_prefix}/info"
+        ).download_as_text()
+
         logger.info("Initialized shard processor",
                      source=config.source_path,
                      dest=config.dest_path,
+                     staging=self._staging_base,
                      scales=config.scales,
                      task_index=self._task_index,
                      task_count=self._task_count)
@@ -234,13 +261,49 @@ class ShardProcessor:
                 time.sleep(wait)
         raise RuntimeError("unreachable")
 
-    def process_shard(self, scale: int, shard_name: str) -> bool:
-        """Process a single shard: read from GCS, decompress, write to destination.
+    def _create_local_volume(self, scale: int, shard_name: str) -> str:
+        """Create a local staging directory with the neuroglancer info file.
 
-        Downloads Arrow+CSV via google-cloud-storage, decompresses each chunk
-        using BRAID, and writes to the neuroglancer precomputed volume.
-        Individual chunk failures are logged and skipped — the shard is still
-        considered successful if at least some chunks were written.
+        Returns the staging directory path.  The info file is written from
+        the cached copy downloaded at startup.
+        """
+        staging_dir = os.path.join(
+            self._staging_base, f"s{scale}_{shard_name}")
+        os.makedirs(staging_dir, exist_ok=True)
+        with open(os.path.join(staging_dir, "info"), "w") as f:
+            f.write(self._info_json)
+        return staging_dir
+
+    def _upload_shard_files(self, staging_dir: str) -> int:
+        """Upload shard files from local staging to the GCS destination.
+
+        Walks the staging directory and uploads every file except 'info',
+        preserving the directory structure (e.g., s0/070e7.shard).
+
+        Returns the number of bytes uploaded.
+        """
+        uploaded_bytes = 0
+        for root, _dirs, files in os.walk(staging_dir):
+            for fn in files:
+                if fn == "info":
+                    continue
+                local_path = os.path.join(root, fn)
+                rel_path = os.path.relpath(local_path, staging_dir)
+                blob_path = f"{self._dest_prefix}/{rel_path}"
+                blob = self.dest_bucket_obj.blob(blob_path)
+                blob.upload_from_filename(local_path)
+                uploaded_bytes += os.path.getsize(local_path)
+        return uploaded_bytes
+
+    def process_shard(self, scale: int, shard_name: str) -> bool:
+        """Process a single shard: read from GCS, write to local disk, upload.
+
+        1. Downloads Arrow+CSV from GCS and decompresses chunks via BRAID.
+        2. Writes chunks to a local neuroglancer precomputed volume using
+           batched transactions (BATCH_SIZE chunks per batch).  Each batch
+           commit does a read-modify-write on local disk, keeping memory flat.
+        3. Uploads the finished shard file(s) to GCS.
+        4. Cleans up the local staging directory.
 
         Args:
             scale: Scale level (0, 1, 2, ...)
@@ -250,10 +313,9 @@ class ShardProcessor:
             True if the shard was processed (even with some chunk errors).
             False only if the shard could not be loaded at all.
         """
+        staging_dir = None
         try:
             logger.info("Processing shard", scale=scale, shard=shard_name)
-
-            dest = self._open_dest_scale(scale)
 
             arrow_uri = f"{self.config.source_path}/s{scale}/{shard_name}.arrow"
             csv_uri = f"{self.config.source_path}/s{scale}/{shard_name}.csv"
@@ -263,37 +325,29 @@ class ShardProcessor:
                          shard=shard_name,
                          chunks=reader.chunk_count)
 
+            # Create local staging volume with info file
+            staging_dir = self._create_local_volume(scale, shard_name)
+            dest = ts.open({
+                "driver": "neuroglancer_precomputed",
+                "kvstore": {"driver": "file", "path": staging_dir},
+                "scale_index": scale,
+                "open": True,
+            }).result()
+
             lt = LabelType(self.config.label_type)
             chunks_written = 0
             chunks_failed = 0
+            shard_uncompressed_bytes = 0
+            batches_committed = 0
+            shard_start_time = time.time()
+            last_progress_time = shard_start_time
+            progress_interval = 60  # seconds between progress logs
 
-            # Determine commit threshold from cgroup memory limit.
-            # If cgroup is unavailable (local dev), fall back to config.
-            _, mem_limit = _read_cgroup_memory()
-            if mem_limit > 0:
-                mem_limit_gib = mem_limit / (1 << 30)
-            else:
-                mem_limit_gib = self.config.worker_memory_gib
-            commit_threshold = int((mem_limit_gib - MEMORY_SAFETY_GIB) * (1 << 30))
-
-            logger.info("Transaction memory budget",
-                         memory_limit_gib=round(mem_limit_gib, 2),
-                         commit_threshold_gib=round(commit_threshold / (1 << 30), 2),
-                         cgroup_available=mem_limit > 0)
-
-            # Explicit transaction: chunk writes accumulate in memory and
-            # commit as a single shard read-modify-write to GCS.  Without
-            # this, each .write().result() creates an implicit transaction
-            # that reads the entire shard, merges one chunk, and writes it
-            # back — O(N²) GCS I/O for N chunks per shard.
+            # Batched transactions: write BATCH_SIZE chunks per transaction,
+            # commit to local disk (RMW), start a new transaction.  Each
+            # commit flushes TensorStore's buffer to disk, keeping RSS flat.
             txn = ts.Transaction()
             batch_chunks = 0
-            shard_uncompressed_bytes = 0
-            peak_memory_gib = 0.0
-            batches_committed = 0
-            last_progress_time = time.time()
-            shard_start_time = last_progress_time
-            progress_interval = 60  # seconds between progress logs
 
             for i, (cx, cy, cz) in enumerate(reader.available_chunks):
                 try:
@@ -302,11 +356,6 @@ class ShardProcessor:
                     # BRAID outputs ZYX order; neuroglancer precomputed is XYZ + channel
                     transposed = chunk_data.transpose(2, 1, 0)
 
-                    # Write to the destination at the chunk's global voxel coordinates.
-                    # Clip to volume bounds for boundary chunks where the volume
-                    # size isn't a multiple of the chunk size.  Skip chunks
-                    # entirely outside the domain (can happen when DVID exports
-                    # chunks beyond the declared volume extent).
                     x0 = cx * CHUNK_VOXELS
                     y0 = cy * CHUNK_VOXELS
                     z0 = cz * CHUNK_VOXELS
@@ -325,40 +374,23 @@ class ShardProcessor:
 
                 except Exception as e:
                     chunks_failed += 1
-                    # Searchable event name for pixi run export-errors
                     logger.error("Chunk failed",
                                   scale=scale, shard=shard_name,
                                   chunk_x=cx, chunk_y=cy, chunk_z=cz,
                                   error=str(e)[:500])
 
-                # Memory pressure: check every chunk and commit early
-                # to avoid OOM.  Reading cgroup memory.current is a
-                # sysfs read (microseconds) so per-chunk cost is negligible.
-                mem_current, _ = _read_cgroup_memory()
-                if mem_current > 0:
-                    mem_gib = mem_current / (1 << 30)
-                    peak_memory_gib = max(peak_memory_gib, mem_gib)
+                # Commit batch to local disk
+                if batch_chunks >= BATCH_SIZE:
+                    txn.commit_async().result()
+                    batches_committed += 1
+                    txn = ts.Transaction()
+                    batch_chunks = 0
 
-                    if batch_chunks > 0 and mem_current > commit_threshold:
-                        txn.commit_async().result()
-                        batches_committed += 1
-                        logger.info("Batch committed (memory pressure)",
-                                     shard=shard_name,
-                                     scale=scale,
-                                     memory_gib=round(mem_gib, 2),
-                                     threshold_gib=round(commit_threshold / (1 << 30), 2),
-                                     batch_chunks=batch_chunks,
-                                     chunks_written=chunks_written,
-                                     chunks_failed=chunks_failed,
-                                     total=reader.chunk_count)
-                        txn = ts.Transaction()
-                        batch_chunks = 0
-
-                # Wall-clock progress: log at regular intervals for
-                # mining memory trajectory and throughput after export.
+                # Wall-clock progress logging
                 now = time.time()
                 if (now - last_progress_time) >= progress_interval:
-                    mem_gib_log = mem_current / (1 << 30) if mem_current > 0 else 0
+                    mem_current, _ = _read_cgroup_memory()
+                    mem_gib = mem_current / (1 << 30) if mem_current > 0 else 0
                     elapsed = now - shard_start_time
                     logger.info("Shard progress",
                                  shard=shard_name,
@@ -367,32 +399,34 @@ class ShardProcessor:
                                  chunks_written=chunks_written,
                                  chunks_failed=chunks_failed,
                                  total=reader.chunk_count,
-                                 memory_gib=round(mem_gib_log, 2),
-                                 memory_limit_gib=round(mem_limit_gib, 2),
-                                 uncompressed_gib=round(shard_uncompressed_bytes / (1 << 30), 3),
+                                 memory_gib=round(mem_gib, 2),
                                  batches=batches_committed)
                     last_progress_time = now
 
-            # Commit remaining chunks in the final batch.
+            # Commit remaining chunks
             if batch_chunks > 0:
                 txn.commit_async().result()
                 batches_committed += 1
 
-            # Record final memory state for peak tracking.
-            mem_current, _ = _read_cgroup_memory()
-            if mem_current > 0:
-                peak_memory_gib = max(peak_memory_gib, mem_current / (1 << 30))
+            # Upload finished shard file(s) to GCS
+            upload_start = time.time()
+            uploaded_bytes = self._upload_shard_files(staging_dir)
+            upload_elapsed = time.time() - upload_start
 
             elapsed = time.time() - shard_start_time
-            logger.info("Shard memory profile",
+            mem_current, _ = _read_cgroup_memory()
+            peak_memory_gib = mem_current / (1 << 30) if mem_current > 0 else 0
+
+            logger.info("Shard complete",
                          scale=scale,
                          shard=shard_name,
                          elapsed_s=round(elapsed, 1),
+                         upload_s=round(upload_elapsed, 1),
+                         uploaded_mib=round(uploaded_bytes / (1 << 20), 1),
                          uncompressed_gib=round(shard_uncompressed_bytes / (1 << 30), 3),
                          peak_memory_gib=round(peak_memory_gib, 2),
-                         memory_limit_gib=round(mem_limit_gib, 2),
                          batches=batches_committed,
-                         chunks=chunks_written,
+                         chunks_written=chunks_written,
                          chunks_failed=chunks_failed)
             return True
 
@@ -400,6 +434,11 @@ class ShardProcessor:
             logger.error("Failed to process shard",
                           scale=scale, shard=shard_name, error=str(e))
             return False
+
+        finally:
+            # Clean up local staging to free disk for the next shard
+            if staging_dir and os.path.isdir(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
     def downres_scale(self, scale: int) -> bool:
         """Generate a scale by downsampling the previous scale from the destination.
@@ -536,6 +575,7 @@ def create_config_from_env() -> WorkerConfig:
         scales=scales,
         downres_scales=downres_scales,
         label_type=os.environ.get("LABEL_TYPE", "labels"),
+        staging_path=os.environ.get("STAGING_PATH", DEFAULT_STAGING_PATH),
         worker_memory_gib=float(os.environ.get("WORKER_MEMORY_GIB", "4")),
         manifest_uri=os.environ.get("MANIFEST_URI", ""),
         max_processing_time_minutes=int(os.environ.get("MAX_PROCESSING_TIME", "1440")),

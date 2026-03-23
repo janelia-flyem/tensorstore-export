@@ -62,19 +62,14 @@ def list_arrow_files(source_path: str, scales: list) -> list:
 def estimate_memory_gib(arrow_size_bytes: int) -> float:
     """Estimate total memory needed to process a shard.
 
-    Memory = Arrow file (fully in RAM)
-           + neuroglancer shard transaction buffer (compressed_segmentation Cords)
-           + Python/OS/TensorStore overhead (~2 GiB).
+    With local-disk staging, TensorStore's transaction buffer is flushed to
+    disk every BATCH_SIZE chunks, so memory is dominated by the Arrow file
+    (loaded fully into RAM by PyArrow) plus runtime overhead.
 
-    We use 3× the Arrow file size (with a 200 MiB floor) to account for both
-    the Arrow reader and the transaction buffer.  The floor handles shards
-    with highly compressible boundary/solid chunks: DVID's compression is
-    very efficient for uniform regions, but compressed_segmentation has
-    fixed per-sub-block overhead, so decompression blowup can be large.
-    2 GiB covers runtime overhead (Python, TensorStore, GCS client, etc.).
+    Memory = Arrow file + 1.5 GiB (Python, TensorStore, BRAID, GCS client).
     """
-    arrow_gib = max(arrow_size_bytes, 200 * (1 << 20)) / (1 << 30)
-    return 3.0 * arrow_gib + 2.0
+    arrow_gib = arrow_size_bytes / (1 << 30)
+    return arrow_gib + 1.5
 
 
 def pick_tier(mem_needed_gib: float) -> int:
@@ -177,7 +172,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: 3 * max(arrow_size, 200 MiB) + 2 GiB")
+    print(f"  Memory formula: arrow_size + 1.5 GiB (local-disk staging)")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")

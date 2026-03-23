@@ -78,6 +78,12 @@ def _create_or_update_job(job_name: str, image: str, env: dict,
         f"--memory={memory}",
         f"--cpu={cpu}",
         f"--env-vars-file={env_file.name}",
+        # Gen 2 execution environment with disk-backed emptyDir volume.
+        # Writes to /mnt/staging use disk, not RAM — critical for TensorStore
+        # batched RMW that would otherwise OOM.
+        "--execution-environment=gen2",
+        "--add-volume=name=staging-disk,type=emptyDir,size-limit=10Gi",
+        "--add-volume-mount=volume=staging-disk,mount-path=/mnt/staging",
     ]
 
     try:
@@ -173,7 +179,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: 3 * max(arrow_size, 200 MiB) + 2 GiB")
+    print(f"  Memory formula: arrow_size + 1.5 GiB (local-disk staging)")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")
