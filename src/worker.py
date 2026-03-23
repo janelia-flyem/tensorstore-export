@@ -155,13 +155,24 @@ class ShardProcessor:
                          configured=config.staging_path, actual=staging_base)
         self._staging_base = staging_base
 
-        # Download the info file from GCS once — needed to open local
-        # TensorStore volumes.
-        self._info_json = self.dest_bucket_obj.blob(
-            f"{self._dest_prefix}/info"
-        ).download_as_text()
-        logger.info("Downloaded info file",
+        # Build the info file from the ng_spec in config.  This avoids
+        # depending on the GCS info file which can be stale due to Cloud Run's
+        # internal GCS caching.  We add compressed_segmentation_block_size
+        # which TensorStore requires but the DVID spec doesn't include.
+        ng_spec = config.ng_spec
+        if ng_spec:
+            for scale in ng_spec.get("scales", []):
+                if scale.get("encoding") == "compressed_segmentation":
+                    scale.setdefault("compressed_segmentation_block_size", [64, 64, 64])
+            self._info_json = json.dumps(ng_spec)
+        else:
+            # Fallback: download from GCS if ng_spec wasn't provided
+            self._info_json = self.dest_bucket_obj.blob(
+                f"{self._dest_prefix}/info"
+            ).download_as_text()
+        logger.info("Info file ready",
                      length=len(self._info_json),
+                     source="ng_spec" if ng_spec else "gcs",
                      has_cseg="compressed_segmentation_block_size" in self._info_json)
 
         logger.info("Initialized shard processor",
