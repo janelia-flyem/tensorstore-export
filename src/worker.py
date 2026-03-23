@@ -160,6 +160,9 @@ class ShardProcessor:
         self._info_json = self.dest_bucket_obj.blob(
             f"{self._dest_prefix}/info"
         ).download_as_text()
+        logger.info("Downloaded info file",
+                     length=len(self._info_json),
+                     has_cseg="compressed_segmentation_block_size" in self._info_json)
 
         logger.info("Initialized shard processor",
                      source=config.source_path,
@@ -270,8 +273,15 @@ class ShardProcessor:
         staging_dir = os.path.join(
             self._staging_base, f"s{scale}_{shard_name}")
         os.makedirs(staging_dir, exist_ok=True)
-        with open(os.path.join(staging_dir, "info"), "w") as f:
+        info_path = os.path.join(staging_dir, "info")
+        with open(info_path, "w") as f:
             f.write(self._info_json)
+        # Verify the file was written correctly
+        written_size = os.path.getsize(info_path)
+        if written_size != len(self._info_json.encode("utf-8")):
+            logger.error("Info file size mismatch",
+                          expected=len(self._info_json.encode("utf-8")),
+                          written=written_size, path=info_path)
         return staging_dir
 
     def _upload_shard_files(self, staging_dir: str) -> int:
