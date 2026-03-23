@@ -29,10 +29,9 @@ logger = structlog.get_logger()
 CHUNK_VOXELS = 64  # voxels per chunk dimension
 
 # Safety margin below the memory limit.  We commit the current transaction
-# batch when cgroup memory usage exceeds (limit - safety margin).  This must
-# be large enough to absorb the memory growth between checks (every 100
-# chunks, at most ~200 MB of new compressed data) plus transient encoding
-# buffers.
+# batch when cgroup memory usage exceeds (limit - safety margin).  Memory is
+# checked every chunk (cgroup sysfs read, ~microseconds), so this only needs
+# to absorb one chunk's encoding spike plus commit overhead.
 MEMORY_SAFETY_GIB = 0.5
 
 
@@ -332,52 +331,47 @@ class ShardProcessor:
                                   chunk_x=cx, chunk_y=cy, chunk_z=cz,
                                   error=str(e)[:500])
 
-                # Periodic checks: memory pressure + wall-clock progress.
-                now = time.time()
-                check_memory = batch_chunks > 0 and batch_chunks % 100 == 0
-                check_progress = (now - last_progress_time) >= progress_interval
+                # Memory pressure: check every chunk and commit early
+                # to avoid OOM.  Reading cgroup memory.current is a
+                # sysfs read (microseconds) so per-chunk cost is negligible.
+                mem_current, _ = _read_cgroup_memory()
+                if mem_current > 0:
+                    mem_gib = mem_current / (1 << 30)
+                    peak_memory_gib = max(peak_memory_gib, mem_gib)
 
-                if check_memory or check_progress:
-                    mem_current, _ = _read_cgroup_memory()
-                    if mem_current > 0:
-                        mem_gib = mem_current / (1 << 30)
-                        peak_memory_gib = max(peak_memory_gib, mem_gib)
-
-                        # Memory pressure: commit early to avoid OOM.
-                        if check_memory and mem_current > commit_threshold:
-                            txn.commit_async().result()
-                            batches_committed += 1
-                            logger.info("Batch committed (memory pressure)",
-                                         shard=shard_name,
-                                         scale=scale,
-                                         memory_gib=round(mem_gib, 2),
-                                         threshold_gib=round(commit_threshold / (1 << 30), 2),
-                                         batch_chunks=batch_chunks,
-                                         chunks_written=chunks_written,
-                                         chunks_failed=chunks_failed,
-                                         total=reader.chunk_count)
-                            txn = ts.Transaction()
-                            batch_chunks = 0
-
-                    # Wall-clock progress: log at regular intervals for
-                    # mining memory trajectory and throughput after export.
-                    if check_progress:
-                        elapsed = now - shard_start_time
-                        mem_current_for_log, _ = _read_cgroup_memory()
-                        mem_gib_log = mem_current_for_log / (1 << 30) if mem_current_for_log > 0 else 0
-                        peak_memory_gib = max(peak_memory_gib, mem_gib_log)
-                        logger.info("Shard progress",
+                    if batch_chunks > 0 and mem_current > commit_threshold:
+                        txn.commit_async().result()
+                        batches_committed += 1
+                        logger.info("Batch committed (memory pressure)",
                                      shard=shard_name,
                                      scale=scale,
-                                     elapsed_s=round(elapsed, 1),
+                                     memory_gib=round(mem_gib, 2),
+                                     threshold_gib=round(commit_threshold / (1 << 30), 2),
+                                     batch_chunks=batch_chunks,
                                      chunks_written=chunks_written,
                                      chunks_failed=chunks_failed,
-                                     total=reader.chunk_count,
-                                     memory_gib=round(mem_gib_log, 2),
-                                     memory_limit_gib=round(mem_limit_gib, 2),
-                                     uncompressed_gib=round(shard_uncompressed_bytes / (1 << 30), 3),
-                                     batches=batches_committed)
-                        last_progress_time = now
+                                     total=reader.chunk_count)
+                        txn = ts.Transaction()
+                        batch_chunks = 0
+
+                # Wall-clock progress: log at regular intervals for
+                # mining memory trajectory and throughput after export.
+                now = time.time()
+                if (now - last_progress_time) >= progress_interval:
+                    mem_gib_log = mem_current / (1 << 30) if mem_current > 0 else 0
+                    elapsed = now - shard_start_time
+                    logger.info("Shard progress",
+                                 shard=shard_name,
+                                 scale=scale,
+                                 elapsed_s=round(elapsed, 1),
+                                 chunks_written=chunks_written,
+                                 chunks_failed=chunks_failed,
+                                 total=reader.chunk_count,
+                                 memory_gib=round(mem_gib_log, 2),
+                                 memory_limit_gib=round(mem_limit_gib, 2),
+                                 uncompressed_gib=round(shard_uncompressed_bytes / (1 << 30), 3),
+                                 batches=batches_committed)
+                    last_progress_time = now
 
             # Commit remaining chunks in the final batch.
             if batch_chunks > 0:

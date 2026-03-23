@@ -258,6 +258,7 @@ def main():
     total_tasks = 0
 
     job_executions = {}  # job_name -> execution_name for memory queries
+    job_failed = {}     # job_name -> failed task count
 
     for label, job_name in jobs:
         info = get_execution_info(job_name, project, region)
@@ -286,6 +287,7 @@ def main():
               f"{info['elapsed']:>10s}  {info['execution']}")
 
         job_executions[job_name] = info["execution"]
+        job_failed[job_name] = failed
 
     if len(jobs) > 1:
         print("-" * 78)
@@ -330,6 +332,9 @@ def main():
             p.get("total", 0) for p in in_flight.values())
 
         print(f"{label}:")
+        failed_count = job_failed.get(job_name, 0)
+        if failed_count:
+            print(f"  Failed tasks: {failed_count}")
         completed_note = "+" if len(completed) >= 50000 else ""
         print(f"  Completed shards: {len(completed_keys)}{completed_note}")
 
@@ -345,8 +350,15 @@ def main():
 
         # In-flight shards sorted by % complete
         if in_flight:
+            mem_vals = [p.get("memory_gib", 0) for p in in_flight.values() if p.get("memory_gib", 0) > 0]
+            mem_limit = max((p.get("memory_limit_gib", 0) for p in in_flight.values()), default=0)
+            mem_summary = ""
+            if mem_vals:
+                mem_summary = (f", memory: avg {sum(mem_vals)/len(mem_vals):.1f}G"
+                               f", max {max(mem_vals):.1f}G / {mem_limit:.0f}G limit")
             print(f"  In-flight shards: {len(in_flight)}, "
-                  f"chunks: {total_chunks_inflight:,}/{total_chunks_total:,}")
+                  f"chunks: {total_chunks_inflight:,}/{total_chunks_total:,}"
+                  f"{mem_summary}")
 
             def _pct(item):
                 p = item[1]
