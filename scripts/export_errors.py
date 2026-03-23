@@ -135,8 +135,8 @@ def main():
         help="Query only this scale (default: all scales)",
     )
     parser.add_argument(
-        "--limit", type=int, default=1000,
-        help="Max log entries to fetch per query (default: 1000)",
+        "--limit", type=int, default=50000,
+        help="Max log entries to fetch per query (default: 50000)",
     )
     parser.add_argument(
         "--details", action="store_true",
@@ -271,9 +271,14 @@ def main():
     print("=" * 60)
     print()
 
-    print(f"Shards completed:       {success_shards}")
-    print(f"  Chunks written:       {success_chunks}")
+    truncated = len(all_success_entries) >= args.limit
+    trunc_note = "+" if truncated else ""
+    print(f"Shards completed:       {success_shards}{trunc_note}")
+    print(f"  Chunks written:       {success_chunks:,}{trunc_note}")
     print(f"  Chunks failed:        {failed_chunks_in_success}")
+    if truncated:
+        print(f"  (counts truncated at --limit={args.limit}; "
+              f"use --limit=N to increase)")
     print(f"Shard load failures:    {len(shard_load_failures)}")
     print(f"Chunk errors (from logs): {len(all_errors)}")
     print()

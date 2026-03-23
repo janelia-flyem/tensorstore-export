@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -21,6 +22,30 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE
+
+
+def load_manifest_summary(source_path: str) -> dict | None:
+    """Load summary.json from the manifests directory on GCS."""
+    uri = f"{source_path}/manifests/summary.json"
+    result = subprocess.run(
+        ["gsutil", "cat", uri], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def print_progress_bar(written: int, total: int, width: int = 40):
+    """Print a text progress bar with chunk counts and percentage."""
+    if total <= 0:
+        return
+    pct = min(100.0, 100.0 * written / total)
+    filled = int(width * written / total)
+    bar = "\u2588" * filled + "\u2591" * (width - filled)
+    print(f"\n  [{bar}] {pct:.1f}%")
+    print(f"  {written:,} / {total:,} chunks written\n")
 
 
 def discover_jobs(base_name: str, project: str, region: str) -> list:
@@ -199,14 +224,15 @@ def summarize_memory(profiles: list) -> dict:
     limits = [p.get("memory_limit_gib", 0) for p in profiles]
     batches = [p.get("batches", 1) for p in profiles]
     elapsed = [p.get("elapsed_s", 0) for p in profiles]
-    multi_batch = sum(1 for b in batches if b > 1)
+    total_batches = sum(batches)
 
     return {
         "shards_profiled": len(profiles),
         "peak_memory_avg": sum(peaks) / len(peaks),
         "peak_memory_max": max(peaks),
         "memory_limit": max(limits) if limits else 0,
-        "rewrites": multi_batch,
+        "total_batch_writes": total_batches,
+        "avg_batch_writes": total_batches / len(batches),
         "avg_elapsed_s": sum(elapsed) / len(elapsed) if elapsed else 0,
         "max_elapsed_s": max(elapsed) if elapsed else 0,
     }
@@ -244,6 +270,9 @@ def main():
     if not base_name or not project:
         print("Error: BASE_JOB_NAME and PROJECT_ID must be configured in .env")
         sys.exit(1)
+
+    source_path = env.get("SOURCE_PATH", "")
+    manifest_summary = load_manifest_summary(source_path) if source_path else None
 
     jobs = discover_jobs(base_name, project, region)
     if not jobs:
@@ -302,6 +331,8 @@ def main():
 
     # Query Cloud Logging for progress and memory stats per tier
     print()
+    grand_chunks_written = 0  # chunks from completed shards
+    grand_chunks_inflight = 0  # chunks written so far in in-flight shards
     for label, job_name in jobs:
         execution = job_executions.get(job_name, "")
         if not execution:
@@ -332,21 +363,46 @@ def main():
         total_chunks_total = sum(
             p.get("total", 0) for p in in_flight.values())
 
+        # Accumulate for grand progress bar
+        tier_completed_chunks = sum(
+            c.get("chunks_written", 0) for c in completed)
+        grand_chunks_written += tier_completed_chunks
+        grand_chunks_inflight += total_chunks_inflight
+
+        # Look up tier totals from manifest summary
+        tier_info = {}
+        if manifest_summary:
+            m = re.search(r"(\d+)gi", label)
+            if m:
+                tier_info = manifest_summary.get("tiers", {}).get(m.group(1), {})
+
         print(f"{label}:")
         failed_count = job_failed.get(job_name, 0)
         if failed_count:
             print(f"  Failed tasks: {failed_count}")
         completed_note = "+" if len(completed) >= 50000 else ""
-        print(f"  Completed shards: {len(completed_keys)}{completed_note}")
+        tier_shards = tier_info.get("shards", 0)
+        if tier_shards:
+            shard_pct = 100 * len(completed_keys) / tier_shards
+            print(f"  Completed shards: {len(completed_keys)}{completed_note} / {tier_shards:,}"
+                  f" ({shard_pct:.0f}%)")
+        else:
+            print(f"  Completed shards: {len(completed_keys)}{completed_note}")
+
+        tier_total_chunks = tier_info.get("chunks", 0)
+        if tier_total_chunks:
+            print(f"  Completed chunks: {tier_completed_chunks:,} / {tier_total_chunks:,}"
+                  f" ({100*tier_completed_chunks/tier_total_chunks:.0f}%)")
 
         # Memory stats for completed shards
         stats = summarize_memory(completed)
         if stats:
             print(f"  Memory: avg {stats['peak_memory_avg']:.1f}G, "
-                  f"max {stats['peak_memory_max']:.1f}G, "
-                  f"rewrites: {stats['rewrites']}")
+                  f"max {stats['peak_memory_max']:.1f}G")
             print(f"  Timing: avg {stats['avg_elapsed_s']:.0f}s, "
                   f"max {stats['max_elapsed_s']:.0f}s per shard")
+            print(f"  Batch writes: {stats['total_batch_writes']:,} total, "
+                  f"avg {stats['avg_batch_writes']:.1f} per shard")
 
         # In-flight shards sorted by % complete
         if in_flight:
@@ -396,6 +452,15 @@ def main():
             print("  (no log data yet)")
 
         print()
+
+    # Grand progress bar
+    if manifest_summary:
+        total_expected = manifest_summary.get("total_chunks", 0)
+        if total_expected > 0:
+            # completed chunks + partial progress on in-flight shards
+            total_written = grand_chunks_written + grand_chunks_inflight
+            print("-" * 78)
+            print_progress_bar(total_written, total_expected)
 
     print("Check chunk-level errors: pixi run export-errors")
 

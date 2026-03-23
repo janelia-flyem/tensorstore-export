@@ -107,53 +107,74 @@ The file format would only be preferable if we wanted to:
 
 ## 3. Cloud Run Worker Memory Sizing
 
-The current deployment allocates 4 GB per Cloud Run worker. The memory requirement depends on which scale is being processed:
+### Current approach: tier-based memory partitioning
 
-| Scale | Median shard | Max shard | Peak memory estimate |
-|-------|-------------|-----------|---------------------|
-| 0 | 135 MB | 471 MB | ~800 MB |
-| 1 | 321 MB | 856 MB | ~1.2 GB |
-| 2 | 504 MB | 1.74 GB | ~2.1 GB |
-| 3 | 799 MB | 3.77 GB | ~4.1 GB |
-| 4 | 1.44 GB | 6.19 GB | ~6.6 GB |
-| 5+ | 1.47 GB | 6.18 GB | ~6.6 GB |
+The pipeline uses a memory estimation formula to assign each shard to the smallest
+Cloud Run memory tier that can handle it. The formula accounts for:
 
-Peak memory estimate = max shard size + ~200 MB (Python runtime + TensorStore + decompression buffer).
+- **Arrow file in RAM**: loaded by BRAID's `ShardReader` (~1x file size)
+- **Output shard on tmpfs**: Cloud Run Gen 2 uses in-memory filesystem, so the
+  neuroglancer shard file being built consumes memory (chunks x compressed KB/chunk)
+- **TensorStore RMW overhead**: ~1.3x shard size during batched read-modify-write commits
+- **Python baseline**: ~1.5 GiB for runtime, libraries, decompression buffers
+- **Safety margin**: 1.3x on the total
 
-**Recommendation**: Use different worker sizes per scale:
-- **Scales 0–1** (25,358 shards, 96.9% of the work): **2 GB** workers
-- **Scales 2–3** (729 shards): **4 GB** workers
-- **Scales 4–5** (33 shards): **8 GB** workers
-- **Scales 6–9** (8 shards): **8 GB** workers (or process on a single machine)
+```
+memory_gib = (arrow_gib + 1.3 * shard_on_tmpfs_gib + 1.5) * 1.3
+```
 
-Alternatively, use **4 GB** workers for all scales and accept that scales 4+ would need larger instances. Since scales 4+ have only 33 shards total, this is a negligible cost impact.
+Cloud Run CPU coupling constraints determine available tiers:
+
+| Tier | CPU | Cloud Run constraint |
+|------|-----|---------------------|
+| 4 GiB | 2 | CPU=2 max 8 GiB |
+| 8 GiB | 2 | CPU=2 max 8 GiB |
+| 16 GiB | 4 | CPU=4 max 16 GiB |
+| 24 GiB | 6 | CPU=6 max 24 GiB |
+| 32 GiB | 8 | CPU=8 max 32 GiB |
+
+### mCNS v0.11 production results (March 2026)
+
+All 26,125 shards completed with **zero errors** and **zero OOM failures**.
+
+| Tier | Shards | Tasks | Wall time | Avg memory | Max memory | Avg time/shard | Max time/shard |
+|------|--------|-------|-----------|------------|------------|----------------|----------------|
+| 4 GiB | 5,169 | 5,000 | 23m | 0.5 G | 1.2 G | 12s | 187s |
+| 8 GiB | 4,027 | 4,027 | 24m | 0.8 G | 3.0 G | 89s | 413s |
+| 16 GiB | 16,717 | 2,500* | 1h 18m | 1.3 G | 4.8 G | 391s | 933s |
+| 24 GiB | 196 | 100 | 53m | 3.2 G | 8.7 G | 868s | 1,249s |
+| 32 GiB | 16 | 16 | 52m | 6.0 G | 9.5 G | 1,431s | 1,867s |
+| **Total** | **26,125** | **14,143** | **1h 18m** | | | | |
+
+\* 5,000 tasks assigned but parallelism capped at 2,500 due to Cloud Run quota.
+
+Key observations:
+- **No tier exceeded 50% of its memory budget** (max 9.5 G in the 32 GiB tier).
+  The memory formula is conservative, which is the right trade-off for avoiding OOM.
+- **Tier-4gi and tier-8gi finished in ~24 minutes** despite having 9,196 shards,
+  because their shards are small (mostly scale 0 edge shards with few chunks).
+- **Tier-16gi dominated wall time** at 1h 18m with 16,717 shards (64% of all shards).
+  These are the bulk scale 0 and scale 1 shards with 20K–33K chunks each.
+- **Batched transactions worked well**: avg 309 batch writes per shard in tier-16gi
+  (BATCH_SIZE=100, so ~30,900 chunks per shard on average).
+
+### Earlier run with incorrect block size
+
+A previous export run (with `compressed_segmentation_block_size: [64,64,64]` instead
+of the correct `[8,8,8]`) had 580/4,027 tier-8gi task failures (~14% OOM rate). The
+block size mismatch caused TensorStore to produce larger output chunks, pushing memory
+over budget. After fixing to `[8,8,8]`, the same tier completed with zero failures
+and max memory of only 3.0 G.
 
 ---
 
-## 4. Current Multiscale Handling
-
-### What tensorstore-export currently does
-
-The current `worker.py` processes shards at a **single scale** — it reads one shard file, writes the decompressed chunks to the neuroglancer precomputed volume at the shard's spatial offset, and moves on. The `ShardExportDesign.md` describes a **two-step architecture**:
-
-1. **Step 1**: Cloud Run workers ingest all scale 0 shards into the neuroglancer precomputed volume
-2. **Step 2**: A separate post-processing job reads the scale 0 data from GCS and generates downsampled scales using TensorStore's `ts.downsample(method='mode')`
-
-### What DVID's export-shards actually produces
+## 4. Multiscale Handling
 
 DVID exports **all scales simultaneously** in a single database scan. The `readBlocksZYX` function iterates through the key-value store in ZYX order across all requested scales (controlled by the `num_scales` parameter). Each block key encodes its scale level, so the scan naturally produces blocks at scales 0, 1, 2, etc.
 
-The downsampled blocks at scale 1+ are pre-computed by DVID's label downres system (`datatype/common/downres/`), which uses a majority-vote algorithm on 2×2×2 neighborhoods. These are stored in the database alongside scale 0 blocks and exported in the same pass.
+The downsampled blocks at scale 1+ are pre-computed by DVID's label downres system (`datatype/common/downres/`), which uses a majority-vote algorithm on 2x2x2 neighborhoods. These are stored in the database alongside scale 0 blocks and exported in the same pass. This means scale 1+ Arrow shards already contain correctly downsampled segmentation — **no computation is needed** to produce lower-resolution scales.
 
-This means the scale 1+ Arrow shards already contain correctly downsampled segmentation — **no computation is needed** to produce lower-resolution scales. Each scale's shard files can be ingested directly into the corresponding scale of the neuroglancer precomputed volume.
-
-### The current gap
-
-The `worker.py` doesn't distinguish between scales. The shard files are organized by scale directory (`s0/`, `s1/`, `s2/`, ...) but the worker treats all shards identically — it reads the shard, extracts chunk coordinates, and writes to the destination volume. To support multiscale ingestion, workers need to:
-
-1. Know which scale a shard belongs to (from its directory path)
-2. Open the correct scale of the destination neuroglancer volume
-3. Use the appropriate shard dimensions for that scale
+The pipeline processes all 10 scales in a single batch. Each worker receives a manifest listing (scale, shard) pairs. The worker opens the correct scale of the destination neuroglancer volume based on the shard's scale index, using the sharding parameters from the neuroglancer spec (`NG_SPEC` env var, base64-encoded).
 
 ---
 
@@ -167,80 +188,95 @@ DVID scans the Badger database in ZYX order across all scales, compresses blocks
 
 ### Phase 2: Upload to GCS
 
-The 4.3 TB of Arrow + CSV files must be uploaded from the DVID server to a GCS bucket.
+The 4.3 TB of Arrow + CSV files must be uploaded from the DVID server to a GCS bucket. Actual upload was performed via `gsutil -m rsync` over the Janelia–Google Cloud interconnect.
 
-| Method | Estimated time |
-|--------|---------------|
-| `gsutil -m rsync` at 1 Gbps | ~10 hours |
-| `gsutil -m rsync` at 10 Gbps | ~1 hour |
-| `gcloud storage cp` (optimized) at 10 Gbps | ~45 minutes |
-| Direct-to-GCS writing (if DVID supported it) | 0 (overlapped with export) |
+### Phase 3: Cloud Run Processing (actual: 1h 18m)
 
-For a Janelia server with a 10 Gbps link to Google Cloud, the upload is roughly 1 hour. With a 1 Gbps link, it becomes a significant bottleneck.
-
-### Phase 3: Cloud Run Processing
-
-Each worker: download shard from GCS → decompress all chunks → write to neuroglancer precomputed volume on GCS.
+The pipeline uses `pixi run precompute-manifest` to scan all Arrow files, estimate
+memory per shard, assign shards to tiers, and distribute across tasks. Then
+`pixi run export` launches one Cloud Run job per tier in parallel.
 
 | Parameter | Value |
 |-----------|-------|
-| Total shards (all scales) | 26,128 |
-| Time per shard (estimate) | 30–90 seconds |
-| With 200 parallel workers | ~26,128 / 200 = 131 shards/worker |
-| Estimated Cloud Run time | ~2–3 hours wall clock |
+| Total shards (all scales) | 26,125 |
+| Total Cloud Run tasks | 14,143 |
+| Memory tiers | 4, 8, 16, 24, 32 GiB |
+| Wall clock (longest tier) | 1h 18m (tier-16gi) |
+| Errors | 0 |
+| OOM failures | 0 |
 
-GCS is not an I/O bottleneck — it supports thousands of concurrent readers/writers with no single-object contention.
+The tier-4gi and tier-8gi tiers finished in ~24 minutes. The bottleneck was
+tier-16gi (16,717 shards across 5,000 tasks), which ran for 1h 18m. All tiers
+run in parallel, so the total wall time equals the slowest tier.
 
-### Total pipeline time
+### Total pipeline time (actual)
 
-| Phase | Optimistic (10 Gbps) | Conservative (1 Gbps) |
-|-------|----------------------|----------------------|
-| DVID export | 12.5 hr | 12.5 hr |
-| Upload to GCS | 1 hr | 10 hr |
-| Cloud Run processing | 2 hr | 3 hr |
-| **Total** | **15.5 hr** | **25.5 hr** |
+| Phase | Duration |
+|-------|----------|
+| DVID export | 12h 35m |
+| Upload to GCS | ~1 hr |
+| Cloud Run processing | 1h 18m |
+| **Total** | **~15 hr** |
 
 ---
 
 ## 6. Optimization: Export Only Scale 0?
 
-### The question
+Since Cloud Run processing is highly parallel and the conversion is fast (1h 18m),
+the bottleneck is the DVID export (12h 35m) and GCS upload (~1h).
 
-Since Cloud Run processing is highly parallel and GCS I/O is not a bottleneck, would it be better to:
-- Export only scale 0 from DVID (saving export time and upload volume for scales 1–9)
-- Have Cloud Run workers compute downsampled scales on-the-fly from the scale 0 data already written to GCS
+Exporting only scale 0 would save ~2.8 hours of export time and ~1.5 TB of upload,
+but introduces complexity (Cloud Run would need to compute downres) and a
+sequential dependency (scale N+1 depends on scale N being fully written).
 
-### Analysis
-
-**Savings from exporting only scale 0:**
-- DVID export time: saves ~2.8 hours (scales 1–9 produced 76.7M chunks at ~13K/sec)
-- Upload volume: saves ~1.5 TB (scales 1–9)
-- Upload time: saves ~20 minutes at 10 Gbps, or ~3.3 hours at 1 Gbps
-
-**Cost of Cloud Run downsampling:**
-- TensorStore's `ts.downsample(method='mode')` can generate scale N+1 from scale N by reading 2×2×2 neighborhoods and picking the majority label
-- Scale 1 has 3,364 shard-sized regions to generate, each reading 8 scale-0 chunks and writing one scale-1 chunk. With 200 workers this completes in minutes
-- Scales 2+ are negligible
-
-**However, there are important considerations against this approach:**
-
-1. **Correctness guarantee**: DVID's downres algorithm (`labels.Block.Downres`) and TensorStore's `ts.downsample(method='mode')` must produce identical results. Both use majority-vote, but tie-breaking behavior may differ. Using DVID's pre-computed downres guarantees the neuroglancer volume exactly matches what DVID serves, which is important for scientific reproducibility.
-
-2. **Sequential dependency**: Scale N+1 can only be generated after scale N is completely written. This means Cloud Run would need to process all scale 0 shards → wait → process scale 1 → wait → etc. With DVID-exported shards, all scales can be processed in a single parallel batch.
-
-3. **Marginal savings**: The ~2.8-hour DVID export saving is modest compared to the ~12.5-hour total. The upload saving matters more if network bandwidth is limited.
-
-4. **Simplicity**: Processing pre-computed shards at every scale uses the same code path — just point workers at each scale's directory. Computing downres on-the-fly requires new logic for reading from the neuroglancer volume, downsampling, and writing back — a different and more complex code path.
-
-### Recommendation
-
-**Use DVID's pre-computed downres shards (current approach)** for production pipelines where correctness and simplicity matter. The time savings from skipping lower-scale export don't justify the added complexity and potential for divergence.
-
-**Consider scale-0-only export** for future optimizations if:
-- Network bandwidth to GCS is limited (1 Gbps), making the 1.5 TB upload saving significant
-- A verified equivalence test confirms DVID and TensorStore downres produce identical output
-- The pipeline already needs to be modified for other reasons
+**Recommendation**: Use DVID's pre-computed downres shards (current approach). The
+time savings don't justify the added complexity, and using DVID's downres guarantees
+the neuroglancer volume exactly matches what DVID serves.
 
 ### A better optimization target
 
-The largest time savings would come from **overlapping the DVID export with the GCS upload and Cloud Run processing**. DVID's export-shards writes shard files as strips complete — early shards are available on disk hours before the export finishes. A concurrent upload process could stream completed shards to GCS incrementally, allowing Cloud Run workers to start processing while DVID is still exporting later regions. This could reduce the effective total time from 15.5 hours to ~13 hours by hiding the upload latency entirely.
+The largest time savings would come from **overlapping the DVID export with the GCS
+upload and Cloud Run processing**. DVID's export-shards writes shard files as strips
+complete — early shards are available on disk hours before the export finishes. A
+concurrent upload process could stream completed shards to GCS incrementally, allowing
+Cloud Run workers to start processing while DVID is still exporting.
+
+## 7. Pipeline Operation
+
+### Commands
+
+```bash
+pixi run deploy               # Build Docker image, push to GCR
+pixi run precompute-manifest   # Scan shards, assign tiers, write manifests to GCS
+pixi run export                # Launch Cloud Run jobs (one per tier)
+pixi run export --dry-run      # Preview without launching
+pixi run export-status         # Monitor progress (task counts, memory, timing)
+pixi run export-errors         # Scan logs for chunk/shard errors
+pixi run find-failed           # Identify failed shards for retry
+```
+
+### Monitoring
+
+`pixi run export-status` queries Cloud Run execution status and Cloud Logging for
+structured events. It shows:
+- Per-tier task completion counts
+- Per-tier shard and chunk completion (with totals from `summary.json`)
+- Memory usage (avg/max) and timing stats from completed shards
+- In-flight shard progress (chunks written, memory, elapsed time)
+- Grand progress bar (if `summary.json` exists from manifest precomputation)
+
+### Retry workflow
+
+If tasks fail (OOM, transient errors), use `pixi run find-failed` to identify
+incomplete shards and create retry manifests at a higher memory tier:
+
+```bash
+pixi run find-failed -- --retry-tier 16   # creates retry manifest at 16 GiB
+pixi run export --manifest-dir manifests-retry --job-suffix retry
+```
+
+### Key configuration
+
+All configuration lives in `.env` (see `.env.example`). The neuroglancer volume spec
+JSON (`NG_SPEC_PATH`) is the single source of truth for volume geometry, sharding
+parameters, and `compressed_segmentation_block_size`.

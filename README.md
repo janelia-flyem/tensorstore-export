@@ -33,7 +33,7 @@ pixi run test-all       # 66 tests
 
 ### Deploy
 
-Run `pixi run deploy` to be guided through all required configuration. It prompts for GCS paths, reads the neuroglancer volume spec JSON, writes the destination `info` file (with `compressed_segmentation` encoding), builds the Docker image, and creates the Cloud Run job.
+Run `pixi run deploy` to be guided through all required configuration. It prompts for GCS paths, reads the neuroglancer volume spec JSON, writes the destination `info` file (with `compressed_segmentation` encoding), builds the Docker image, and creates the Cloud Run jobs per memory tier.
 
 ```bash
 pixi run deploy
@@ -58,13 +58,11 @@ pixi run deploy
   ...
 
 --- Deployment ---
-  SCALES [0,1]: ↵
-  MEMORY [2Gi]: ↵
+  SCALES [0,1,2,3,4,5,6,7,8,9]: ↵
   ...
 
 Writing neuroglancer info file ...
 Building Docker image ...
-Creating per-scale Cloud Run jobs...
 Done.
 ```
 
@@ -82,25 +80,25 @@ pixi run export
 
 ```
 Scanning Arrow files across 10 scales...
-  Found 26128 Arrow files
-  Memory formula: 2.5 * arrow_size + 1 GiB
+  Found 26125 Arrow files
+  Memory formula: (arrow + 1.3 * shard_on_tmpfs + 1.5) * 1.3
 
 Tier assignments:
-  2Gi (cpu=1): 10181 shards, 2000 tasks, total=372.1GB, max_arrow=99MB
-  4Gi (cpu=2): 15915 shards, 2600 tasks, total=2804.5GB, max_arrow=1200MB
-  8Gi (cpu=2):    22 shards,   22 tasks, total=43.8GB, max_arrow=1900MB
-  16Gi (cpu=4):    8 shards,    8 tasks, total=30.2GB, max_arrow=4050MB
-  32Gi (cpu=8):    2 shards,    2 tasks, total=13.3GB, max_arrow=6647MB
+  4Gi (cpu=2): 5169 shards, 5000 tasks, total=41.5GB, max_arrow=629MB
+  8Gi (cpu=2): 4027 shards, 4027 tasks, total=234.6GB, max_arrow=1997MB
+  16Gi (cpu=4): 16717 shards, 5000 tasks, total=4121.0GB, max_arrow=3402MB
+  24Gi (cpu=6): 196 shards, 100 tasks, total=275.4GB, max_arrow=6634MB
+  32Gi (cpu=8): 16 shards, 16 tasks, total=58.2GB, max_arrow=6647MB
 
 Writing per-task manifests...
-  2Gi: 2000 task manifests → gs://mybucket/exports/seg/manifests/tier-2gi/
-  4Gi: 2600 task manifests → gs://mybucket/exports/seg/manifests/tier-4gi/
+  4Gi: 5000 task manifests → gs://mybucket/exports/seg/manifests/tier-4gi/
+  8Gi: 4027 task manifests → gs://mybucket/exports/seg/manifests/tier-8gi/
   ...
 
 Launching 5 tier job(s)...
-  export-tier-2gi: launched (2000 tasks, 2Gi, cpu=1)
-  export-tier-4gi: launched (2600 tasks, 4Gi, cpu=2)
-  export-tier-8gi: launched (22 tasks, 8Gi, cpu=2)
+  export-tier-4gi: launched (5000 tasks, 4Gi, cpu=2)
+  export-tier-8gi: launched (4027 tasks, 8Gi, cpu=2)
+  export-tier-16gi: launched (5000 tasks, 16Gi, cpu=4)
   ...
 ```
 
@@ -127,65 +125,26 @@ By default, workers export **agglomerated labels** — the standard segmentation
 ### Monitoring Progress
 
 ```bash
-# Status of all per-scale jobs (elapsed time, task counts)
-pixi run export-status
-
-# Status of a specific scale
-pixi run export-status --scale 0
+pixi run export-status    # task counts, memory, timing, in-flight shards
+pixi run export-errors    # error summary across all tiers
+pixi run export-errors --details  # full details of every failed chunk
 ```
 
-### Checking for Errors
+`export-status` queries Cloud Run execution status and Cloud Logging for
+structured events. It shows per-tier shard/chunk completion, memory usage,
+timing stats, and in-flight shard progress. If `summary.json` exists (written
+by `precompute-manifest`), it also shows a grand progress bar with total
+chunks written vs expected.
 
-Check for errors at any time — during execution for a live snapshot, or after completion for the final summary:
+### Retry workflow
+
+If tasks fail (OOM, transient errors), identify incomplete shards and retry
+at a higher memory tier:
 
 ```bash
-# Summary of errors across all scales (latest execution each)
-pixi run export-errors
-
-# Errors for a specific scale only
-pixi run export-errors --scale 0
-
-# Full details of every failed chunk
-pixi run export-errors --details
-
-# Errors from all executions (not just the latest)
-pixi run export-errors --all
+pixi run find-failed -- --retry-tier 16
+pixi run export --manifest-dir manifests-retry --job-suffix retry
 ```
-
-The script queries per-scale Cloud Run jobs (`{BASE_JOB_NAME}-s0`, `-s1`, ...),
-auto-detects the latest execution for each, and aggregates results. Individual
-chunk failures are logged as `"Chunk failed"` events with coordinates, so they
-don't abort the entire shard.
-
-### Mining Memory Profiles
-
-After an export, mine the structured logs to understand actual memory
-usage per shard and tune tier boundaries for future runs:
-
-```bash
-# Memory profile summary per shard (peak RSS, batches, elapsed time)
-pixi run export-errors -- --details | grep "Shard memory profile"
-
-# Wall-clock progress snapshots (memory trajectory over time)
-pixi run export-errors -- --details | grep "Shard progress"
-
-# Memory pressure events (transaction forced to commit early)
-pixi run export-errors -- --details | grep "memory pressure"
-```
-
-Key fields in `"Shard memory profile"` events:
-
-| Field | Description |
-|-------|-------------|
-| `peak_memory_gib` | Maximum cgroup memory usage during shard processing |
-| `memory_limit_gib` | Container memory limit (from Cloud Run `--memory`) |
-| `batches` | Number of transaction commits (1 = ideal single-write) |
-| `uncompressed_gib` | Total uncompressed chunk data written |
-| `elapsed_s` | Wall-clock time to process the shard |
-
-If `batches > 1` for many shards, increase the memory tier. If
-`peak_memory_gib` is well below `memory_limit_gib` for all shards in a
-tier, you can safely reduce the tier to save cost.
 
 ### Multi-Scale Processing
 
@@ -197,37 +156,25 @@ Workers support two sources for each scale:
 
 ### Memory Sizing
 
-BRAID's ShardReader fully downloads the Arrow IPC file into memory (not
-lazy/streamed — pyarrow's native GCS filesystem is unreliable on Cloud Run).
-The Arrow file size is the dominant memory variable.
+Memory per shard is dominated by two components: the Arrow file in RAM and
+the output neuroglancer shard on tmpfs (Cloud Run Gen 2 uses in-memory
+filesystem). The formula used by `precompute-manifest`:
 
-Memory needed per shard ≈ `2.5 × arrow_file_size + 1 GiB`:
+```
+memory_gib = (arrow_gib + 1.3 * shard_on_tmpfs_gib + 1.5) * 1.3
+```
 
 | Component | Size | Notes |
 |-----------|------|-------|
-| Arrow file (BRAID ShardReader) | 1× arrow_size | Fully in RAM via `blob.download_as_bytes()` |
-| Transaction buffer (TensorStore Cords) | ~1-1.5× arrow_size | compressed_segmentation encoded chunks |
-| Python, TensorStore, OS overhead | ~1 GiB | Runtime, encoding buffers, etc. |
+| Arrow file | 1x arrow_size | Fully in RAM via `blob.download_as_bytes()` |
+| Output shard on tmpfs | chunks x KB/chunk | Grows during batched RMW commits |
+| TensorStore RMW overhead | ~1.3x shard size | During commit |
+| Python baseline | ~1.5 GiB | Runtime, libraries, buffers |
+| Safety margin | 1.3x total | |
 
-The `precompute-manifest` command uses this formula to assign shards to
-memory tiers automatically.  Workers monitor actual container memory via
-cgroup (`/sys/fs/cgroup/memory.current`) and will commit the transaction
-early if memory pressure is detected, so the estimate doesn't need to be
-exact — the cgroup safety valve prevents OOM.
-
-Arrow shard file sizes from the mCNS dataset:
-
-| Scale | Count  | Mean   | Max     |
-|-------|--------|--------|---------|
-| 0     | 21,994 | 142 MB | 493 MB  |
-| 1     | 3,364  | 337 MB | 898 MB  |
-| 2     | 606    | 528 MB | 1.9 GB  |
-| 3     | 123    | 838 MB | 4.1 GB  |
-| 4     | 25     | 1.5 GB | 6.6 GB  |
-| 5     | 8      | 1.6 GB | 6.6 GB  |
-| 6+    | 9      | ≤1.6 GB| 3.1 GB  |
-
-99.9% of shards (26,096 of 26,128) fit in 4 GiB workers.
+The `precompute-manifest` command assigns shards to tiers (4/8/16/24/32 GiB)
+automatically. In the mCNS v0.11 production run, all 26,125 shards completed
+with zero OOM failures. No tier exceeded 50% of its memory budget.
 
 ## Configuration
 
@@ -237,13 +184,9 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 |----------|-------------|---------|
 | `SOURCE_PATH` | GCS URI to DVID shard export (contains s0/, s1/, ...) | `gs://mybucket/exports/seg` |
 | `DEST_PATH` | GCS URI for neuroglancer precomputed output | `gs://mybucket/v1.0/precomputed` |
-| `NG_SPEC_PATH` | Neuroglancer volume spec JSON (same as DVID export-shards) | `cns3-ng-specs.json` |
-| `BASE_JOB_NAME` | Cloud Run job name prefix (per-scale: `{name}-s0`, `-s1`, ...) | `tensorstore-dvid-export` |
-| `SCALES` | Scales to ingest from DVID shards | `0,1,2,3` |
-| `DOWNRES_SCALES` | Scales to generate by downsampling previous scale | `10` |
-| `TASKS` | Default parallel worker tasks per scale | `200` |
-| `MEMORY` | Default memory per worker | `4Gi` |
-| `CPU` | Default CPUs per worker | `2` |
+| `NG_SPEC_PATH` | Neuroglancer volume spec JSON (same as DVID export-shards) | `mcns-v0.11-export-specs.json` |
+| `BASE_JOB_NAME` | Cloud Run job name prefix (tier jobs: `{name}-tier-4gi`, ...) | `tensorstore-dvid-export` |
+| `SCALES` | Scales to process (comma-separated) | `0,1,2,3,4,5,6,7,8,9` |
 
 ## Architecture
 
@@ -261,9 +204,9 @@ GCS.  Without this, each chunk triggers a full shard read-modify-write
 (O(N²) I/O).  Workers monitor container memory via cgroup and commit early
 only if approaching the memory limit.
 
-**Tier-based task assignment**: `pixi run export` scans Arrow file sizes,
-estimates memory requirements (`2.5 × arrow_size + 1 GiB`), and assigns
-shards to memory tiers (1–32 GiB).  Each tier gets its own Cloud Run job
+**Tier-based task assignment**: `pixi run precompute-manifest` scans Arrow
+file sizes and chunk counts, estimates memory requirements, and assigns
+shards to memory tiers (4–32 GiB).  Each tier gets its own Cloud Run job
 with appropriate memory and CPU.  Each task downloads only its own small
 manifest file listing the shards it should process.  Tasks within a tier
 are load-balanced by Arrow file size.
@@ -278,26 +221,33 @@ tensorstore-export/
 ├── .env.example                     # Configuration template
 ├── Dockerfile                       # Cloud Run container
 ├── scripts/
-│   ├── deploy.py                   # Interactive deployment (image, info file, base job)
+│   ├── deploy.py                   # Interactive deployment (image, info file)
 │   ├── export.py                   # Scan, manifest, launch (single command)
-│   ├── precompute_manifest.py      # Tier assignment and manifest generation
+│   ├── precompute_manifest.py      # Tier assignment, manifest + summary generation
+│   ├── export_status.py            # Job status, memory, progress tracking
 │   ├── export_errors.py            # Query error logs
-│   └── export_status.py            # Job status overview
+│   ├── find_failed_shards.py       # Identify failed shards for retry
+│   └── compute_offsets.py          # Pre-compute Arrow byte offsets for range reads
 ├── src/
 │   ├── worker.py                   # Cloud Run worker
 │   └── tensorstore_adapter.py      # TensorStore helpers
-├── braid/                           # BRAID library (will be its own repo)
+├── braid/                           # BRAID library
 │   ├── src/braid/
-│   │   ├── reader.py               # ShardReader (local + GCS)
+│   │   ├── reader.py               # ShardReader + ShardRangeReader
 │   │   ├── decompressor.py         # DVID block decompressor
+│   │   ├── cseg_encoder.py         # DVID-to-cseg transcoder (Python wrapper)
 │   │   └── exceptions.py
-│   ├── tests/                      # 66 tests including ground truth verification
+│   ├── csrc/
+│   │   ├── dvid_decompress.c       # C DVID block decompressor
+│   │   └── cseg_encode.c           # C compressed_segmentation encoder
+│   ├── tests/                      # Tests including ground truth verification
 │   └── docs/ARCHITECTURE.md        # I/O design decisions
 ├── examples/
-│   └── run-all-scales.sh           # Full export example (tier-based)
+│   └── mcns-v0.11-export-specs.json # mCNS neuroglancer volume spec
 └── docs/
-    ├── mCNS-ExportAnalysis.md      # Real export data analysis
-    ├── ExportObservabilityPlan.md   # DVID export error detection plan
+    ├── mCNS-ExportAnalysis.md      # Export data analysis + production results
+    ├── PrecomputeShardOffsets.md    # Two-phase memory separation design
+    ├── CustomShardWriter.md        # Future: bypass TensorStore with BRAID transcoder
     └── ShardExportDesign.md        # System design document
 ```
 

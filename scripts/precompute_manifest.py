@@ -238,9 +238,15 @@ def main():
     # Assign to tiers
     tier_map = assign_tiers(all_files, max_tasks)
 
+    # Build chunk count lookup: (scale, shard_name) -> chunk_count
+    chunk_counts = {(s, n): cc for s, n, _, cc in all_files}
+    total_chunks_all = sum(cc for cc in chunk_counts.values())
+    print(f"  Total chunks across all shards: {total_chunks_all:,}")
+
     # Print summary and write per-task manifests
     print(f"\nTier assignments:")
     manifest_prefixes = {}
+    tier_summary = {}  # for summary.json
     storage_client = None
     bucket_name, source_prefix = source_path.replace("gs://", "").split("/", 1)
 
@@ -253,7 +259,15 @@ def main():
         max_arrow = max(s for _, _, s in shards)
         cpu = TIER_CPU.get(gib, 2)
 
+        tier_chunks = sum(chunk_counts.get((s, n), 0) for s, n, _ in shards)
+        tier_summary[str(gib)] = {
+            "shards": len(shards),
+            "tasks": num_tasks,
+            "chunks": tier_chunks,
+        }
+
         print(f"  {gib}Gi (cpu={cpu}): {len(shards)} shards, {num_tasks} tasks, "
+              f"{tier_chunks:,} chunks, "
               f"total={total_bytes/1e9:.1f}GB, max_arrow={max_arrow/1e6:.0f}MB")
 
         if args.dry_run:
@@ -281,6 +295,17 @@ def main():
     if args.dry_run:
         print("\n(dry run — no manifests written)")
         return
+
+    # Write summary.json with chunk totals for export-status progress tracking
+    summary = {
+        "total_shards": len(all_files),
+        "total_chunks": total_chunks_all,
+        "tiers": tier_summary,
+    }
+    summary_blob = gcs_bucket.blob(f"{source_prefix}/manifests/summary.json")
+    summary_blob.upload_from_string(
+        json.dumps(summary, indent=2), content_type="application/json")
+    print(f"\n  Written summary: {source_path}/manifests/summary.json")
 
     # Print execution commands
     scales_arg = ",".join(str(s) for s in scales)
