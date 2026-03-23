@@ -300,6 +300,8 @@ class ShardProcessor:
 
         Walks the staging directory and uploads every file except 'info',
         preserving the directory structure (e.g., s0/070e7.shard).
+        Uses streaming upload with a small chunk size to avoid buffering
+        the entire shard file in memory.
 
         Returns the number of bytes uploaded.
         """
@@ -312,6 +314,10 @@ class ShardProcessor:
                 rel_path = os.path.relpath(local_path, staging_dir)
                 blob_path = f"{self._dest_prefix}/{rel_path}"
                 blob = self.dest_bucket_obj.blob(blob_path)
+                # Use resumable upload with 8MB chunks to avoid loading
+                # the entire shard file into memory.  Default upload
+                # buffers the whole file, which OOMs for large shards.
+                blob.chunk_size = 8 * (1 << 20)  # 8 MiB
                 blob.upload_from_filename(local_path)
                 uploaded_bytes += os.path.getsize(local_path)
         return uploaded_bytes

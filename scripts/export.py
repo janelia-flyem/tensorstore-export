@@ -72,7 +72,8 @@ def _create_or_update_job(job_name: str, image: str, env: dict,
         f"--region={env['REGION']}",
         f"--project={env['PROJECT_ID']}",
         f"--tasks={tasks}",
-        f"--parallelism={tasks}",
+        # Cap parallelism to stay within project memory quota (~40 TB).
+        f"--parallelism={min(tasks, int(40000 / _parse_memory_gib(memory)))}",
         f"--max-retries={env.get('MAX_RETRIES', '3')}",
         f"--task-timeout={env.get('TASK_TIMEOUT', '86400s')}",
         f"--memory={memory}",
@@ -177,7 +178,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: 1.5 * arrow_size + 2 GiB (local-disk staging)")
+    print(f"  Memory formula: 2 * arrow + chunks/10K + 6 GiB (local-disk staging)")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")
@@ -207,6 +208,14 @@ def main():
     storage_client = storage.Client()
     bucket_name, source_prefix = source_path.replace("gs://", "").split("/", 1)
     gcs_bucket = storage_client.bucket(bucket_name)
+
+    # Delete stale manifests from previous runs
+    manifest_prefix = f"{source_prefix}/manifests/"
+    stale = list(gcs_bucket.list_blobs(prefix=manifest_prefix))
+    if stale:
+        print(f"\nDeleting {len(stale)} stale manifest files...")
+        gcs_bucket.delete_blobs(stale)
+        print(f"  Deleted.")
 
     tier_info = {}  # gib -> (manifest_uri, num_tasks)
     total_manifests = 0

@@ -24,18 +24,22 @@ from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE
 
 # Available memory tiers with Cloud Run CPU coupling constraints.
 # Cloud Run Gen2: CPU=1→max 4Gi, CPU=2→max 8Gi, CPU=4→max 16Gi, CPU=8→max 32Gi.
-TIER_CPU = {1: 1, 2: 1, 4: 2, 8: 2, 16: 4, 32: 8}
+TIER_CPU = {1: 1, 2: 1, 4: 2, 8: 2, 16: 4, 24: 6, 32: 8}
 
 # Default max tasks per tier; override with --tiers.
-DEFAULT_TIER_MAX_TASKS = {1: 5000, 2: 5000, 4: 5000, 8: 100, 16: 20, 32: 5}
+DEFAULT_TIER_MAX_TASKS = {1: 5000, 2: 5000, 4: 5000, 8: 5000, 16: 5000, 24: 100, 32: 20}
 
 
 def list_arrow_files(source_path: str, scales: list) -> list:
-    """List all Arrow files with sizes across scales via gsutil.
+    """List all Arrow files with sizes and chunk counts across scales.
 
-    Returns list of (scale, shard_name, size_bytes) tuples.
+    Returns list of (scale, shard_name, size_bytes, chunk_count) tuples.
+    Chunk count is obtained from the companion CSV file (lines - 1 header).
     """
     all_files = []
+    arrow_by_scale = {}  # scale -> {name: size_bytes}
+
+    # Pass 1: list Arrow files and sizes
     for scale in scales:
         prefix = f"{source_path}/s{scale}/"
         result = subprocess.run(
@@ -46,32 +50,47 @@ def list_arrow_files(source_path: str, scales: list) -> list:
             print(f"  Warning: could not list {prefix}: {result.stderr.strip()}")
             continue
 
+        arrow_by_scale[scale] = {}
+        csv_sizes = {}
         for line in result.stdout.splitlines():
             line = line.strip()
             if not line or line.startswith("TOTAL"):
                 continue
             parts = line.split()
-            if len(parts) >= 3 and parts[2].endswith(".arrow"):
-                size_bytes = int(parts[0])
-                name = parts[2].split("/")[-1].replace(".arrow", "")
-                all_files.append((scale, name, size_bytes))
+            if len(parts) >= 3:
+                if parts[2].endswith(".arrow"):
+                    size_bytes = int(parts[0])
+                    name = parts[2].split("/")[-1].replace(".arrow", "")
+                    arrow_by_scale[scale][name] = size_bytes
+                elif parts[2].endswith(".csv"):
+                    size_bytes = int(parts[0])
+                    name = parts[2].split("/")[-1].replace(".csv", "")
+                    csv_sizes[name] = size_bytes
+
+        # Estimate chunk count from CSV size: each line ~15 bytes (x,y,z,rec)
+        # minus 1 header line
+        for name, arrow_size in arrow_by_scale[scale].items():
+            csv_size = csv_sizes.get(name, 0)
+            chunk_count = max(0, csv_size // 15 - 1) if csv_size > 0 else 0
+            all_files.append((scale, name, arrow_size, chunk_count))
 
     return all_files
 
 
-def estimate_memory_gib(arrow_size_bytes: int) -> float:
+def estimate_memory_gib(arrow_size_bytes: int, chunk_count: int = 0) -> float:
     """Estimate total memory needed to process a shard.
 
     With local-disk staging, TensorStore's transaction buffer is flushed to
-    disk every BATCH_SIZE chunks, so memory is dominated by the Arrow file
-    (loaded fully into RAM by PyArrow) plus runtime overhead.
+    disk every BATCH_SIZE chunks, but memory still grows ~1 GiB per 10K
+    chunks due to TensorStore's internal caching during RMW.
 
-    Memory = 1.5 × Arrow file + 2.0 GiB (Python, TensorStore, BRAID, GCS client).
-    The 1.5× accounts for PyArrow internal overhead beyond the file size.
-    Calibrated from production: 1.82G observed for a 170MB Arrow file.
+    Memory = 2.0 × Arrow file
+           + (chunk_count / 10000) GiB  (RMW memory growth)
+           + 5.0 GiB                    (runtime + upload overhead)
     """
     arrow_gib = arrow_size_bytes / (1 << 30)
-    return 1.5 * arrow_gib + 2.0
+    chunk_gib = chunk_count / 10000.0
+    return 2.0 * arrow_gib + chunk_gib + 6.0
 
 
 def pick_tier(mem_needed_gib: float) -> int:
@@ -95,8 +114,10 @@ def assign_tiers(files: list, max_tasks: dict) -> dict:
     """
     tier_map = {}
 
-    for scale, name, size_bytes in files:
-        mem_needed = estimate_memory_gib(size_bytes)
+    for entry in files:
+        scale, name, size_bytes = entry[0], entry[1], entry[2]
+        chunk_count = entry[3] if len(entry) > 3 else 0
+        mem_needed = estimate_memory_gib(size_bytes, chunk_count)
         gib = pick_tier(mem_needed)
         tier_map.setdefault(gib, []).append((scale, name, size_bytes))
 
@@ -174,7 +195,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: 1.5 * arrow_size + 2 GiB (local-disk staging)")
+    print(f"  Memory formula: 2 * arrow + chunks/10K + 6 GiB (local-disk staging)")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")

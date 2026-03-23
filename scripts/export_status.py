@@ -310,7 +310,7 @@ def main():
         progress = _query_log_events(
             job_name, project, region, "Shard progress", execution)
         completed = _query_log_events(
-            job_name, project, region, "Shard memory profile", execution)
+            job_name, project, region, "Shard complete", execution)
 
         # Deduplicate progress: keep latest per (scale, shard)
         latest = {}
@@ -342,8 +342,7 @@ def main():
         stats = summarize_memory(completed)
         if stats:
             print(f"  Memory: avg {stats['peak_memory_avg']:.1f}G, "
-                  f"max {stats['peak_memory_max']:.1f}G / "
-                  f"{stats['memory_limit']:.0f}G limit, "
+                  f"max {stats['peak_memory_max']:.1f}G, "
                   f"rewrites: {stats['rewrites']}")
             print(f"  Timing: avg {stats['avg_elapsed_s']:.0f}s, "
                   f"max {stats['max_elapsed_s']:.0f}s per shard")
@@ -351,11 +350,10 @@ def main():
         # In-flight shards sorted by % complete
         if in_flight:
             mem_vals = [p.get("memory_gib", 0) for p in in_flight.values() if p.get("memory_gib", 0) > 0]
-            mem_limit = max((p.get("memory_limit_gib", 0) for p in in_flight.values()), default=0)
             mem_summary = ""
             if mem_vals:
                 mem_summary = (f", memory: avg {sum(mem_vals)/len(mem_vals):.1f}G"
-                               f", max {max(mem_vals):.1f}G / {mem_limit:.0f}G limit")
+                               f", max {max(mem_vals):.1f}G")
             print(f"  In-flight shards: {len(in_flight)}, "
                   f"chunks: {total_chunks_inflight:,}/{total_chunks_total:,}"
                   f"{mem_summary}")
