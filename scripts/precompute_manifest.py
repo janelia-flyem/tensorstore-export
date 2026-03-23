@@ -66,10 +66,12 @@ def estimate_memory_gib(arrow_size_bytes: int) -> float:
     disk every BATCH_SIZE chunks, so memory is dominated by the Arrow file
     (loaded fully into RAM by PyArrow) plus runtime overhead.
 
-    Memory = Arrow file + 1.5 GiB (Python, TensorStore, BRAID, GCS client).
+    Memory = 1.5 × Arrow file + 2.0 GiB (Python, TensorStore, BRAID, GCS client).
+    The 1.5× accounts for PyArrow internal overhead beyond the file size.
+    Calibrated from production: 1.82G observed for a 170MB Arrow file.
     """
     arrow_gib = arrow_size_bytes / (1 << 30)
-    return arrow_gib + 1.5
+    return 1.5 * arrow_gib + 2.0
 
 
 def pick_tier(mem_needed_gib: float) -> int:
@@ -172,7 +174,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: arrow_size + 1.5 GiB (local-disk staging)")
+    print(f"  Memory formula: 1.5 * arrow_size + 2 GiB (local-disk staging)")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")
