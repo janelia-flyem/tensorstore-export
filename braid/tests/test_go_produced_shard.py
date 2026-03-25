@@ -57,12 +57,12 @@ class TestGoProducedShardReader:
 
     def test_csv_coordinates_match_arrow(self, go_shard):
         """Every CSV index entry matches the Arrow record's chunk coordinates."""
-        for (cx, cy, cz), rec_idx in go_shard._chunk_index.items():
-            arrow_x = go_shard._table["chunk_x"][rec_idx].as_py()
-            arrow_y = go_shard._table["chunk_y"][rec_idx].as_py()
-            arrow_z = go_shard._table["chunk_z"][rec_idx].as_py()
+        for (cx, cy, cz), row_idx in go_shard._row_index.items():
+            arrow_x = go_shard._table["chunk_x"][row_idx].as_py()
+            arrow_y = go_shard._table["chunk_y"][row_idx].as_py()
+            arrow_z = go_shard._table["chunk_z"][row_idx].as_py()
             assert (arrow_x, arrow_y, arrow_z) == (cx, cy, cz), (
-                f"CSV coord ({cx},{cy},{cz}) at rec {rec_idx} != "
+                f"CSV coord ({cx},{cy},{cz}) at row {row_idx} != "
                 f"Arrow coord ({arrow_x},{arrow_y},{arrow_z})"
             )
 
@@ -75,9 +75,9 @@ class TestGoProducedShardReader:
         by positional correspondence.
         """
         mismatches = []
-        for (cx, cy, cz), rec_idx in go_shard._chunk_index.items():
-            labels = go_shard._table["labels"][rec_idx].as_py()
-            supervoxels = go_shard._table["supervoxels"][rec_idx].as_py()
+        for (cx, cy, cz), row_idx in go_shard._row_index.items():
+            labels = go_shard._table["labels"][row_idx].as_py()
+            supervoxels = go_shard._table["supervoxels"][row_idx].as_py()
             if len(labels) != len(supervoxels):
                 mismatches.append(
                     f"({cx},{cy},{cz}): labels={len(labels)}, supervoxels={len(supervoxels)}"

@@ -87,24 +87,107 @@ def two_label_dvid_block():
     return _create_block
 
 
+def _write_arrow_streaming(path, table, batch_size=1):
+    """Write an Arrow IPC streaming file, grouping rows into batches.
+
+    Returns (schema_size, batches) where batches is a list of
+    (offset, size, num_rows) for each record batch.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+    from scripts.compute_offsets import scan_record_offsets
+
+    with open(path, "wb") as f:
+        writer = ipc.new_stream(f, table.schema)
+        for start in range(0, len(table), batch_size):
+            end = min(start + batch_size, len(table))
+            batch = table.slice(start, end - start).to_batches()[0]
+            writer.write_batch(batch)
+        writer.close()
+
+    # Scan the written file to find actual byte offsets (the streaming
+    # writer buffers the schema, so we can't capture positions during write).
+    data = Path(path).read_bytes()
+    schema_size, raw_offsets = scan_record_offsets(data)
+
+    batches = []
+    total_rows = len(table)
+    for i, (_, off, sz) in enumerate(raw_offsets):
+        start = i * batch_size
+        nrows = min(batch_size, total_rows - start)
+        batches.append((off, sz, nrows))
+
+    return schema_size, batches
+
+
+def _write_new_csv(csv_path, table, schema_size, batches, batch_size=1):
+    """Write a new-format CSV index with offset/size/batch_idx."""
+    xs = table.column("chunk_x").to_pylist()
+    ys = table.column("chunk_y").to_pylist()
+    zs = table.column("chunk_z").to_pylist()
+
+    with open(csv_path, "w", newline="") as f:
+        f.write(f"# schema_size={schema_size}\n")
+        writer = csv.writer(f)
+        writer.writerow(["x", "y", "z", "offset", "size", "batch_idx"])
+        for i in range(len(table)):
+            batch_num = i // batch_size
+            offset, size, _ = batches[batch_num]
+            batch_idx = i % batch_size
+            writer.writerow([xs[i], ys[i], zs[i], offset, size, batch_idx])
+
+
 @pytest.fixture
 def temp_shard_files(sample_arrow_data):
-    """Create temporary Arrow and CSV files for testing."""
+    """Create temporary Arrow and CSV files (batch_size=1, new format)."""
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         arrow_path = temp_path / "test_shard.arrow"
         csv_path = temp_path / "test_shard.csv"
 
-        # Write Arrow file
-        with open(arrow_path, 'wb') as f:
-            with ipc.new_file(f, sample_arrow_data.schema) as writer:
-                writer.write_table(sample_arrow_data)
+        schema_size, batches = _write_arrow_streaming(
+            arrow_path, sample_arrow_data, batch_size=1)
+        _write_new_csv(csv_path, sample_arrow_data, schema_size, batches,
+                       batch_size=1)
 
-        # Write CSV index
-        with open(csv_path, 'w', newline='') as f:
+        yield arrow_path, csv_path
+
+
+@pytest.fixture
+def temp_shard_files_batched(sample_arrow_data):
+    """Create temporary Arrow and CSV files with batch_size=2.
+
+    Both chunks are in a single record batch, distinguished by batch_idx.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        arrow_path = temp_path / "test_shard.arrow"
+        csv_path = temp_path / "test_shard.csv"
+
+        schema_size, batches = _write_arrow_streaming(
+            arrow_path, sample_arrow_data, batch_size=2)
+        _write_new_csv(csv_path, sample_arrow_data, schema_size, batches,
+                       batch_size=2)
+
+        yield arrow_path, csv_path
+
+
+@pytest.fixture
+def temp_shard_files_old_csv(sample_arrow_data):
+    """Create temporary Arrow and CSV files with old-format CSV (x,y,z,rec)."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        arrow_path = temp_path / "test_shard.arrow"
+        csv_path = temp_path / "test_shard.csv"
+
+        # Write Arrow file (streaming, batch_size=1)
+        _write_arrow_streaming(arrow_path, sample_arrow_data, batch_size=1)
+
+        # Write old-format CSV
+        with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(['x', 'y', 'z', 'rec'])
-            writer.writerow([0, 0, 0, 0])  # First chunk
-            writer.writerow([1, 0, 0, 1])  # Second chunk
+            writer.writerow(["x", "y", "z", "rec"])
+            writer.writerow([0, 0, 0, 0])
+            writer.writerow([1, 0, 0, 1])
 
         yield arrow_path, csv_path

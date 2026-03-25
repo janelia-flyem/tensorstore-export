@@ -10,15 +10,21 @@ CURL error 81 ("Socket not ready for send/recv") on Google Cloud Run.
 See docs/GoogleCloudRunIssues.md for details.
 """
 
+from collections import namedtuple
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
+import csv as csv_mod
+import io
 import numpy as np
 import pyarrow as pa
 import pyarrow.csv as pcsv
 import pyarrow.ipc as ipc
 from .decompressor import DVIDDecompressor
 from .exceptions import BraidError, ChunkNotFoundError, DecompressionError, InvalidShardFormatError, InvalidCoordinateError
+
+# Per-chunk location within an Arrow IPC shard file.
+ChunkLocation = namedtuple("ChunkLocation", ["offset", "size", "batch_idx"])
 
 
 def _parse_gs_uri(uri: str):
@@ -73,6 +79,66 @@ def _read_gcs_bytes(uri: str) -> bytes:
     if not blob.exists():
         raise BraidError(f"GCS file not found: {uri}")
     return blob.download_as_bytes()
+
+
+def _parse_csv_index(data: bytes):
+    """Parse a CSV chunk index, detecting old or new format.
+
+    New format (from DVID export-shards with batch_size support):
+        # schema_size=688
+        x,y,z,offset,size,batch_idx
+        1,1,0,688,792,0
+
+    Old format (legacy):
+        x,y,z,rec
+        1,1,0,0
+
+    Returns:
+        (chunk_index, schema_size) where chunk_index maps
+        (x, y, z) -> ChunkLocation(offset, size, batch_idx).
+        For old-format CSVs, offset and size are -1 (unknown)
+        and batch_idx stores the record index; schema_size is 0.
+    """
+    text = data.decode("utf-8")
+
+    # Parse optional schema_size comment header
+    schema_size = 0
+    for line in text.splitlines():
+        if line.startswith("# schema_size="):
+            schema_size = int(line.split("=", 1)[1])
+            break
+
+    # Parse CSV rows (skip comment lines)
+    clean_lines = (l for l in io.StringIO(text) if not l.startswith("#"))
+    reader = csv_mod.DictReader(clean_lines)
+    columns = set(reader.fieldnames or [])
+
+    new_cols = {"x", "y", "z", "offset", "size", "batch_idx"}
+    old_cols = {"x", "y", "z", "rec"}
+    new_format = new_cols.issubset(columns)
+    old_format = old_cols.issubset(columns)
+
+    if not new_format and not old_format:
+        raise InvalidShardFormatError(
+            f"CSV missing required columns. "
+            f"Expected {new_cols} (new format) or {old_cols} (old format), "
+            f"found {columns}"
+        )
+
+    chunk_index = {}
+    for row in reader:
+        coord = (int(row["x"]), int(row["y"]), int(row["z"]))
+        if new_format:
+            chunk_index[coord] = ChunkLocation(
+                offset=int(row["offset"]),
+                size=int(row["size"]),
+                batch_idx=int(row["batch_idx"]),
+            )
+        else:
+            chunk_index[coord] = ChunkLocation(
+                offset=-1, size=-1, batch_idx=int(row["rec"]),
+            )
+    return chunk_index, schema_size
 
 
 class LabelType(Enum):
@@ -130,8 +196,13 @@ class ShardReader:
 
         # Load data during initialization (existence checked during read)
         self._table = self._load_arrow_data()
-        self._chunk_index = self._load_csv_index()
+        self._chunk_index, self._schema_size = self._load_csv_index()
         self._decompressor = DVIDDecompressor()
+
+        # Build row index from the table's own coordinate columns.
+        # This is robust regardless of CSV format or batch_size since
+        # read_all() concatenates all record batches into a flat table.
+        self._row_index = self._build_row_index()
 
         # Validate loaded data
         self._validate_data()
@@ -158,35 +229,26 @@ class ShardReader:
                 raise
             raise BraidError(f"Failed to load Arrow file {self.arrow_path}: {e}")
 
-    def _load_csv_index(self) -> Dict[Tuple[int, int, int], int]:
-        """Load CSV chunk index using PyArrow's CSV reader.
+    def _load_csv_index(self):
+        """Load CSV chunk index (new or old format).
 
-        Downloads the file (local or GCS), parses via pyarrow.csv in C++,
-        then builds the Python lookup dict from Arrow columns.
+        Returns:
+            (chunk_index, schema_size) — see ``_parse_csv_index``.
         """
         try:
             data = _read_bytes(self.csv_path)
-            table = pcsv.read_csv(pa.BufferReader(data))
-
-            # Validate columns
-            expected = {"x", "y", "z", "rec"}
-            actual = set(table.column_names)
-            if not expected.issubset(actual):
-                raise InvalidShardFormatError(
-                    f"CSV missing required columns. Expected: {expected}, Found: {actual}"
-                )
-
-            # Build lookup dict from Arrow columns
-            xs = table.column("x").to_pylist()
-            ys = table.column("y").to_pylist()
-            zs = table.column("z").to_pylist()
-            recs = table.column("rec").to_pylist()
-            return {(x, y, z): rec for x, y, z, rec in zip(xs, ys, zs, recs)}
-
+            return _parse_csv_index(data)
         except Exception as e:
             if isinstance(e, BraidError):
                 raise
             raise BraidError(f"Failed to load CSV index {self.csv_path}: {e}")
+
+    def _build_row_index(self) -> Dict[Tuple[int, int, int], int]:
+        """Build (x,y,z) -> global row index from the Arrow table."""
+        xs = self._table.column("chunk_x").to_pylist()
+        ys = self._table.column("chunk_y").to_pylist()
+        zs = self._table.column("chunk_z").to_pylist()
+        return {(x, y, z): i for i, (x, y, z) in enumerate(zip(xs, ys, zs))}
 
     def _validate_data(self):
         """Validate that loaded data is consistent and valid."""
@@ -199,11 +261,13 @@ class ShardReader:
                 f"Arrow table missing required fields: {missing}"
             )
 
-        max_record_idx = max(self._chunk_index.values()) if self._chunk_index else -1
-        if max_record_idx >= self._table.num_rows:
+        # Ensure every CSV coordinate has a matching row in the table
+        missing_coords = set(self._chunk_index.keys()) - set(self._row_index.keys())
+        if missing_coords:
+            sample = list(missing_coords)[:3]
             raise InvalidShardFormatError(
-                f"CSV references record index {max_record_idx} but table only has "
-                f"{self._table.num_rows} rows"
+                f"CSV references {len(missing_coords)} coordinates not found "
+                f"in Arrow table, e.g. {sample}"
             )
 
     @property
@@ -226,18 +290,18 @@ class ShardReader:
         if coord_key not in self._chunk_index:
             raise ChunkNotFoundError(f"Chunk not found at coordinates {coord_key}")
 
-        record_idx = self._chunk_index[coord_key]
+        row_idx = self._row_index[coord_key]
 
         return {
             'coordinates': coord_key,
-            'record_index': record_idx,
-            'chunk_x': self._table['chunk_x'][record_idx].as_py(),
-            'chunk_y': self._table['chunk_y'][record_idx].as_py(),
-            'chunk_z': self._table['chunk_z'][record_idx].as_py(),
-            'labels_count': len(self._table['labels'][record_idx].as_py()),
-            'supervoxels_count': len(self._table['supervoxels'][record_idx].as_py()),
-            'compressed_size': len(self._table['dvid_compressed_block'][record_idx].as_py()),
-            'uncompressed_size': self._table['uncompressed_size'][record_idx].as_py()
+            'record_index': row_idx,
+            'chunk_x': self._table['chunk_x'][row_idx].as_py(),
+            'chunk_y': self._table['chunk_y'][row_idx].as_py(),
+            'chunk_z': self._table['chunk_z'][row_idx].as_py(),
+            'labels_count': len(self._table['labels'][row_idx].as_py()),
+            'supervoxels_count': len(self._table['supervoxels'][row_idx].as_py()),
+            'compressed_size': len(self._table['dvid_compressed_block'][row_idx].as_py()),
+            'uncompressed_size': self._table['uncompressed_size'][row_idx].as_py()
         }
 
     def read_chunk(self, x: int, y: int, z: int,
@@ -251,12 +315,12 @@ class ShardReader:
         if coord_key not in self._chunk_index:
             raise ChunkNotFoundError(f"Chunk not found at coordinates {coord_key}")
 
-        record_idx = self._chunk_index[coord_key]
+        row_idx = self._row_index[coord_key]
 
         try:
-            labels = self._table['labels'][record_idx].as_py()
-            supervoxels = self._table['supervoxels'][record_idx].as_py()
-            compressed_data = self._table['dvid_compressed_block'][record_idx].as_py()
+            labels = self._table['labels'][row_idx].as_py()
+            supervoxels = self._table['supervoxels'][row_idx].as_py()
+            compressed_data = self._table['dvid_compressed_block'][row_idx].as_py()
 
             if label_type == LabelType.LABELS:
                 return self._decompressor.decompress_block(
@@ -286,17 +350,17 @@ class ShardReader:
         if coord_key not in self._chunk_index:
             raise ChunkNotFoundError(f"Chunk not found at coordinates {coord_key}")
 
-        record_idx = self._chunk_index[coord_key]
+        row_idx = self._row_index[coord_key]
 
         return {
             'coordinates': coord_key,
-            'chunk_x': self._table['chunk_x'][record_idx].as_py(),
-            'chunk_y': self._table['chunk_y'][record_idx].as_py(),
-            'chunk_z': self._table['chunk_z'][record_idx].as_py(),
-            'labels': self._table['labels'][record_idx].as_py(),
-            'supervoxels': self._table['supervoxels'][record_idx].as_py(),
-            'compressed_data': self._table['dvid_compressed_block'][record_idx].as_py(),
-            'uncompressed_size': self._table['uncompressed_size'][record_idx].as_py()
+            'chunk_x': self._table['chunk_x'][row_idx].as_py(),
+            'chunk_y': self._table['chunk_y'][row_idx].as_py(),
+            'chunk_z': self._table['chunk_z'][row_idx].as_py(),
+            'labels': self._table['labels'][row_idx].as_py(),
+            'supervoxels': self._table['supervoxels'][row_idx].as_py(),
+            'compressed_data': self._table['dvid_compressed_block'][row_idx].as_py(),
+            'uncompressed_size': self._table['uncompressed_size'][row_idx].as_py()
         }
 
     def __repr__(self) -> str:
@@ -310,14 +374,19 @@ class ShardReader:
 
 class ShardRangeReader:
     """
-    Memory-efficient shard reader using pre-computed byte offsets.
+    Memory-efficient shard reader using byte offsets from the CSV index.
 
     Instead of downloading the entire Arrow file into memory, this reader
-    uses a companion offset CSV (produced by ``pixi run compute-offsets``)
-    to fetch individual record batches via GCS byte-range reads.
+    uses byte offsets from the CSV (produced by DVID ``export-shards``) to
+    fetch individual record batches via GCS byte-range reads.
 
-    Memory per chunk: ~schema bytes + one record batch (~5-50 KB) vs
-    the full Arrow file (up to ~6.6 GB for the largest shards).
+    When ``batch_size > 1``, multiple chunks share a record batch.  The
+    reader caches the most recently fetched batch so that consecutive
+    chunks within the same batch are served from cache without an
+    additional GCS round-trip.
+
+    Memory per access: ~schema bytes + one record batch vs the full Arrow
+    file (up to ~6.6 GB for the largest shards).
 
     The public interface matches ``ShardReader`` so the two are
     interchangeable in the worker:
@@ -325,83 +394,55 @@ class ShardRangeReader:
         >>> reader = ShardRangeReader(
         ...     "gs://bucket/shards/s0/0_0_0.arrow",
         ...     "gs://bucket/shards/s0/0_0_0.csv",
-        ...     "gs://bucket/shards/s0/0_0_0-offsets.csv",
         ... )
         >>> for cx, cy, cz in reader.available_chunks:
         ...     data = reader.read_chunk(cx, cy, cz)
     """
 
     def __init__(self, arrow_path: Union[str, Path],
-                 csv_path: Union[str, Path],
-                 offsets_csv_path: Union[str, Path]):
+                 csv_path: Union[str, Path]):
         """
         Initialize range-read shard reader.
 
         Args:
             arrow_path: Path or GCS URI to the Arrow IPC shard file.
             csv_path: Path or GCS URI to the CSV chunk index file.
-            offsets_csv_path: Path or GCS URI to the byte-offset CSV
-                produced by ``compute_offsets.py``.
+                Must contain columns ``x, y, z, offset, size, batch_idx``
+                and a ``# schema_size=N`` comment header.
         """
         self.arrow_path = str(arrow_path)
         self.csv_path = str(csv_path)
-        self.offsets_csv_path = str(offsets_csv_path)
 
-        # Load the small metadata files (CSV index + offsets)
-        self._chunk_index = self._load_csv_index()
-        self._record_offsets, self._schema_size = self._load_offsets()
+        # Load the small CSV index (contains offsets + batch positions)
+        self._chunk_index, self._schema_size = self._load_csv_index()
 
         # Lazily downloaded Arrow schema bytes (first schema_size bytes)
         self._schema_bytes: bytes = b""
-        self._schema: pa.Schema = None
+        self._schema: Optional[pa.Schema] = None
+
+        # Batch cache: avoid re-downloading when consecutive chunks share
+        # the same record batch (batch_size > 1).
+        self._cached_batch_key: Optional[Tuple[int, int]] = None
+        self._cached_batch: Optional[pa.RecordBatch] = None
+        self._batch_fetches: int = 0  # for testing / monitoring
 
         self._decompressor = DVIDDecompressor()
 
-    def _load_csv_index(self) -> Dict[Tuple[int, int, int], int]:
-        """Load the (x,y,z) -> record_index mapping from the CSV index."""
-        data = _read_bytes(self.csv_path)
-        table = pcsv.read_csv(pa.BufferReader(data))
-        xs = table.column("x").to_pylist()
-        ys = table.column("y").to_pylist()
-        zs = table.column("z").to_pylist()
-        recs = table.column("rec").to_pylist()
-        return {(x, y, z): rec for x, y, z, rec in zip(xs, ys, zs, recs)}
-
-    def _load_offsets(self) -> tuple:
-        """Load byte offsets from the offset CSV.
+    def _load_csv_index(self):
+        """Load the CSV chunk index (new or old format).
 
         Returns:
-            (record_offsets, schema_size) where record_offsets is a dict
-            mapping record_index -> (byte_offset, byte_size).
+            (chunk_index, schema_size) — see ``_parse_csv_index``.
         """
-        import csv as csv_mod
-        import io
-
-        data = _read_bytes(self.offsets_csv_path)
-        text = data.decode("utf-8")
-
-        # Parse schema_size from comment header
-        schema_size = 0
-        for line in text.splitlines():
-            if line.startswith("# schema_size="):
-                schema_size = int(line.split("=", 1)[1])
-                break
-
-        reader = csv_mod.DictReader(
-            (l for l in io.StringIO(text) if not l.startswith("#")))
-        offsets = {}
-        for row in reader:
-            rec = int(row["rec"])
-            offsets[rec] = (int(row["offset"]), int(row["size"]))
-        return offsets, schema_size
+        data = _read_bytes(self.csv_path)
+        return _parse_csv_index(data)
 
     def _ensure_schema(self):
         """Download the Arrow schema bytes on first access."""
         if self._schema is not None:
             return
         if self._schema_size == 0:
-            raise BraidError("schema_size is 0 in offset CSV; "
-                             "cannot read schema")
+            raise BraidError("schema_size is 0 in CSV; cannot read schema")
         if self.arrow_path.startswith("gs://"):
             self._schema_bytes = _read_gcs_range(
                 self.arrow_path, 0, self._schema_size)
@@ -412,12 +453,12 @@ class ShardRangeReader:
         msg = ipc.read_message(pa.BufferReader(self._schema_bytes))
         self._schema = ipc.read_schema(msg)
 
-    def _read_record(self, record_idx: int) -> pa.RecordBatch:
-        """Fetch and parse a single record batch by byte range."""
-        if record_idx not in self._record_offsets:
-            raise BraidError(f"Record {record_idx} not in offset CSV")
+    def _get_batch(self, offset: int, size: int) -> pa.RecordBatch:
+        """Fetch a record batch, returning cached batch on cache hit."""
+        key = (offset, size)
+        if key == self._cached_batch_key:
+            return self._cached_batch
 
-        offset, size = self._record_offsets[record_idx]
         self._ensure_schema()
 
         if self.arrow_path.startswith("gs://"):
@@ -428,7 +469,11 @@ class ShardRangeReader:
                 raw = f.read(size)
 
         msg = ipc.read_message(pa.BufferReader(raw))
-        return ipc.read_record_batch(msg, self._schema)
+        batch = ipc.read_record_batch(msg, self._schema)
+        self._cached_batch_key = key
+        self._cached_batch = batch
+        self._batch_fetches += 1
+        return batch
 
     @property
     def chunk_count(self) -> int:
@@ -450,7 +495,8 @@ class ShardRangeReader:
         """Read and decompress a single chunk via byte-range read.
 
         Only downloads the Arrow schema (once) plus the specific record
-        batch for this chunk, instead of the entire Arrow file.
+        batch for this chunk.  If another chunk in the same batch was
+        read recently, the cached batch is reused.
         """
         if not all(isinstance(c, int) and c >= 0 for c in [x, y, z]):
             raise InvalidCoordinateError(f"Invalid coordinates: ({x}, {y}, {z})")
@@ -460,15 +506,16 @@ class ShardRangeReader:
             raise ChunkNotFoundError(
                 f"Chunk not found at coordinates {coord_key}")
 
-        record_idx = self._chunk_index[coord_key]
+        loc = self._chunk_index[coord_key]
 
         try:
-            batch = self._read_record(record_idx)
+            batch = self._get_batch(loc.offset, loc.size)
+            idx = loc.batch_idx
 
-            labels = batch.column("labels")[0].as_py()
-            supervoxels = batch.column("supervoxels")[0].as_py()
+            labels = batch.column("labels")[idx].as_py()
+            supervoxels = batch.column("supervoxels")[idx].as_py()
             compressed_data = batch.column(
-                "dvid_compressed_block")[0].as_py()
+                "dvid_compressed_block")[idx].as_py()
 
             if label_type == LabelType.LABELS:
                 return self._decompressor.decompress_block(
@@ -500,20 +547,21 @@ class ShardRangeReader:
             raise ChunkNotFoundError(
                 f"Chunk not found at coordinates {coord_key}")
 
-        record_idx = self._chunk_index[coord_key]
-        batch = self._read_record(record_idx)
+        loc = self._chunk_index[coord_key]
+        batch = self._get_batch(loc.offset, loc.size)
+        idx = loc.batch_idx
 
         return {
             "coordinates": coord_key,
-            "chunk_x": batch.column("chunk_x")[0].as_py(),
-            "chunk_y": batch.column("chunk_y")[0].as_py(),
-            "chunk_z": batch.column("chunk_z")[0].as_py(),
-            "labels": batch.column("labels")[0].as_py(),
-            "supervoxels": batch.column("supervoxels")[0].as_py(),
+            "chunk_x": batch.column("chunk_x")[idx].as_py(),
+            "chunk_y": batch.column("chunk_y")[idx].as_py(),
+            "chunk_z": batch.column("chunk_z")[idx].as_py(),
+            "labels": batch.column("labels")[idx].as_py(),
+            "supervoxels": batch.column("supervoxels")[idx].as_py(),
             "compressed_data": batch.column(
-                "dvid_compressed_block")[0].as_py(),
+                "dvid_compressed_block")[idx].as_py(),
             "uncompressed_size": batch.column(
-                "uncompressed_size")[0].as_py(),
+                "uncompressed_size")[idx].as_py(),
         }
 
     def __repr__(self) -> str:

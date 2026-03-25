@@ -14,6 +14,49 @@ Both backends download the full file into Python bytes, then parse via
 `pa.BufferReader` into Arrow's IPC reader (for `.arrow` files) or CSV reader
 (for `.csv` index files).
 
+`ShardRangeReader` also uses `blob.download_as_bytes(start, end)` for GCS
+byte-range reads, fetching individual record batches without downloading the
+full Arrow file.
+
+## Reader Variants
+
+BRAID provides two reader classes with identical public interfaces:
+
+| Class | Memory | I/O | Use case |
+|-------|--------|-----|----------|
+| `ShardReader` | Full Arrow file in RAM | One download per shard | Worker processing all chunks in a shard |
+| `ShardRangeReader` | Schema + one record batch | Byte-range reads per batch | Memory-constrained access to individual chunks |
+
+### CSV Index Format
+
+The CSV index maps chunk coordinates to positions in the Arrow IPC stream.
+BRAID auto-detects two formats by column names:
+
+**New format** (from DVID `export-shards` with batch_size support):
+```
+# schema_size=688
+x,y,z,offset,size,batch_idx
+1,1,0,688,792,0
+```
+
+**Old format** (legacy, batch_size=1 only):
+```
+x,y,z,rec
+1,1,0,0
+```
+
+The new format embeds byte offsets directly in the CSV, eliminating the
+separate offsets CSV previously required by `ShardRangeReader`.
+
+### Batch Caching (ShardRangeReader)
+
+When `batch_size > 1`, multiple chunks share a single Arrow record batch.
+`ShardRangeReader` caches the most recently fetched batch so that consecutive
+chunk reads within the same batch are served without an additional GCS
+round-trip.  Since DVID exports blocks in ZYX order and chunks within a
+batch are spatially adjacent, the cache hit rate is high for sequential
+access patterns.
+
 ### Why not pyarrow.fs for GCS?
 
 PyArrow ships a native C++ GCS filesystem (`pyarrow.fs.GcsFileSystem`) built on
@@ -47,12 +90,14 @@ back to `pyarrow.fs` to regain the zero-copy streaming path (see below).
 
 ## Future: Streaming Batch Iteration
 
-The current `ShardReader` calls `read_all()` to materialize the entire Arrow
-table in memory.  For a 160 MB shard file at scale 0, this means ~160 MB+ of
-Arrow table data resident in memory before any chunks are processed.
+`ShardRangeReader` already solves the memory problem for GCS by fetching only
+the needed record batches via byte-range reads.  However, `ShardReader` still
+calls `read_all()` to materialize the entire Arrow table in memory.  For a
+160 MB shard file at scale 0, this means ~160 MB+ of Arrow table data resident
+in memory before any chunks are processed.
 
-A more memory-efficient architecture would iterate record batches without
-materializing the full table:
+For local-file workflows, a more memory-efficient architecture would iterate
+record batches without materializing the full table:
 
 ```python
 # Instead of:

@@ -68,10 +68,11 @@ Tier-based manifests group shards by estimated memory so that small-shard tasks 
 ### BRAID Library (`braid/`)
 
 Pure Python (with optional C extension) for reading DVID Arrow shard files:
+- Two reader variants: `ShardReader` (full-file load) and `ShardRangeReader` (GCS byte-range reads with batch caching)
 - Block-wise access: reads individual 64x64x64 chunks by coordinate
 - Dual label support: agglomerated labels and supervoxel data
 - DVID block decompression: zstd + custom label encoding
-- CSV index: maps (x,y,z) to Arrow record offsets
+- CSV index: maps (x,y,z) to Arrow byte offsets and batch positions
 
 ## Configuration
 
