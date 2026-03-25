@@ -280,3 +280,149 @@ pixi run export --manifest-dir manifests-retry --job-suffix retry
 All configuration lives in `.env` (see `.env.example`). The neuroglancer volume spec
 JSON (`NG_SPEC_PATH`) is the single source of truth for volume geometry, sharding
 parameters, and `compressed_segmentation_block_size`.
+
+---
+
+## 8. Post-Mortem: Excessive GCS Replication Charges (March 20–23, 2026)
+
+### Incident summary
+
+During the mCNS v0.11 export runs (March 20–23), the GCP billing SKU "Network Data
+Transfer GCP Replication within Northern America" (AED0-3315-7B11) accrued significant unexpected charges. The cost dropped 99.3% after deploying the local-disk staging
+fix on March 22.
+
+| Date | Replication (GiB) | Event |
+|------|------------------|------|
+| March 20 | 809,654 |First production export runs begin |
+| March 21 | 2,150,962 | Heaviest export day (full parallelism, tier-based manifests) |
+| March 22 | 210,440 | `.result()` fix at 19:11; **local-disk staging at 22:46** |
+| March 23 | ~15,769 | Running with local-disk staging |
+
+### Root cause: TensorStore read-modify-write amplification × multi-region replication
+
+Two factors compounded to produce catastrophic costs:
+
+**1. TensorStore's shard-level read-modify-write (RMW) against GCS.**
+Before the local-disk staging change (`184e6ff`), the worker opened TensorStore with
+the GCS destination as the kvstore:
+
+```python
+"kvstore": self.config.dest_path   # "gs://flyem-male-cns/..."
+```
+
+TensorStore's sharded neuroglancer_precomputed driver performs a full shard-level RMW
+on every transaction commit (see `docs/EfficientWrites.md` for the source-level
+explanation). With memory-pressure-based batching, a shard with N chunks and B batch
+commits produced:
+
+- **Total bytes written to GCS** ≈ final_shard_size × (B+1)/2
+- **Total bytes read from GCS** ≈ final_shard_size × (B-1)/2
+
+For a typical tier-16gi shard with ~30,000 chunks and ~300 batch commits (memory
+pressure triggering a commit roughly every 100 chunks), the write amplification
+factor was approximately **150×** relative to the final shard size.
+
+**2. Multi-region GCS bucket replication.**
+The destination bucket `gs://flyem-male-cns` is configured as **multi-region (US)**.
+Every byte written to a multi-region bucket is replicated across US data centers.
+The Cloud Run tasks were running in `us-central1`, but the writes were replicated to
+other US regions by GCS to satisfy the multi-region durability guarantee.
+
+The SKU "Network Data Transfer GCP Replication within Northern America" charges
+**$0.02/GiB** for this cross-region replication — applied to every byte of every
+amplified RMW write.
+
+**3. Additional amplifiers.**
+
+- **Soft delete** was enabled on the bucket (7-day retention). Each intermediate
+  shard overwrite from each RMW commit created a retained soft-deleted version.
+  Post-incident bucket inspection found **4,572,931 soft-deleted objects totaling
+  3,097 TiB (3.1 PiB)** — 881× the 3.52 TiB of live data — adding significant
+  one-time storage charges over the retention window. See "Soft-delete storage
+  impact" below.
+- **The `.result()` bug** (fixed at `7169e8f`, March 22 19:11): before this fix,
+  `ts.TensorStore.write()` futures were not `.result()`'d, causing ~31% data loss at
+  scale 0 and complete data loss at scales 5–9. Failed exports were rerun,
+  multiplying GCS write traffic.
+- **Rapid iteration**: 40+ commits across March 20–22 fixed bugs and redeployed,
+  each deployment reprocessing shards that had already been partially written.
+
+### The fix: local-disk staging (`184e6ff`, March 22 22:46 EDT)
+
+The fix rewrote `process_shard()` to write to local disk instead of directly to GCS:
+
+```python
+# Before: TensorStore writes directly to GCS (every commit = shard RMW on GCS)
+"kvstore": self.config.dest_path        # "gs://flyem-male-cns/..."
+
+# After: TensorStore writes to local staging (every commit = shard RMW on local disk)
+"kvstore": {"driver": "file", "path": staging_dir}   # "/mnt/staging/s0_abc123"
+```
+
+All RMW cycles now happen locally (free). Only one final upload per shard to GCS via
+`_upload_shard_files()`. This reduces GCS write traffic from `O(B × shard_size)` to
+`1 × shard_size` — eliminating the write amplification entirely.
+
+### Cost breakdown: what could have prevented this
+
+| Mitigation | Notes |
+|-----------|-------|
+| Local-disk staging (what was deployed) | Eliminates RMW write amplification against GCS |
+| Single-region bucket (us-central1) | No cross-region replication; this specific SKU becomes $0 |
+| Both combined | Belt and suspenders |
+
+Using a single-region bucket pinned to the same region as Cloud Run would have
+avoided the replication SKU entirely. However, the RMW amplification would still
+have incurred elevated GCS **operation** costs (Class A writes at $0.05/10K ops)
+and potentially egress charges. The local-disk staging fix is the more fundamental
+solution because it eliminates the amplified I/O pattern regardless of bucket
+configuration.
+
+### Soft-delete storage impact
+
+The destination bucket `gs://flyem-male-cns` had soft delete enabled with the
+default 7-day retention (604800 seconds). Each RMW overwrite of a shard file turned
+the previous version into a soft-deleted object, retained and billed at multi-region
+standard storage rates ($0.026/GB/month) until hard deletion.
+
+### Best practices
+
+**1. Never let TensorStore write sharded format directly to remote storage.**
+TensorStore's sharded neuroglancer_precomputed driver performs a shard-level
+read-modify-write on every transaction commit. Writing directly to GCS turns every
+commit into a full shard download + upload cycle. Always stage to local disk and
+upload the finished shard file once.
+
+**2. Pin your GCS bucket region to match your compute region.**
+Multi-region buckets (US, EU, ASIA) incur cross-region replication charges on every
+write. If all compute runs in a single region (e.g., Cloud Run in `us-central1`),
+use a single-region bucket in that same region. Multi-region only provides value
+when readers are distributed across regions.
+
+**3. Account for soft-delete costs on buckets receiving repeated overwrites.**
+Soft delete retains every overwritten version for the retention period (default 7
+days), billed at the same storage rate as live data. In this incident, the RMW
+pattern created 4.57M retained versions totaling 3.1 PiB — an additional required storage charge
+on top of the significant replication bill. For write-heavy pipelines under development, consider
+disabling soft delete or reducing the retention period during initial runs, then
+re-enabling it once the pipeline is stable.
+
+More practically, we should separate a staging bucket from the distribution bucket. The staging bucket should be single zone and could enable a number of properties to improve latency and throughput like Hierarchical Namespace. The distribution bucket could remain multi-region and enable soft delete.
+
+**4. Always `.result()` TensorStore write futures inside transactions.**
+`ts.TensorStore.write()` returns a `WriteFutures` object. Without calling
+`.result()`, the write may not be staged in the transaction before commit — causing
+silent data loss. This bug caused the export to be rerun multiple times, amplifying
+all the costs above. See the pitfall note in `CLAUDE.md`.
+
+**5. Estimate GCS costs before large exports.**
+Back-of-envelope before launching: if writing N shards with B batch commits each to
+a multi-region bucket, the replication cost is roughly:
+
+```
+cost ≈ N × avg_shard_size × (B+1)/2 × $0.02/GiB
+```
+
+**6. Monitor billing daily during large jobs.**
+GCP billing data is available with a ~24-hour delay. For multi-day export runs, check
+the billing console daily. 
