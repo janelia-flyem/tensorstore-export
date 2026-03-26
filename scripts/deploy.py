@@ -443,7 +443,7 @@ def main():
     import hashlib
     content_hash_input = subprocess.run(
         ["git", "log", "-1", "--format=%H", "--",
-         "Dockerfile", "requirements.txt", "main.py", "src/", "braid/src/", "braid/csrc/", "braid/pyproject.toml"],
+         "Dockerfile", "requirements.txt", "main.py", "src/", "scripts/", "braid/src/", "braid/csrc/", "braid/pyproject.toml"],
         capture_output=True, text=True, cwd=str(PROJECT_ROOT),
     ).stdout.strip()
     content_tag = hashlib.sha256(content_hash_input.encode()).hexdigest()[:12] if content_hash_input else "latest"

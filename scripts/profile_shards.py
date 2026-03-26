@@ -184,9 +184,15 @@ def process_shards(source_path: str, output_path: str,
 
     def _process_one(scale_and_name):
         scale, name = scale_and_name
+        csv_path = f"{output_path}/s{scale}/{name}-labels.csv"
+        if _exists(csv_path):
+            return scale, name, {"skipped": True}
+        print(f"  Processing s{scale}/{name}...")
         result = profile_shard(source_path, scale, name)
         if "error" not in result:
             write_labels_csv(output_path, scale, name, result["rows"])
+            print(f"  Done s{scale}/{name}: {result['chunk_count']} chunks, "
+                  f"{result['arrow_bytes'] / 1e6:.0f} MB")
         return scale, name, result
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -194,19 +200,25 @@ def process_shards(source_path: str, output_path: str,
             pool.submit(_process_one, sn): sn
             for sn in shards
         }
+        skipped = 0
         for future in as_completed(futures):
             scale, name, result = future.result()
+            if result.get("skipped"):
+                skipped += 1
+                continue
             if "error" in result:
                 errors += 1
                 print(f"  Error: s{scale}/{name}: {result['error']}")
             else:
                 completed += 1
                 total_arrow_bytes += result.get("arrow_bytes", 0)
-                if completed % 100 == 0 or completed == len(shards):
+                log_interval = max(1, min(100, len(shards) // 10))
+                if completed % log_interval == 0 or completed == len(shards):
                     elapsed = time.time() - start_time
                     rate = completed / elapsed if elapsed > 0 else 0
+                    skip_msg = f", {skipped} skipped" if skipped else ""
                     print(f"  {completed}/{len(shards)} profiled"
-                          f" ({errors} errors)"
+                          f" ({errors} errors{skip_msg})"
                           f" [{elapsed:.0f}s, {rate:.1f}/s]")
 
     elapsed = time.time() - start_time
@@ -284,18 +296,6 @@ def main():
         "--workers", type=int, default=8,
         help="Number of parallel workers (default: 8)",
     )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Count shards needing profiling without writing",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Regenerate even if -labels.csv already exists",
-    )
-    parser.add_argument(
-        "--skip-check", action="store_true",
-        help="Skip checking for existing -labels.csv files (faster first run)",
-    )
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
@@ -315,43 +315,29 @@ def main():
     all_shards = list_shards(source_path, scales)
     print(f"  Found {len(all_shards)} Arrow shards")
 
-    # Check which shards already have label CSVs (in output path)
-    need_profiling = []
-    if args.force or args.skip_check:
-        need_profiling = all_shards
-        if args.skip_check:
-            print("  Skipping existence check (--skip-check)")
-    else:
-        # List existing label CSVs in bulk (one list_blobs per scale)
-        # instead of one exists() call per shard (26K API calls).
-        print("Scanning for existing -labels.csv files...")
-        existing = set()
-        for scale in scales:
-            prefix = f"{output_path}/s{scale}/"
-            if prefix.startswith("gs://"):
-                bucket_name, blob_prefix = _parse_gs(prefix)
-                for blob in _get_gcs_client().bucket(bucket_name).list_blobs(
-                        prefix=blob_prefix):
-                    if blob.name.endswith("-labels.csv"):
-                        name = blob.name.split("/")[-1].replace("-labels.csv", "")
-                        existing.add((scale, name))
-            else:
-                for f in Path(prefix).glob("*-labels.csv"):
+    # Bulk scan for existing label CSVs to avoid 26K per-shard existence
+    # checks (one list_blobs per scale = seconds vs minutes).
+    # process_shards still does per-shard checks as a safety net.
+    print("Scanning for existing -labels.csv files...")
+    existing = set()
+    for scale in scales:
+        prefix = f"{output_path}/s{scale}/"
+        if prefix.startswith("gs://"):
+            bucket_name, blob_prefix = _parse_gs(prefix)
+            for blob in _get_gcs_client().bucket(bucket_name).list_blobs(
+                    prefix=blob_prefix):
+                if blob.name.endswith("-labels.csv"):
+                    name = blob.name.split("/")[-1].replace("-labels.csv", "")
+                    existing.add((scale, name))
+        else:
+            p = Path(prefix)
+            if p.exists():
+                for f in p.glob("*-labels.csv"):
                     existing.add((scale, f.stem.replace("-labels", "")))
-        for scale, name in all_shards:
-            if (scale, name) not in existing:
-                need_profiling.append((scale, name))
-        print(f"  {len(need_profiling)} shards need profiling "
-              f"({len(all_shards) - len(need_profiling)} already done)")
 
-    if args.dry_run:
-        by_scale = {}
-        for scale, _ in need_profiling:
-            by_scale[scale] = by_scale.get(scale, 0) + 1
-        for s in sorted(by_scale):
-            print(f"    scale {s}: {by_scale[s]} shards")
-        print("\n(dry run — nothing written)")
-        return
+    need_profiling = [(s, n) for s, n in all_shards if (s, n) not in existing]
+    print(f"  {len(need_profiling)} shards need profiling "
+          f"({len(existing)} already done)")
 
     if not need_profiling:
         print("All shards already profiled.")

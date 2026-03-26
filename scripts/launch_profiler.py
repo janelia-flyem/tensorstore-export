@@ -84,6 +84,17 @@ def main():
         env_file.write(f"{k}: '{v}'\n")
     env_file.close()
 
+    # Pick CPU based on memory (Cloud Run coupling constraints)
+    mem_gib = int(args.memory.replace("Gi", ""))
+    if mem_gib <= 8:
+        cpu = 2
+    elif mem_gib <= 16:
+        cpu = 4
+    elif mem_gib <= 24:
+        cpu = 6
+    else:
+        cpu = 8
+
     # Override the entrypoint to run profile_shards.py instead of main.py
     cmd = [
         "gcloud", "run", "jobs", "create", job_name,
@@ -95,7 +106,7 @@ def main():
         "--max-retries=1",
         "--task-timeout=3600s",
         f"--memory={args.memory}",
-        "--cpu=2",
+        f"--cpu={cpu}",
         f"--env-vars-file={env_file.name}",
         "--execution-environment=gen2",
         "--command=python",
@@ -106,7 +117,7 @@ def main():
     print(f"  Image: {image}")
     print(f"  Region: {region}")
     print(f"  Tasks: {args.tasks}, workers/task: {args.workers}")
-    print(f"  Memory: {args.memory}, CPU: 2")
+    print(f"  Memory: {args.memory}, CPU: {cpu}")
     print(f"  Source: {args.source}")
     print(f"  Output: {args.output}")
     print(f"  Scales: {args.scales}")
