@@ -190,13 +190,22 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 
 ## GCS Bucket Setup
 
-Use a **single-region** GCS bucket in the same region as your Cloud Run tasks for both source shards and destination output. This avoids cross-region replication charges that can be catastrophic at scale (see the [$63K incident post-mortem](docs/mCNS-ExportAnalysis.md#8-post-mortem-excessive-gcs-replication-charges-march-2023)).
+Use **single-region** GCS buckets in the same region as your Cloud Run tasks. This avoids cross-region replication charges that can be catastrophic at scale (see the [$63K incident post-mortem](docs/mCNS-ExportAnalysis.md#8-post-mortem-excessive-gcs-replication-charges-march-2023)).
 
 ```bash
-gcloud storage buckets create gs://my-export-bucket \
+# Source bucket (for DVID export-shards output)
+gcloud storage buckets create gs://myproject-export-shards \
+  --location=us-east4 \
+  --default-storage-class=STANDARD \
+  --uniform-bucket-level-access
+
+# Destination bucket (for neuroglancer precomputed output)
+# deploy auto-creates this if it doesn't exist
+gcloud storage buckets create gs://myproject-precomputed \
   --location=us-east4 \
   --default-storage-class=STANDARD \
   --uniform-bucket-level-access \
+  --enable-hierarchical-namespace \
   --no-soft-delete
 ```
 
@@ -207,13 +216,19 @@ gcloud storage buckets create gs://my-export-bucket \
 | Location type | Single-region | Cloud Run distributes tasks across zones randomly. Single-region gives consistent performance with no inter-zone costs. Multi-region incurs $0.02/GiB replication on every write. |
 | Soft delete | Disabled | TensorStore's batched write pattern creates intermediate shard versions. Soft delete retains all of them, potentially generating petabytes of retained data. `pixi run deploy` auto-disables this if detected. |
 | Uniform access | Enabled | Simplifies IAM; no per-object ACLs needed. |
+| Hierarchical namespace | Enabled (dest) | Improves throughput for the thousands of parallel shard file uploads to the destination bucket. Not needed for the source bucket since DVID writes shards sequentially. Must be set at bucket creation time. |
 
 **Why not zonal?** Zonal buckets offer higher peak throughput for same-zone access, but Cloud Run tasks can land in any zone within the region. A zonal bucket in `us-east4-c` would incur inter-zone transfer costs (~$0.01/GiB) when tasks land in other zones. For this pipeline's CPU-bound workload (decompression + label mapping), the GCS I/O difference is negligible.
 
-**Separation of concerns:**
+**Recommended bucket layout:**
 
-- **Export bucket** (this pipeline): Single-region, soft delete off, optimized for write throughput. Holds both DVID source shards and neuroglancer output.
-- **Distribution bucket** (optional, outside this pipeline): Multi-region, soft delete on. Copy finished volumes here for team/public access via `gcloud storage cp -r`.
+| Bucket | Purpose | Settings |
+|--------|---------|----------|
+| Source (e.g., `myproject-export-shards`) | DVID Arrow+CSV shard files | Single-region, same as `REGION` |
+| Destination (e.g., `myproject-precomputed`) | Neuroglancer precomputed output | Single-region, same as `REGION`, HNS on, soft delete off |
+| Distribution (optional) | Public/team access to finished volumes | Multi-region, soft delete on |
+
+Use **separate buckets for source and destination** to isolate read and write workloads — this avoids throughput contention on a single bucket during large exports with thousands of parallel workers. Both must be in the same region as Cloud Run to avoid egress charges. Copy finished volumes to a distribution bucket afterward via `gcloud storage cp -r`.
 
 `pixi run deploy` validates the destination bucket at deploy time: creates it if missing, warns on region mismatches, and auto-disables soft delete.
 

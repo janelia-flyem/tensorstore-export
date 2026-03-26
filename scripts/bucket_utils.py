@@ -49,6 +49,7 @@ def create_bucket(bucket_name: str, location: str) -> bool:
     - Single-region in the specified location
     - Standard storage class
     - Uniform bucket-level access
+    - Hierarchical namespace enabled
     - Soft delete disabled
 
     Returns True on success, False on failure (prints error).
@@ -58,6 +59,7 @@ def create_bucket(bucket_name: str, location: str) -> bool:
     bucket.location = location
     bucket.storage_class = "STANDARD"
     bucket.iam_configuration.uniform_bucket_level_access_enabled = True
+    bucket.hierarchical_namespace_enabled = True
 
     try:
         client.create_bucket(bucket)
@@ -104,6 +106,51 @@ def disable_soft_delete(bucket_name: str) -> int:
             )
 
     return old_retention
+
+
+def check_write_permission(bucket_name: str, prefix: str = "") -> bool:
+    """Test that the default service account can write to the bucket.
+
+    Writes a small test object and deletes it.  Returns True if
+    successful, False on permission error (prints the error).
+    """
+    client = storage.Client()
+    test_path = f"{prefix}/.deploy-permission-check".lstrip("/")
+    blob = client.bucket(bucket_name).blob(test_path)
+    try:
+        blob.upload_from_string(b"permission check", content_type="text/plain")
+        blob.delete()
+        return True
+    except gcs_exceptions.Forbidden:
+        print(f"  Error: write permission denied on 'gs://{bucket_name}/{test_path}'")
+        print("  The Cloud Run service account needs storage.objects.create access.")
+        print("  Grant it with:")
+        print(f"    gcloud storage buckets add-iam-policy-binding gs://{bucket_name} \\")
+        print("      --member='serviceAccount:<SERVICE_ACCOUNT>' \\")
+        print("      --role='roles/storage.objectAdmin'")
+        return False
+
+
+def check_read_permission(bucket_name: str, prefix: str = "") -> bool:
+    """Test that the default service account can read from the bucket.
+
+    Lists objects under the prefix.  Returns True if successful,
+    False on permission error (prints the error).
+    """
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    try:
+        # Just try to list one object — this tests storage.objects.list
+        next(iter(bucket.list_blobs(prefix=prefix, max_results=1)), None)
+        return True
+    except gcs_exceptions.Forbidden:
+        print(f"  Error: read permission denied on 'gs://{bucket_name}/{prefix}'")
+        print("  The Cloud Run service account needs storage.objects.get access.")
+        print("  Grant it with:")
+        print(f"    gcloud storage buckets add-iam-policy-binding gs://{bucket_name} \\")
+        print("      --member='serviceAccount:<SERVICE_ACCOUNT>' \\")
+        print("      --role='roles/storage.objectViewer'")
+        return False
 
 
 def validate_bucket_region(bucket_info: dict, compute_region: str,

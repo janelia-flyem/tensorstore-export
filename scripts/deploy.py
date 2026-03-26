@@ -193,9 +193,11 @@ def validate_and_configure_buckets(env: dict):
 
     Called after the user confirms settings, before writing the info file.
     """
+    import sys as _sys
+    _sys.path.insert(0, str(PROJECT_ROOT))
     from scripts.bucket_utils import (
         get_bucket_info, create_bucket, disable_soft_delete,
-        validate_bucket_region,
+        validate_bucket_region, check_write_permission, check_read_permission,
     )
 
     region = env.get("REGION", "us-central1")
@@ -210,41 +212,84 @@ def validate_and_configure_buckets(env: dict):
     if source_uri:
         source_bucket, _ = _parse_gs_uri(source_uri)
 
-    # --- Destination bucket ---
     print("\n--- Bucket Validation ---")
-    info = get_bucket_info(dest_bucket)
 
-    if info is None:
-        # Bucket doesn't exist — create it
+    # --- Source bucket (check first to inform dest bucket creation) ---
+    src_info = None
+    src_region = None  # resolved single-region location, if available
+    if source_bucket and source_bucket != dest_bucket:
+        src_info = get_bucket_info(source_bucket)
+        if src_info and "error" not in src_info:
+            src_loc = src_info["location"]
+            src_type = src_info.get("location_type", "region")
+            if src_type.lower() in ("multi-region", "dual-region"):
+                print(f"  Source bucket '{source_bucket}': {src_type} "
+                      f"({src_loc.lower()}) — read-only, no action needed")
+            else:
+                src_region = src_loc.upper()
+                if src_region != region.upper():
+                    print(f"  Warning: source bucket '{source_bucket}' is in "
+                          f"{src_loc.lower()}, but REGION is {region}. "
+                          f"Cross-region reads will incur egress charges. "
+                          f"Consider setting REGION={src_loc.lower()}.")
+                else:
+                    print(f"  Source bucket '{source_bucket}': "
+                          f"{src_loc.lower()} (matches REGION)")
+
+    # --- Destination bucket ---
+    dest_info = get_bucket_info(dest_bucket)
+
+    if dest_info is None:
+        # Bucket doesn't exist — create it in the same region as source
+        # (if available and single-region), otherwise use REGION.
+        create_region = region
+        if src_region and src_region != region.upper():
+            print(f"  Note: creating dest bucket in {src_region.lower()} "
+                  f"to match source bucket (overrides REGION={region}).")
+            create_region = src_region.lower()
+        elif src_region:
+            create_region = src_region.lower()
+
         print(f"  Destination bucket '{dest_bucket}' does not exist.")
-        print(f"  Creating single-region bucket in {region}...")
-        if create_bucket(dest_bucket, region):
-            print(f"  Created '{dest_bucket}' (single-region {region}, "
-                  f"standard storage, soft delete disabled)")
+        print(f"  Creating single-region bucket in {create_region}...")
+        if create_bucket(dest_bucket, create_region):
+            print(f"  Created '{dest_bucket}' (single-region {create_region}, "
+                  f"HNS enabled, soft delete disabled)")
         else:
             print("  Could not create bucket. Create it manually:")
             print(f"    gcloud storage buckets create gs://{dest_bucket} "
-                  f"--location={region} --no-soft-delete")
+                  f"--location={create_region} --no-soft-delete "
+                  f"--enable-hierarchical-namespace")
         return
 
-    if "error" in info:
+    if "error" in dest_info:
         print(f"  Warning: could not read metadata for '{dest_bucket}' "
               f"(permission denied). Skipping bucket validation.")
         return
 
-    # Region check
-    warnings = validate_bucket_region(info, region, dest_bucket)
+    # Region check — dest vs Cloud Run REGION
+    warnings = validate_bucket_region(dest_info, region, dest_bucket)
     if warnings:
         for w in warnings:
             print(f"  Warning: {w}")
     else:
-        loc = info['location']
-        loc_type = info.get('location_type', 'region')
-        print(f"  Bucket '{dest_bucket}': {loc_type} {loc.lower()} "
+        loc = dest_info['location']
+        loc_type = dest_info.get('location_type', 'region')
+        print(f"  Dest bucket '{dest_bucket}': {loc_type} {loc.lower()} "
               f"(matches Cloud Run region {region})")
 
+    # Region check — dest vs source
+    dest_loc = dest_info["location"].upper()
+    dest_type = dest_info.get("location_type", "region").lower()
+    if (src_region and dest_type == "region"
+            and dest_loc != src_region):
+        print(f"  Warning: dest bucket '{dest_bucket}' is in "
+              f"{dest_loc.lower()} but source bucket '{source_bucket}' "
+              f"is in {src_region.lower()}. Cross-region transfer between "
+              f"source and dest will incur egress charges.")
+
     # Soft delete
-    retention = info["soft_delete_retention_seconds"]
+    retention = dest_info["soft_delete_retention_seconds"]
     if retention > 0:
         try:
             old = disable_soft_delete(dest_bucket)
@@ -257,19 +302,23 @@ def validate_and_configure_buckets(env: dict):
     else:
         print("  Soft delete: disabled")
 
-    # --- Source bucket (informational only, if different) ---
+    # --- Permission checks ---
+    _, dest_prefix = _parse_gs_uri(dest_uri)
+    if not check_write_permission(dest_bucket, dest_prefix):
+        print("\n  \033[1mDeploy aborted\033[0m: cannot write to destination bucket.")
+        print("  Fix permissions before running export — otherwise Cloud Run tasks")
+        print("  will burn CPU/memory for hours before failing at upload.")
+        sys.exit(1)
+    else:
+        print("  Dest write permission: ok")
+
     if source_bucket and source_bucket != dest_bucket:
-        src_info = get_bucket_info(source_bucket)
-        if src_info and "error" not in src_info:
-            src_loc = src_info["location"]
-            src_type = src_info.get("location_type", "region")
-            if src_type.lower() in ("multi-region", "dual-region"):
-                print(f"  Source bucket '{source_bucket}': {src_type} "
-                      f"({src_loc.lower()}) — read-only, no action needed")
-            elif src_loc.upper() != region.upper():
-                print(f"  Note: source bucket '{source_bucket}' is in "
-                      f"{src_loc.lower()}, Cloud Run in {region}. "
-                      f"Cross-region reads may incur egress charges.")
+        _, src_prefix = _parse_gs_uri(source_uri)
+        if not check_read_permission(source_bucket, src_prefix):
+            print("\n  \033[1mWarning\033[0m: cannot read from source bucket.")
+            print("  Cloud Run tasks will fail to download Arrow shard files.")
+        else:
+            print("  Source read permission: ok")
 
 
 def setup_destination_info(dest_uri: str, ng_spec: dict):
