@@ -182,6 +182,96 @@ def _parse_gs_uri(uri: str):
     return bucket, path.rstrip("/")
 
 
+def validate_and_configure_buckets(env: dict):
+    """Validate and configure GCS buckets for export.
+
+    Checks destination (and optionally source) bucket settings:
+    - Creates the destination bucket if it doesn't exist (single-region,
+      matching REGION, soft delete disabled)
+    - Warns if bucket is multi-region or in a mismatched region
+    - Auto-disables soft delete if enabled
+
+    Called after the user confirms settings, before writing the info file.
+    """
+    from scripts.bucket_utils import (
+        get_bucket_info, create_bucket, disable_soft_delete,
+        validate_bucket_region,
+    )
+
+    region = env.get("REGION", "us-central1")
+    dest_uri = env.get("DEST_PATH", "")
+    source_uri = env.get("SOURCE_PATH", "")
+
+    if not dest_uri:
+        return
+
+    dest_bucket, _ = _parse_gs_uri(dest_uri)
+    source_bucket = None
+    if source_uri:
+        source_bucket, _ = _parse_gs_uri(source_uri)
+
+    # --- Destination bucket ---
+    print("\n--- Bucket Validation ---")
+    info = get_bucket_info(dest_bucket)
+
+    if info is None:
+        # Bucket doesn't exist — create it
+        print(f"  Destination bucket '{dest_bucket}' does not exist.")
+        print(f"  Creating single-region bucket in {region}...")
+        if create_bucket(dest_bucket, region):
+            print(f"  Created '{dest_bucket}' (single-region {region}, "
+                  f"standard storage, soft delete disabled)")
+        else:
+            print("  Could not create bucket. Create it manually:")
+            print(f"    gcloud storage buckets create gs://{dest_bucket} "
+                  f"--location={region} --no-soft-delete")
+        return
+
+    if "error" in info:
+        print(f"  Warning: could not read metadata for '{dest_bucket}' "
+              f"(permission denied). Skipping bucket validation.")
+        return
+
+    # Region check
+    warnings = validate_bucket_region(info, region, dest_bucket)
+    if warnings:
+        for w in warnings:
+            print(f"  Warning: {w}")
+    else:
+        loc = info['location']
+        loc_type = info.get('location_type', 'region')
+        print(f"  Bucket '{dest_bucket}': {loc_type} {loc.lower()} "
+              f"(matches Cloud Run region {region})")
+
+    # Soft delete
+    retention = info["soft_delete_retention_seconds"]
+    if retention > 0:
+        try:
+            old = disable_soft_delete(dest_bucket)
+            days = old // 86400
+            print(f"  \033[1mSoft delete disabled\033[0m on '{dest_bucket}' "
+                  f"(was {days}-day retention). "
+                  f"Export buckets should not use soft delete.")
+        except PermissionError as e:
+            print(f"  Warning: {e}")
+    else:
+        print("  Soft delete: disabled")
+
+    # --- Source bucket (informational only, if different) ---
+    if source_bucket and source_bucket != dest_bucket:
+        src_info = get_bucket_info(source_bucket)
+        if src_info and "error" not in src_info:
+            src_loc = src_info["location"]
+            src_type = src_info.get("location_type", "region")
+            if src_type.lower() in ("multi-region", "dual-region"):
+                print(f"  Source bucket '{source_bucket}': {src_type} "
+                      f"({src_loc.lower()}) — read-only, no action needed")
+            elif src_loc.upper() != region.upper():
+                print(f"  Note: source bucket '{source_bucket}' is in "
+                      f"{src_loc.lower()}, Cloud Run in {region}. "
+                      f"Cross-region reads may incur egress charges.")
+
+
 def setup_destination_info(dest_uri: str, ng_spec: dict):
     """Write the neuroglancer info file to GCS if it doesn't already exist."""
     import copy
@@ -290,6 +380,10 @@ def main():
         if save_answer != "n":
             save_env(ENV_FILE, final)
             print(f"  Saved to {ENV_FILE}")
+
+    # Validate and configure GCS buckets (creates dest bucket if needed,
+    # disables soft delete, warns about region mismatches).
+    validate_and_configure_buckets(final)
 
     # Setup destination info file
     setup_destination_info(final["DEST_PATH"], ng_spec)

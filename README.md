@@ -33,7 +33,7 @@ pixi run test-all       # 66 tests
 
 ### Deploy
 
-Run `pixi run deploy` to be guided through all required configuration. It prompts for GCS paths, reads the neuroglancer volume spec JSON, writes the destination `info` file (with `compressed_segmentation` encoding), builds the Docker image, and creates the Cloud Run jobs per memory tier.
+Run `pixi run deploy` to be guided through all required configuration. It prompts for GCS paths, reads the neuroglancer volume spec JSON, validates bucket settings (creating the destination bucket if needed — see [GCS Bucket Setup](#gcs-bucket-setup)), writes the destination `info` file, and builds the Docker image.
 
 ```bash
 pixi run deploy
@@ -188,6 +188,35 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 | `BASE_JOB_NAME` | Cloud Run job name prefix (tier jobs: `{name}-tier-4gi`, ...) | `tensorstore-dvid-export` |
 | `SCALES` | Scales to process (comma-separated) | `0,1,2,3,4,5,6,7,8,9` |
 
+## GCS Bucket Setup
+
+Use a **single-region** GCS bucket in the same region as your Cloud Run tasks for both source shards and destination output. This avoids cross-region replication charges that can be catastrophic at scale (see the [$63K incident post-mortem](docs/mCNS-ExportAnalysis.md#8-post-mortem-excessive-gcs-replication-charges-march-2023)).
+
+```bash
+gcloud storage buckets create gs://my-export-bucket \
+  --location=us-east4 \
+  --default-storage-class=STANDARD \
+  --uniform-bucket-level-access \
+  --no-soft-delete
+```
+
+**Key settings:**
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Location type | Single-region | Cloud Run distributes tasks across zones randomly. Single-region gives consistent performance with no inter-zone costs. Multi-region incurs $0.02/GiB replication on every write. |
+| Soft delete | Disabled | TensorStore's batched write pattern creates intermediate shard versions. Soft delete retains all of them, potentially generating petabytes of retained data. `pixi run deploy` auto-disables this if detected. |
+| Uniform access | Enabled | Simplifies IAM; no per-object ACLs needed. |
+
+**Why not zonal?** Zonal buckets offer higher peak throughput for same-zone access, but Cloud Run tasks can land in any zone within the region. A zonal bucket in `us-east4-c` would incur inter-zone transfer costs (~$0.01/GiB) when tasks land in other zones. For this pipeline's CPU-bound workload (decompression + label mapping), the GCS I/O difference is negligible.
+
+**Separation of concerns:**
+
+- **Export bucket** (this pipeline): Single-region, soft delete off, optimized for write throughput. Holds both DVID source shards and neuroglancer output.
+- **Distribution bucket** (optional, outside this pipeline): Multi-region, soft delete on. Copy finished volumes here for team/public access via `gcloud storage cp -r`.
+
+`pixi run deploy` validates the destination bucket at deploy time: creates it if missing, warns on region mismatches, and auto-disables soft delete.
+
 ## Architecture
 
 ```
@@ -227,7 +256,8 @@ tensorstore-export/
 │   ├── export_status.py            # Job status, memory, progress tracking
 │   ├── export_errors.py            # Query error logs
 │   ├── find_failed_shards.py       # Identify failed shards for retry
-│   └── compute_offsets.py          # Pre-compute Arrow byte offsets for range reads
+│   ├── compute_offsets.py          # Pre-compute Arrow byte offsets for range reads
+│   └── bucket_utils.py            # GCS bucket validation and configuration
 ├── src/
 │   ├── worker.py                   # Cloud Run worker
 │   └── tensorstore_adapter.py      # TensorStore helpers
