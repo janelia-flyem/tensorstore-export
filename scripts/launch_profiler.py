@@ -44,8 +44,8 @@ def main():
         help="Number of Cloud Run tasks (default: 100)",
     )
     parser.add_argument(
-        "--workers", type=int, default=32,
-        help="Threads per task (default: 32)",
+        "--workers", type=int, default=4,
+        help="Threads per task (default: 4)",
     )
     parser.add_argument(
         "--memory", default="8Gi",

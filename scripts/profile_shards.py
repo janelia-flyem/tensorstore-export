@@ -322,10 +322,24 @@ def main():
         if args.skip_check:
             print("  Skipping existence check (--skip-check)")
     else:
-        print("Checking for existing -labels.csv files...")
+        # List existing label CSVs in bulk (one list_blobs per scale)
+        # instead of one exists() call per shard (26K API calls).
+        print("Scanning for existing -labels.csv files...")
+        existing = set()
+        for scale in scales:
+            prefix = f"{output_path}/s{scale}/"
+            if prefix.startswith("gs://"):
+                bucket_name, blob_prefix = _parse_gs(prefix)
+                for blob in _get_gcs_client().bucket(bucket_name).list_blobs(
+                        prefix=blob_prefix):
+                    if blob.name.endswith("-labels.csv"):
+                        name = blob.name.split("/")[-1].replace("-labels.csv", "")
+                        existing.add((scale, name))
+            else:
+                for f in Path(prefix).glob("*-labels.csv"):
+                    existing.add((scale, f.stem.replace("-labels", "")))
         for scale, name in all_shards:
-            csv_path = f"{output_path}/s{scale}/{name}-labels.csv"
-            if not _exists(csv_path):
+            if (scale, name) not in existing:
                 need_profiling.append((scale, name))
         print(f"  {len(need_profiling)} shards need profiling "
               f"({len(all_shards) - len(need_profiling)} already done)")
