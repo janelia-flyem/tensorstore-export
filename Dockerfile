@@ -38,6 +38,7 @@ RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip \
 
 # Copy application code
 COPY src/ src/
+COPY scripts/ scripts/
 COPY main.py .
 
 # Create staging mount point for local-disk shard writes
