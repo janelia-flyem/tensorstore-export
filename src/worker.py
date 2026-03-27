@@ -330,7 +330,8 @@ class ShardProcessor:
                           written=written_size, path=info_path)
         return staging_dir
 
-    def _upload_shard_files(self, staging_dir: str) -> int:
+    def _upload_shard_files(self, staging_dir: str,
+                            scale: int = -1, shard_name: str = "") -> int:
         """Upload shard files from local staging to the GCS destination.
 
         Walks the staging directory and uploads every file except 'info',
@@ -341,12 +342,15 @@ class ShardProcessor:
         Returns the number of bytes uploaded.
         """
         uploaded_bytes = 0
+        all_files = []
         for root, _dirs, files in os.walk(staging_dir):
             for fn in files:
-                if fn == "info":
-                    continue
                 local_path = os.path.join(root, fn)
                 rel_path = os.path.relpath(local_path, staging_dir)
+                size = os.path.getsize(local_path)
+                all_files.append((rel_path, size))
+                if fn == "info":
+                    continue
                 blob_path = f"{self._dest_prefix}/{rel_path}"
                 blob = self.dest_bucket_obj.blob(blob_path)
                 # Use resumable upload with 8MB chunks to avoid loading
@@ -354,8 +358,36 @@ class ShardProcessor:
                 # buffers the whole file, which OOMs for large shards.
                 blob.chunk_size = 8 * (1 << 20)  # 8 MiB
                 blob.upload_from_filename(local_path)
-                uploaded_bytes += os.path.getsize(local_path)
+                uploaded_bytes += size
+
+        # Diagnostic: log staging contents when no shard files were produced.
+        shard_files = [(f, s) for f, s in all_files if not f.endswith("/info") and f != "info"]
+        if not shard_files:
+            logger.warning("No shard files in staging directory",
+                           scale=scale, shard=shard_name,
+                           staging_dir=staging_dir,
+                           all_files=[(f, s) for f, s in all_files])
+
         return uploaded_bytes
+
+    @staticmethod
+    def _list_staging(staging_dir: str, label: str):
+        """Log all files in the staging directory for debugging."""
+        entries = []
+        for root, dirs, files in os.walk(staging_dir):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                rel = os.path.relpath(fp, staging_dir)
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    sz = -1
+                entries.append(f"{rel}:{sz}")
+        logger.info("DEBUG staging listing",
+                     label=label,
+                     staging_dir=staging_dir,
+                     files=entries,
+                     pid=os.getpid())
 
     def process_shard(self, scale: int, shard_name: str) -> bool:
         """Process a single shard: read from GCS, write to local disk, upload.
@@ -389,12 +421,43 @@ class ShardProcessor:
 
             # Create local staging volume with info file
             staging_dir = self._create_local_volume(scale, shard_name)
+
+            # DEBUG: verify info file
+            info_path = os.path.join(staging_dir, "info")
+            info_size = os.path.getsize(info_path)
+            with open(info_path) as _f:
+                info_head = _f.read(200)
+            import json as _json
+            try:
+                _json.loads(open(info_path).read())
+                info_valid = True
+            except Exception:
+                info_valid = False
+            logger.info("DEBUG info file",
+                         scale=scale, shard=shard_name,
+                         info_size=info_size,
+                         info_valid=info_valid,
+                         info_head=info_head[:100],
+                         staging_dir=staging_dir,
+                         pid=os.getpid())
+
+            self._list_staging(staging_dir, "after info write")
+
             dest = ts.open({
                 "driver": "neuroglancer_precomputed",
                 "kvstore": {"driver": "file", "path": staging_dir},
                 "scale_index": scale,
                 "open": True,
             }).result()
+
+            # DEBUG: log resolved TensorStore spec
+            resolved_spec = dest.spec(retain_context=True).to_json()
+            logger.info("DEBUG tensorstore opened",
+                         scale=scale, shard=shard_name,
+                         kvstore_path=resolved_spec.get("kvstore", {}).get("path", "?"),
+                         shape=list(dest.shape),
+                         dtype=str(dest.dtype),
+                         fill_value=str(dest.fill_value))
 
             # Per-shard bounds check: scan available_chunks once to detect
             # shards that extend beyond the volume.  Diagnostic only (warn).
@@ -406,7 +469,7 @@ class ShardProcessor:
                     if v > max_voxel[d]:
                         max_voxel[d] = v
             if any(mv > vs for mv, vs in zip(max_voxel, vol_shape)):
-                logger.warning("Shard extends beyond volume",
+                logger.info("Shard extends beyond volume",
                                scale=scale, shard=shard_name,
                                shard_max_voxel=tuple(max_voxel),
                                volume_shape=vol_shape)
@@ -457,6 +520,17 @@ class ShardProcessor:
                                            volume_shape=tuple(dest.shape[:3]))
                         continue
                     clipped = transposed[:x1 - x0, :y1 - y0, :z1 - z0]
+                    import numpy as _np
+                    logger.info("DEBUG chunk write",
+                                 scale=scale, shard=shard_name,
+                                 chunk_x=cx, chunk_y=cy, chunk_z=cz,
+                                 voxel_range=f"[{x0}:{x1},{y0}:{y1},{z0}:{z1}]",
+                                 shape=list(clipped.shape),
+                                 nonzero=int(_np.count_nonzero(clipped)),
+                                 dtype=str(clipped.dtype),
+                                 min_val=int(clipped.min()),
+                                 max_val=int(clipped.max()),
+                                 txn_id=id(txn))
                     dest.with_transaction(txn)[x0:x1, y0:y1, z0:z1, 0].write(
                         clipped
                     ).result()
@@ -474,12 +548,18 @@ class ShardProcessor:
                 # Commit batch to local disk — sample memory before and after
                 # commit to bracket the RMW peak (old + new shard coexist).
                 if batch_chunks >= BATCH_SIZE:
+                    self._list_staging(staging_dir, f"BEFORE batch commit #{batches_committed}")
+                    logger.info("DEBUG committing batch",
+                                 scale=scale, shard=shard_name,
+                                 batch_chunks=batch_chunks,
+                                 txn_id=id(txn))
                     mem_current, _, _ = _read_cgroup_memory()
                     shard_peak_mem = max(shard_peak_mem, mem_current)
                     txn.commit_async().result()
                     batches_committed += 1
                     mem_current, _, _ = _read_cgroup_memory()
                     shard_peak_mem = max(shard_peak_mem, mem_current)
+                    self._list_staging(staging_dir, f"AFTER batch commit #{batches_committed-1}")
                     txn = ts.Transaction()
                     batch_chunks = 0
 
@@ -503,12 +583,24 @@ class ShardProcessor:
 
             # Commit remaining chunks
             if batch_chunks > 0:
+                self._list_staging(staging_dir, "BEFORE final commit")
+                logger.info("DEBUG committing final batch",
+                             scale=scale, shard=shard_name,
+                             batch_chunks=batch_chunks,
+                             chunks_written=chunks_written,
+                             txn_id=id(txn))
                 mem_current, _, _ = _read_cgroup_memory()
                 shard_peak_mem = max(shard_peak_mem, mem_current)
                 txn.commit_async().result()
                 batches_committed += 1
                 mem_current, _, _ = _read_cgroup_memory()
                 shard_peak_mem = max(shard_peak_mem, mem_current)
+                self._list_staging(staging_dir, "AFTER final commit")
+            else:
+                logger.info("DEBUG no final commit needed",
+                             scale=scale, shard=shard_name,
+                             batch_chunks=batch_chunks,
+                             chunks_written=chunks_written)
 
             # Fail if no chunks were written (all outside bounds or all failed)
             if chunks_written == 0:
@@ -519,9 +611,18 @@ class ShardProcessor:
                              chunks_failed=chunks_failed)
                 return False
 
+            # Release the TensorStore handle before scanning for output
+            # files.  This ensures any deferred writes (cache writeback,
+            # sharded format finalization) are flushed to the filesystem.
+            self._list_staging(staging_dir, "BEFORE del dest")
+            del dest
+            import gc as _gc
+            _gc.collect()
+            self._list_staging(staging_dir, "AFTER del dest + gc")
+
             # Upload finished shard file(s) to GCS
             upload_start = time.time()
-            uploaded_bytes = self._upload_shard_files(staging_dir)
+            uploaded_bytes = self._upload_shard_files(staging_dir, scale, shard_name)
             upload_elapsed = time.time() - upload_start
 
             elapsed = time.time() - shard_start_time

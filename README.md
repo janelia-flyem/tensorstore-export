@@ -81,25 +81,27 @@ pixi run export
 ```
 Scanning Arrow files across 10 scales...
   Found 26125 Arrow files
-  Memory formula: (arrow + 1.3 * shard_on_tmpfs + 1.5) * 1.3
+  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB
 
 Tier assignments:
-  4Gi (cpu=2): 5169 shards, 5000 tasks, total=41.5GB, max_arrow=629MB
-  8Gi (cpu=2): 4027 shards, 4027 tasks, total=234.6GB, max_arrow=1997MB
-  16Gi (cpu=4): 16717 shards, 5000 tasks, total=4121.0GB, max_arrow=3402MB
-  24Gi (cpu=6): 196 shards, 100 tasks, total=275.4GB, max_arrow=6634MB
-  32Gi (cpu=8): 16 shards, 16 tasks, total=58.2GB, max_arrow=6647MB
+  4Gi (cpu=2): 23204 shards, 5000 tasks, total=3034.4GB, max_arrow=629MB
+  8Gi (cpu=2): 2756 shards, 2756 tasks, total=1400.3GB, max_arrow=3133MB
+  16Gi (cpu=4): 162 shards, 162 tasks, total=278.8GB, max_arrow=6634MB
+  24Gi (cpu=6): 3 shards, 3 tasks, total=17.3GB, max_arrow=6647MB
 
-Writing per-task manifests...
-  4Gi: 5000 task manifests → gs://mybucket/exports/seg/manifests/tier-4gi/
-  8Gi: 4027 task manifests → gs://mybucket/exports/seg/manifests/tier-8gi/
+Writing 7921 task manifests to GCS...
+  500/7921 manifests written
   ...
+  4Gi: 5000 tasks → gs://.../manifests/tier-4gi/
+  8Gi: 2756 tasks → gs://.../manifests/tier-8gi/
+  16Gi: 162 tasks → gs://.../manifests/tier-16gi/
+  24Gi: 3 tasks → gs://.../manifests/tier-24gi/
 
-Launching 5 tier job(s)...
-  export-tier-4gi: launched (5000 tasks, 4Gi, cpu=2)
-  export-tier-8gi: launched (4027 tasks, 8Gi, cpu=2)
-  export-tier-16gi: launched (5000 tasks, 16Gi, cpu=4)
-  ...
+Launching 4 tier job(s)...
+  tensorstore-dvid-export-tier-4gi: launched (5000 tasks, 4Gi, cpu=2)
+  tensorstore-dvid-export-tier-8gi: launched (2756 tasks, 8Gi, cpu=2)
+  tensorstore-dvid-export-tier-16gi: launched (162 tasks, 16Gi, cpu=4)
+  tensorstore-dvid-export-tier-24gi: launched (3 tasks, 24Gi, cpu=6)
 ```
 
 Each task reads only its own small manifest file
@@ -135,6 +137,33 @@ structured events. It shows per-tier shard/chunk completion, memory usage,
 timing stats, and in-flight shard progress. If `summary.json` exists (written
 by `precompute-manifest`), it also shows a grand progress bar with total
 chunks written vs expected.
+
+**Note:** Cloud Run can take 15-30 minutes to reconcile task statuses after
+containers exit. Tasks may show as "running" in `export-status` even though
+the containers have already exited with code 0. This is a platform-side delay
+— no billing occurs after container exit. Use `pixi run verify-export` to
+confirm output completeness independently of task status.
+
+### Post-Export Verification
+
+Verify that every DVID source shard produced an NG output shard on GCS:
+
+```bash
+pixi run verify-export                    # all scales
+pixi run verify-export -- --scales 0,1,2  # specific scales
+pixi run verify-export -- --json-report report.json
+```
+
+This compares DVID Arrow files against actual `.shard` files on GCS using the
+compressed Z-index mapping — no dependency on Cloud Logging.
+
+To validate the DVID export itself before running the pipeline (checks that
+all chunks in each DVID shard map to the same NG shard number):
+
+```bash
+pixi run validate-dvid
+pixi run validate-dvid -- --scales 0 --sample 100
+```
 
 ### Retry workflow
 
