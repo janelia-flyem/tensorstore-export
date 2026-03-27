@@ -520,17 +520,20 @@ class ShardProcessor:
                                            volume_shape=tuple(dest.shape[:3]))
                         continue
                     clipped = transposed[:x1 - x0, :y1 - y0, :z1 - z0]
-                    import numpy as _np
-                    logger.info("DEBUG chunk write",
-                                 scale=scale, shard=shard_name,
-                                 chunk_x=cx, chunk_y=cy, chunk_z=cz,
-                                 voxel_range=f"[{x0}:{x1},{y0}:{y1},{z0}:{z1}]",
-                                 shape=list(clipped.shape),
-                                 nonzero=int(_np.count_nonzero(clipped)),
-                                 dtype=str(clipped.dtype),
-                                 min_val=int(clipped.min()),
-                                 max_val=int(clipped.max()),
-                                 txn_id=id(txn))
+                    # Per-chunk debug logging only for small shards
+                    # (avoids flooding logs for 30K+ chunk shards)
+                    if reader.chunk_count <= 200:
+                        import numpy as _np
+                        logger.info("DEBUG chunk write",
+                                     scale=scale, shard=shard_name,
+                                     chunk_x=cx, chunk_y=cy, chunk_z=cz,
+                                     voxel_range=f"[{x0}:{x1},{y0}:{y1},{z0}:{z1}]",
+                                     shape=list(clipped.shape),
+                                     nonzero=int(_np.count_nonzero(clipped)),
+                                     dtype=str(clipped.dtype),
+                                     min_val=int(clipped.min()),
+                                     max_val=int(clipped.max()),
+                                     txn_id=id(txn))
                     dest.with_transaction(txn)[x0:x1, y0:y1, z0:z1, 0].write(
                         clipped
                     ).result()
@@ -548,7 +551,8 @@ class ShardProcessor:
                 # Commit batch to local disk — sample memory before and after
                 # commit to bracket the RMW peak (old + new shard coexist).
                 if batch_chunks >= BATCH_SIZE:
-                    self._list_staging(staging_dir, f"BEFORE batch commit #{batches_committed}")
+                    if reader.chunk_count <= 200:
+                        self._list_staging(staging_dir, f"BEFORE batch commit #{batches_committed}")
                     logger.info("DEBUG committing batch",
                                  scale=scale, shard=shard_name,
                                  batch_chunks=batch_chunks,
@@ -559,7 +563,8 @@ class ShardProcessor:
                     batches_committed += 1
                     mem_current, _, _ = _read_cgroup_memory()
                     shard_peak_mem = max(shard_peak_mem, mem_current)
-                    self._list_staging(staging_dir, f"AFTER batch commit #{batches_committed-1}")
+                    if reader.chunk_count <= 200:
+                        self._list_staging(staging_dir, f"AFTER batch commit #{batches_committed-1}")
                     txn = ts.Transaction()
                     batch_chunks = 0
 
