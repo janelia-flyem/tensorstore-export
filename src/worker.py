@@ -611,14 +611,7 @@ class ShardProcessor:
                              chunks_failed=chunks_failed)
                 return False
 
-            # Release the TensorStore handle before scanning for output
-            # files.  This ensures any deferred writes (cache writeback,
-            # sharded format finalization) are flushed to the filesystem.
-            self._list_staging(staging_dir, "BEFORE del dest")
-            del dest
-            import gc as _gc
-            _gc.collect()
-            self._list_staging(staging_dir, "AFTER del dest + gc")
+            self._list_staging(staging_dir, "BEFORE upload")
 
             # Upload finished shard file(s) to GCS
             upload_start = time.time()
@@ -653,14 +646,14 @@ class ShardProcessor:
                          kernel_peak_gib=round(kernel_peak_gib, 2),
                          memory_limit_gib=round(mem_limit_gib, 2),
                          chunks=chunks_written,
-                         uploaded_mib=round(uploaded_bytes / (1 << 20), 1))
+                         uploaded_bytes=uploaded_bytes)
 
             logger.info("Shard complete",
                          scale=scale,
                          shard=shard_name,
                          elapsed_s=round(elapsed, 1),
                          upload_s=round(upload_elapsed, 1),
-                         uploaded_mib=round(uploaded_bytes / (1 << 20), 1),
+                         uploaded_bytes=uploaded_bytes,
                          uncompressed_gib=round(shard_uncompressed_bytes / (1 << 30), 3),
                          peak_memory_gib=round(peak_gib, 2),
                          memory_limit_gib=round(mem_limit_gib, 2),
