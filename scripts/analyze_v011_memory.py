@@ -166,9 +166,13 @@ def read_label_csvs(labels_path, scale, shard_names):
         reader = csv.DictReader(io.StringIO(data))
         labels_list = []
         sv_list = []
+        unique_labels_list = []
         for row in reader:
             labels_list.append(int(row["num_labels"]))
             sv_list.append(int(row["num_supervoxels"]))
+            # unique_labels column added in profiler v2; fall back to num_labels
+            ul = row.get("unique_labels")
+            unique_labels_list.append(int(ul) if ul else int(row["num_labels"]))
         if not labels_list:
             return name, None
         n = len(labels_list)
@@ -180,6 +184,9 @@ def read_label_csvs(labels_path, scale, shard_names):
             "total_sv": sum(sv_list),
             "mean_sv": sum(sv_list) / n,
             "max_sv": max(sv_list),
+            "total_unique_labels": sum(unique_labels_list),
+            "mean_unique_labels": sum(unique_labels_list) / n,
+            "max_unique_labels": max(unique_labels_list),
         }
 
     result = {}
@@ -254,6 +261,9 @@ def process_scale(scale, source_path, labels_path, dest_path, scale_params):
             "total_sv": labels["total_sv"],
             "mean_sv": round(labels["mean_sv"], 1),
             "max_sv": labels["max_sv"],
+            "total_unique_labels": labels["total_unique_labels"],
+            "mean_unique_labels": round(labels["mean_unique_labels"], 1),
+            "max_unique_labels": labels["max_unique_labels"],
             "ng_output_bytes": ng_bytes,
         })
 
@@ -376,36 +386,49 @@ def analyze(rows):
         y = [r["ng_output_bytes"] for r in sr]
         sv = [r["total_sv"] for r in sr]
         lab = [r["total_labels"] for r in sr]
+        ul = [r["total_unique_labels"] for r in sr]
         ch = [r["chunk_count"] for r in sr]
 
         a_sv, r2_sv = _ls_1var(sv, y)
         a_lab, r2_lab = _ls_1var(lab, y)
-        a2, b2, r2_2 = _ls_2var(sv, ch, y)
+        a_ul, r2_ul = _ls_1var(ul, y)
+        a2, b2, r2_2 = _ls_2var(ul, ch, y)
 
-        # Relative prediction errors for the SV model
-        pred = [a_sv * xi for xi in sv]
+        # Relative prediction errors for the best single-var model
+        models = [("total_sv", a_sv, r2_sv, sv),
+                  ("total_unique_labels", a_ul, r2_ul, ul)]
+        best_name, best_a, best_r2, best_x = max(models, key=lambda m: m[2])
+        pred = [best_a * xi for xi in best_x]
         errs = sorted(abs(yi - pi) / yi for yi, pi in zip(y, pred) if yi > 0)
 
         print(f"\n  Scale {scale} ({n} shards):")
         print(f"    ng = {a_sv:.0f} * total_sv"
-              f"                   R²={r2_sv:.4f}")
-        print(f"    ng = {a_lab:.0f} * total_labels"
-              f"               R²={r2_lab:.4f}")
-        print(f"    ng = {a2:.0f} * total_sv + {b2:.0f} * chunks"
+              f"                        R²={r2_sv:.4f}")
+        print(f"    ng = {a_lab:.0f} * total_labels (list len)"
+              f"        R²={r2_lab:.4f}")
+        print(f"    ng = {a_ul:.0f} * total_unique_labels"
+              f"           R²={r2_ul:.4f}")
+        print(f"    ng = {a2:.0f} * total_unique_labels + {b2:.0f} * chunks"
               f"    R²={r2_2:.4f}")
         if errs:
-            print(f"    SV model error: "
+            print(f"    Best ({best_name}) error: "
                   f"p50={_percentile(errs, 50) * 100:.1f}%  "
                   f"p95={_percentile(errs, 95) * 100:.1f}%  "
                   f"max={errs[-1] * 100:.1f}%")
 
-        best_per_scale[scale] = {"a_sv": a_sv, "r2_sv": r2_sv}
+        best_per_scale[scale] = {
+            "a_sv": a_sv, "r2_sv": r2_sv,
+            "a_ul": a_ul, "r2_ul": r2_ul,
+        }
 
     # Global regression across all scales
     all_sv = [r["total_sv"] for r in rows]
+    all_ul = [r["total_unique_labels"] for r in rows]
     all_y = [r["ng_output_bytes"] for r in rows]
-    global_a, global_r2 = _ls_1var(all_sv, all_y)
-    print(f"\n  GLOBAL: ng = {global_a:.0f} * total_sv   R²={global_r2:.4f}")
+    global_a_sv, global_r2_sv = _ls_1var(all_sv, all_y)
+    global_a_ul, global_r2_ul = _ls_1var(all_ul, all_y)
+    print(f"\n  GLOBAL: ng = {global_a_sv:.0f} * total_sv              R²={global_r2_sv:.4f}")
+    print(f"  GLOBAL: ng = {global_a_ul:.0f} * total_unique_labels   R²={global_r2_ul:.4f}")
 
     # -- Tier comparison --
     print("\n" + "=" * 80)
@@ -429,10 +452,16 @@ def analyze(rows):
         sg = r["chunk_count"] * KB_PER_CHUNK_OLD.get(r["scale"], 400) / (1 << 20)
         return (ag + 1.3 * sg + 1.5) * 1.3
 
-    def _new(r):
+    def _new_sv(r):
         ag = r["arrow_bytes"] / (1 << 30)
-        coeff = best_per_scale.get(r["scale"], {}).get("a_sv", global_a)
+        coeff = best_per_scale.get(r["scale"], {}).get("a_sv", global_a_sv)
         ng = coeff * r["total_sv"] / (1 << 30)
+        return (ag + ng + 1.5) * 1.15
+
+    def _new_ul(r):
+        ag = r["arrow_bytes"] / (1 << 30)
+        coeff = best_per_scale.get(r["scale"], {}).get("a_ul", global_a_ul)
+        ng = coeff * r["total_unique_labels"] / (1 << 30)
         return (ag + ng + 1.5) * 1.15
 
     def _oracle(r):
@@ -441,29 +470,33 @@ def analyze(rows):
         return (ag + ng + 1.5) * 1.15
 
     old_d = defaultdict(int)
-    new_d = defaultdict(int)
+    sv_d = defaultdict(int)
+    ul_d = defaultdict(int)
     ora_d = defaultdict(int)
     for r in rows:
         old_d[_pick_tier(_old(r))] += 1
-        new_d[_pick_tier(_new(r))] += 1
+        sv_d[_pick_tier(_new_sv(r))] += 1
+        ul_d[_pick_tier(_new_ul(r))] += 1
         ora_d[_pick_tier(_oracle(r))] += 1
 
     total = len(rows)
-    print(f"\n  {'Tier':>8}  {'Old':>8}  {'New':>8}  {'Oracle':>8}  {'Old->New':>9}")
-    print(f"  {'----':>8}  {'---':>8}  {'---':>8}  {'------':>8}  {'--------':>9}")
+    print(f"\n  {'Tier':>8}  {'Old':>8}  {'New(SV)':>8}  {'New(UL)':>8}  {'Oracle':>8}")
+    print(f"  {'----':>8}  {'---':>8}  {'------':>8}  {'------':>8}  {'------':>8}")
     for t in TIERS:
-        o, n, ora = old_d.get(t, 0), new_d.get(t, 0), ora_d.get(t, 0)
-        d = n - o
-        sign = "+" if d > 0 else ""
-        print(f"  {t:>6}Gi  {o:>8}  {n:>8}  {ora:>8}  {sign}{d:>8}")
-    print(f"  {'Total':>8}  {total:>8}  {total:>8}  {total:>8}")
+        o = old_d.get(t, 0)
+        sv = sv_d.get(t, 0)
+        ul = ul_d.get(t, 0)
+        ora = ora_d.get(t, 0)
+        print(f"  {t:>6}Gi  {o:>8}  {sv:>8}  {ul:>8}  {ora:>8}")
+    print(f"  {'Total':>8}  {total:>8}  {total:>8}  {total:>8}  {total:>8}")
 
     # -- Overestimation analysis --
     print("\n" + "=" * 80)
     print("OVERESTIMATION ANALYSIS (formula / oracle ratio)")
     print("=" * 80)
 
-    for label, fn in [("Old", _old), ("New", _new)]:
+    for label, fn in [("Old", _old), ("New(SV)", _new_sv),
+                       ("New(UL)", _new_ul)]:
         print(f"\n  {label} formula:")
         for scale in sorted(by_scale):
             sr = by_scale[scale]
@@ -480,20 +513,37 @@ def analyze(rows):
     print("SUGGESTED FORMULA FOR precompute_manifest.py")
     print("=" * 80)
 
-    print(f"\n  Bytes per supervoxel by scale:")
+    print(f"\n  Coefficients by scale:")
+    print(f"  {'Scale':>7}  {'Bytes/SV':>10}  {'R²(SV)':>8}  "
+          f"{'Bytes/UL':>10}  {'R²(UL)':>8}")
     for s in sorted(best_per_scale):
         info = best_per_scale[s]
-        print(f"    {s}: {info['a_sv']:.0f}  (R²={info['r2_sv']:.4f})")
+        print(f"  {s:>7}  {info['a_sv']:>10.0f}  {info['r2_sv']:>8.4f}  "
+              f"{info['a_ul']:>10.0f}  {info['r2_ul']:>8.4f}")
 
-    bps = ", ".join(
+    print(f"\n  For agglomerated label exports (use unique_labels):")
+    bps_ul = ", ".join(
+        f"{s}: {best_per_scale[s]['a_ul']:.0f}"
+        for s in sorted(best_per_scale))
+    print(f"""
+  BYTES_PER_UNIQUE_LABEL = {{{bps_ul}}}
+
+  def estimate_memory_gib(arrow_bytes, total_unique_labels, scale):
+      arrow_gib = arrow_bytes / (1 << 30)
+      coeff = BYTES_PER_UNIQUE_LABEL.get(scale, {global_a_ul:.0f})
+      ng_gib = total_unique_labels * coeff / (1 << 30)
+      return (arrow_gib + ng_gib + 1.5) * 1.15
+""")
+    print(f"  For supervoxel exports (use total_sv):")
+    bps_sv = ", ".join(
         f"{s}: {best_per_scale[s]['a_sv']:.0f}"
         for s in sorted(best_per_scale))
     print(f"""
-  BYTES_PER_SV = {{{bps}}}
+  BYTES_PER_SV = {{{bps_sv}}}
 
   def estimate_memory_gib(arrow_bytes, total_sv, scale):
       arrow_gib = arrow_bytes / (1 << 30)
-      coeff = BYTES_PER_SV.get(scale, {global_a:.0f})
+      coeff = BYTES_PER_SV.get(scale, {global_a_sv:.0f})
       ng_gib = total_sv * coeff / (1 << 30)
       return (arrow_gib + ng_gib + 1.5) * 1.15
 """)
@@ -568,7 +618,9 @@ def main():
     fieldnames = [
         "scale", "shard_name", "arrow_bytes", "chunk_count",
         "total_labels", "mean_labels", "max_labels",
-        "total_sv", "mean_sv", "max_sv", "ng_output_bytes",
+        "total_sv", "mean_sv", "max_sv",
+        "total_unique_labels", "mean_unique_labels", "max_unique_labels",
+        "ng_output_bytes",
     ]
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

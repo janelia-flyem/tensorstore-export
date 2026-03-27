@@ -7,9 +7,9 @@ writes a companion CSV with per-chunk label counts.  This data is used
 for label-aware memory estimation in tier assignment.
 
 Output format (<shard>-labels.csv):
-    x,y,z,num_labels,num_supervoxels
-    480,384,448,13,14
-    480,384,449,25,31
+    x,y,z,num_labels,num_supervoxels,unique_labels
+    480,384,448,13,14,11
+    480,384,449,25,31,20
 
 Can run locally or as a Cloud Run job.  In Cloud Run mode, uses
 CLOUD_RUN_TASK_INDEX and CLOUD_RUN_TASK_COUNT for work partitioning,
@@ -115,8 +115,8 @@ def list_shards(source_path: str, scales: list) -> list:
 def profile_shard(source_path: str, scale: int, shard_name: str) -> dict:
     """Read an Arrow shard and extract per-chunk label counts.
 
-    Returns a dict with 'rows' (list of (x,y,z,num_labels,num_sv)) and
-    summary stats, or a dict with 'error' key on failure.
+    Returns a dict with 'rows' (list of (x,y,z,num_labels,num_sv,unique_labels))
+    and summary stats, or a dict with 'error' key on failure.
     """
     arrow_path = f"{source_path}/s{scale}/{shard_name}.arrow"
     try:
@@ -133,9 +133,15 @@ def profile_shard(source_path: str, scale: int, shard_name: str) -> dict:
     label_lengths = table.column("labels").combine_chunks().value_lengths().to_pylist()
     sv_lengths = table.column("supervoxels").combine_chunks().value_lengths().to_pylist()
 
-    rows = list(zip(xs, ys, zs, label_lengths, sv_lengths))
+    # Count unique agglomerated labels per chunk (list contains duplicates
+    # since multiple supervoxels map to the same agglomerated label).
+    labels_col = table.column("labels").combine_chunks()
+    unique_labels = [len(set(labels_col[i].as_py())) for i in range(len(labels_col))]
+
+    rows = list(zip(xs, ys, zs, label_lengths, sv_lengths, unique_labels))
     total_labels = sum(label_lengths)
     total_sv = sum(sv_lengths)
+    total_unique_labels = sum(unique_labels)
     n = len(rows)
 
     return {
@@ -144,10 +150,13 @@ def profile_shard(source_path: str, scale: int, shard_name: str) -> dict:
         "arrow_bytes": arrow_bytes,
         "total_labels": total_labels,
         "total_supervoxels": total_sv,
+        "total_unique_labels": total_unique_labels,
         "mean_labels": total_labels / n if n else 0,
         "max_labels": max(label_lengths) if label_lengths else 0,
         "mean_supervoxels": total_sv / n if n else 0,
         "max_supervoxels": max(sv_lengths) if sv_lengths else 0,
+        "mean_unique_labels": total_unique_labels / n if n else 0,
+        "max_unique_labels": max(unique_labels) if unique_labels else 0,
     }
 
 
@@ -156,9 +165,10 @@ def write_labels_csv(output_path: str, scale: int, shard_name: str,
     """Write a -labels.csv file for a shard."""
     out = io.StringIO()
     writer = csv.writer(out)
-    writer.writerow(["x", "y", "z", "num_labels", "num_supervoxels"])
-    for x, y, z, nl, nsv in rows:
-        writer.writerow([x, y, z, nl, nsv])
+    writer.writerow(["x", "y", "z", "num_labels", "num_supervoxels",
+                     "unique_labels"])
+    for x, y, z, nl, nsv, ul in rows:
+        writer.writerow([x, y, z, nl, nsv, ul])
 
     csv_path = f"{output_path}/s{scale}/{shard_name}-labels.csv"
     _write_string(csv_path, out.getvalue())

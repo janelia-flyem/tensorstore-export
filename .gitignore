@@ -15,3 +15,6 @@ build/
 .coverage
 .pytest_cache/
 htmlcov/
+
+# Generated analysis output
+analysis/
