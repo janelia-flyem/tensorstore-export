@@ -154,6 +154,29 @@ def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
         else:
             print(f"  {job_name}: FAILED to execute")
 
+    # Post-export verification when using --wait
+    if wait:
+        source_path = env.get("SOURCE_PATH", "").rstrip("/")
+        dest_path = env.get("DEST_PATH", "").rstrip("/")
+        ng_spec_path = env.get("NG_SPEC_PATH", "")
+        scales_str = env.get("SCALES", "")
+
+        if all([source_path, dest_path, ng_spec_path, scales_str]):
+            print("\n--- Post-export verification ---")
+            try:
+                from scripts.verify_export import verify_all_scales, print_report
+                scales = [int(s) for s in scales_str.split(",")]
+                total_missing, results = verify_all_scales(
+                    source_path, dest_path, ng_spec_path, scales)
+                print_report(results)
+                if total_missing > 0:
+                    print(f"\n*** WARNING: {total_missing} DVID shards have "
+                          f"no NG output ***")
+                    print("Run 'pixi run verify-export' for details.")
+            except Exception as e:
+                print(f"\n  Verification failed: {e}")
+                print("  Run 'pixi run verify-export' manually.")
+
     print("\nMonitor progress:")
     print("  pixi run export-status")
     print("  pixi run export-errors")

@@ -28,7 +28,6 @@ Usage:
 import argparse
 import csv
 import io
-import json
 import sys
 import time
 from collections import defaultdict
@@ -55,79 +54,13 @@ def _parse_gs(path):
 
 
 # ---------------------------------------------------------------------------
-# Morton code
+# Morton code / NG spec — centralized in src/ng_sharding.py
 # ---------------------------------------------------------------------------
 
-def compressed_z_index(coords, coord_bits):
-    """Compressed Z-index matching TensorStore's EncodeCompressedZIndex.
-
-    Unlike a standard Morton code, the compressed variant only interleaves
-    bits for dimensions that still have significant bits at each level.
-    This matches the DVID and TensorStore implementations exactly.
-
-    Args:
-        coords: (x, y, z) chunk grid coordinates
-        coord_bits: (bx, by, bz) number of bits per dimension,
-                    computed as bit_length(grid_size[d] - 1)
-    """
-    max_bit = max(coord_bits)
-    code = 0
-    j = 0
-    for i in range(max_bit):
-        for dim in range(3):
-            if i < coord_bits[dim]:
-                code |= ((coords[dim] >> i) & 1) << j
-                j += 1
-    return code
-
-
-def dvid_to_ng_shard_number(shard_name, scale_params):
-    """Map DVID shard name to neuroglancer shard number.
-
-    Uses the compressed Z-index (not standard Morton code) to match
-    TensorStore's sharding.
-    """
-    x, y, z = (int(v) for v in shard_name.split("_"))
-    chunk_size = scale_params["chunk_size"]
-    cx, cy, cz = x // chunk_size[0], y // chunk_size[1], z // chunk_size[2]
-    morton = compressed_z_index(
-        (cx, cy, cz), scale_params["coord_bits"])
-    preshift = scale_params["preshift_bits"]
-    minishard = scale_params["minishard_bits"]
-    return morton >> (preshift + minishard)
-
-
-# ---------------------------------------------------------------------------
-# NG spec
-# ---------------------------------------------------------------------------
-
-def load_ng_spec(spec_path):
-    """Load NG spec -> {scale_index: {key, sharding params, grid geometry}}."""
-    with open(spec_path) as f:
-        spec = json.load(f)
-    result = {}
-    for i, s in enumerate(spec["scales"]):
-        sh = s["sharding"]
-        chunk_size = s["chunk_sizes"][0]
-        vol_size = s["size"]
-        grid_shape = [
-            (vol_size[d] + chunk_size[d] - 1) // chunk_size[d]
-            for d in range(3)
-        ]
-        coord_bits = [
-            (grid_shape[d] - 1).bit_length() if grid_shape[d] > 1 else 0
-            for d in range(3)
-        ]
-        result[i] = {
-            "key": s["key"],
-            "preshift_bits": sh["preshift_bits"],
-            "minishard_bits": sh["minishard_bits"],
-            "shard_bits": sh["shard_bits"],
-            "chunk_size": chunk_size,
-            "grid_shape": grid_shape,
-            "coord_bits": coord_bits,
-        }
-    return result
+from src.ng_sharding import (  # noqa: E402
+    dvid_to_ng_shard_number,
+    load_ng_spec,
+)
 
 
 # ---------------------------------------------------------------------------

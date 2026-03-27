@@ -41,13 +41,18 @@ DEFAULT_STAGING_PATH = "/mnt/staging"
 
 
 def _read_cgroup_memory() -> tuple:
-    """Read current memory usage and limit from the container's cgroup (bytes).
+    """Read current and peak memory usage from the container's cgroup (bytes).
 
-    Returns (current_bytes, limit_bytes).  Returns (0, 0) if cgroup memory
-    accounting is unavailable (e.g., macOS local development).
+    Returns (current_bytes, limit_bytes, peak_bytes).  Returns (0, 0, 0) if
+    cgroup memory accounting is unavailable (e.g., macOS local development).
+
+    Peak is read from memory.peak (cgroups v2) or
+    memory.max_usage_in_bytes (cgroups v1).  This is the high-water mark
+    since the cgroup was created — it cannot be reset per shard.
     """
     current = 0
     limit = 0
+    peak = 0
     # cgroups v2 (Cloud Run Gen2), then v1 fallback
     for path in [
         "/sys/fs/cgroup/memory.current",
@@ -71,7 +76,18 @@ def _read_cgroup_memory() -> tuple:
             break
         except (FileNotFoundError, ValueError):
             pass
-    return current, limit
+    # High-water mark since cgroup creation
+    for path in [
+        "/sys/fs/cgroup/memory.peak",
+        "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+    ]:
+        try:
+            with open(path) as f:
+                peak = int(f.read().strip())
+            break
+        except (FileNotFoundError, ValueError):
+            pass
+    return current, limit, peak
 
 
 def _parse_gs_uri(uri: str) -> Tuple[str, str]:
@@ -363,12 +379,34 @@ class ShardProcessor:
                 "open": True,
             }).result()
 
+            # Per-shard bounds check: scan available_chunks once to detect
+            # shards that extend beyond the volume.  Diagnostic only (warn).
+            vol_shape = tuple(dest.shape[:3])
+            max_voxel = [0, 0, 0]
+            for (cx, cy, cz) in reader.available_chunks:
+                for d, c in enumerate((cx, cy, cz)):
+                    v = c * CHUNK_VOXELS + CHUNK_VOXELS
+                    if v > max_voxel[d]:
+                        max_voxel[d] = v
+            if any(mv > vs for mv, vs in zip(max_voxel, vol_shape)):
+                logger.warning("Shard extends beyond volume",
+                               scale=scale, shard=shard_name,
+                               shard_max_voxel=tuple(max_voxel),
+                               volume_shape=vol_shape)
+
             lt = LabelType(self.config.label_type)
             chunks_written = 0
             chunks_failed = 0
+            chunks_outside = 0
             shard_uncompressed_bytes = 0
             batches_committed = 0
             shard_start_time = time.time()
+
+            # Track per-shard peak memory by sampling current usage.
+            # cgroup memory.peak is per-container (not resettable per shard),
+            # so we track max(memory.current) across samples ourselves.
+            mem_at_start, _, _ = _read_cgroup_memory()
+            shard_peak_mem = mem_at_start
             last_progress_time = shard_start_time
             progress_interval = 60  # seconds between progress logs
 
@@ -392,7 +430,14 @@ class ShardProcessor:
                     y1 = min(y0 + CHUNK_VOXELS, dest.shape[1])
                     z1 = min(z0 + CHUNK_VOXELS, dest.shape[2])
                     if x1 <= x0 or y1 <= y0 or z1 <= z0:
-                        continue  # chunk entirely outside volume
+                        chunks_outside += 1
+                        if chunks_outside == 1:
+                            logger.warning("Chunk outside volume bounds",
+                                           scale=scale, shard=shard_name,
+                                           chunk_x=cx, chunk_y=cy, chunk_z=cz,
+                                           voxel_origin=(x0, y0, z0),
+                                           volume_shape=tuple(dest.shape[:3]))
+                        continue
                     clipped = transposed[:x1 - x0, :y1 - y0, :z1 - z0]
                     dest.with_transaction(txn)[x0:x1, y0:y1, z0:z1, 0].write(
                         clipped
@@ -408,17 +453,21 @@ class ShardProcessor:
                                   chunk_x=cx, chunk_y=cy, chunk_z=cz,
                                   error=str(e)[:500])
 
-                # Commit batch to local disk
+                # Commit batch to local disk — sample memory after commit
+                # since RMW is the peak memory moment.
                 if batch_chunks >= BATCH_SIZE:
                     txn.commit_async().result()
                     batches_committed += 1
+                    mem_current, _, _ = _read_cgroup_memory()
+                    shard_peak_mem = max(shard_peak_mem, mem_current)
                     txn = ts.Transaction()
                     batch_chunks = 0
 
                 # Wall-clock progress logging
                 now = time.time()
                 if (now - last_progress_time) >= progress_interval:
-                    mem_current, _ = _read_cgroup_memory()
+                    mem_current, _, _ = _read_cgroup_memory()
+                    shard_peak_mem = max(shard_peak_mem, mem_current)
                     mem_gib = mem_current / (1 << 30) if mem_current > 0 else 0
                     elapsed = now - shard_start_time
                     logger.info("Shard progress",
@@ -436,6 +485,17 @@ class ShardProcessor:
             if batch_chunks > 0:
                 txn.commit_async().result()
                 batches_committed += 1
+                mem_current, _, _ = _read_cgroup_memory()
+                shard_peak_mem = max(shard_peak_mem, mem_current)
+
+            # Fail if no chunks were written (all outside bounds or all failed)
+            if chunks_written == 0:
+                logger.error("Shard produced no output",
+                             scale=scale, shard=shard_name,
+                             total_chunks=reader.chunk_count,
+                             chunks_outside=chunks_outside,
+                             chunks_failed=chunks_failed)
+                return False
 
             # Upload finished shard file(s) to GCS
             upload_start = time.time()
@@ -443,8 +503,10 @@ class ShardProcessor:
             upload_elapsed = time.time() - upload_start
 
             elapsed = time.time() - shard_start_time
-            mem_current, _ = _read_cgroup_memory()
-            peak_memory_gib = mem_current / (1 << 30) if mem_current > 0 else 0
+            mem_current, _, cgroup_peak = _read_cgroup_memory()
+            shard_peak_mem = max(shard_peak_mem, mem_current)
+            shard_peak_gib = shard_peak_mem / (1 << 30) if shard_peak_mem > 0 else 0
+            cgroup_peak_gib = cgroup_peak / (1 << 30) if cgroup_peak > 0 else 0
 
             logger.info("Shard complete",
                          scale=scale,
@@ -453,10 +515,12 @@ class ShardProcessor:
                          upload_s=round(upload_elapsed, 1),
                          uploaded_mib=round(uploaded_bytes / (1 << 20), 1),
                          uncompressed_gib=round(shard_uncompressed_bytes / (1 << 30), 3),
-                         peak_memory_gib=round(peak_memory_gib, 2),
+                         shard_peak_memory_gib=round(shard_peak_gib, 2),
+                         cgroup_peak_memory_gib=round(cgroup_peak_gib, 2),
                          batches=batches_committed,
                          chunks_written=chunks_written,
-                         chunks_failed=chunks_failed)
+                         chunks_failed=chunks_failed,
+                         chunks_outside=chunks_outside)
             return True
 
         except Exception as e:
