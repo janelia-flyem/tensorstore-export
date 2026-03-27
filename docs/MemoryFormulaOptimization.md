@@ -111,12 +111,18 @@ This runs during `pixi run export` phase 1 (after scanning Arrow files, before a
 
 ### Phase 2: Correlate with actual output sizes
 
-Using the v0.11 data:
+Implemented in `scripts/analyze_v011_memory.py` (`pixi run analyze-memory`).
 
-1. For each neuroglancer shard file in `gs://flyem-male-cns/v0.11/segmentation/s{N}/`, record its size
-2. Map neuroglancer shards back to DVID Arrow shards by spatial coordinates (they use the same 2048³ extent)
-3. Build a dataset: `(scale, chunk_count, arrow_size, total_labels, max_labels, total_supervoxels) → output_shard_size`
-4. Fit a regression model (likely linear in `chunk_count × mean_labels_per_chunk` for the shard-on-tmpfs component)
+Maps DVID shards to neuroglancer output shards using TensorStore's compressed Z-index
+(not a standard Morton code — the compressed variant only interleaves bits for dimensions
+that still have significant bits at each level, matching `EncodeCompressedZIndex`).
+
+For each matched shard, builds a correlation row:
+`(scale, shard_name, arrow_bytes, chunk_count, total_labels, total_sv, ng_output_bytes)`
+
+Outputs:
+- `analysis/v011_shard_memory.csv` — full dataset
+- Console report with per-scale regression, tier comparison, and suggested formula
 
 ### Phase 3: New memory formula
 
