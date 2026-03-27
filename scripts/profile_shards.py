@@ -27,6 +27,7 @@ Usage (Cloud Run):
 import argparse
 import csv
 import io
+import json
 import os
 import subprocess
 import sys
@@ -225,35 +226,35 @@ def process_shards(source_path: str, output_path: str,
     return completed, errors, total_arrow_bytes, elapsed
 
 
-def run_cloud_run_task(source_path: str, output_path: str,
-                       all_shards: list, workers: int):
-    """Cloud Run mode: process this task's partition of shards.
+def _bulk_scan_existing(output_path: str, scales: list) -> set:
+    """List existing -labels.csv files via bulk list_blobs (seconds, not minutes)."""
+    existing = set()
+    for scale in scales:
+        prefix = f"{output_path}/s{scale}/"
+        if prefix.startswith("gs://"):
+            bucket_name, blob_prefix = _parse_gs(prefix)
+            for blob in _get_gcs_client().bucket(bucket_name).list_blobs(
+                    prefix=blob_prefix):
+                if blob.name.endswith("-labels.csv"):
+                    name = blob.name.split("/")[-1].replace("-labels.csv", "")
+                    existing.add((scale, name))
+        else:
+            p = Path(prefix)
+            if p.exists():
+                for f in p.glob("*-labels.csv"):
+                    existing.add((scale, f.stem.replace("-labels", "")))
+    return existing
 
-    Uses CLOUD_RUN_TASK_INDEX and CLOUD_RUN_TASK_COUNT for partitioning.
+
+def load_manifest(manifest_uri: str, task_index: int) -> list:
+    """Load this task's shard list from a manifest file on GCS.
+
+    Returns list of (scale, shard_name) tuples.
     """
-    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
-    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
-
-    # Round-robin partition
-    my_shards = [s for i, s in enumerate(all_shards)
-                 if i % task_count == task_index]
-
-    print(f"Task {task_index}/{task_count}: "
-          f"{len(my_shards)} shards assigned (of {len(all_shards)} total)")
-
-    if not my_shards:
-        print("No shards to process.")
-        return
-
-    completed, errors, arrow_bytes, elapsed = process_shards(
-        source_path, output_path, my_shards, workers)
-
-    total_gb = arrow_bytes / 1e9
-    rate = completed / elapsed if elapsed > 0 else 0
-    bw = total_gb / elapsed if elapsed > 0 else 0
-    print(f"\nTask {task_index} done: {completed} profiled, {errors} errors")
-    print(f"  Elapsed: {elapsed / 60:.1f} min")
-    print(f"  Throughput: {rate:.1f} shards/s, {bw:.2f} GB/s")
+    task_path = f"{manifest_uri}/task-{task_index}.json"
+    data = _read_bytes(task_path)
+    entries = json.loads(data)
+    return [(scale, name) for scale, name in entries]
 
 
 def main():
@@ -261,19 +262,33 @@ def main():
     if os.environ.get("CLOUD_RUN_TASK_INDEX") is not None:
         source_path = os.environ["PROFILER_SOURCE"]
         output_path = os.environ["PROFILER_OUTPUT"]
-        scales_str = os.environ.get("PROFILER_SCALES", "0,1,2,3,4,5,6,7,8,9")
-        scales = [int(s.strip()) for s in scales_str.split(",")]
-        workers = int(os.environ.get("PROFILER_WORKERS", "32"))
+        manifest_uri = os.environ.get("PROFILER_MANIFEST_URI", "")
+        workers = int(os.environ.get("PROFILER_WORKERS", "4"))
+        task_index = int(os.environ["CLOUD_RUN_TASK_INDEX"])
 
-        print("Cloud Run profiler task")
+        if not manifest_uri:
+            print("Error: PROFILER_MANIFEST_URI not set")
+            sys.exit(1)
+
+        my_shards = load_manifest(manifest_uri, task_index)
+        print(f"Task {task_index}: {len(my_shards)} shards from manifest")
         print(f"  Source: {source_path}")
         print(f"  Output: {output_path}")
-        print(f"  Scales: {scales_str}")
         print(f"  Workers: {workers}")
 
-        all_shards = list_shards(source_path, scales)
-        print(f"  Total shards: {len(all_shards)}")
-        run_cloud_run_task(source_path, output_path, all_shards, workers)
+        if not my_shards:
+            print("No shards to process.")
+            return
+
+        completed, errors, arrow_bytes, elapsed = process_shards(
+            source_path, output_path, my_shards, workers)
+
+        total_gb = arrow_bytes / 1e9
+        rate = completed / elapsed if elapsed > 0 else 0
+        bw = total_gb / elapsed if elapsed > 0 else 0
+        print(f"\nTask {task_index} done: {completed} profiled, {errors} errors")
+        print(f"  Elapsed: {elapsed / 60:.1f} min")
+        print(f"  Throughput: {rate:.1f} shards/s, {bw:.2f} GB/s")
         return
 
     # Local CLI mode
@@ -315,26 +330,10 @@ def main():
     all_shards = list_shards(source_path, scales)
     print(f"  Found {len(all_shards)} Arrow shards")
 
-    # Bulk scan for existing label CSVs to avoid 26K per-shard existence
-    # checks (one list_blobs per scale = seconds vs minutes).
+    # Bulk scan for existing label CSVs (seconds, not minutes).
     # process_shards still does per-shard checks as a safety net.
     print("Scanning for existing -labels.csv files...")
-    existing = set()
-    for scale in scales:
-        prefix = f"{output_path}/s{scale}/"
-        if prefix.startswith("gs://"):
-            bucket_name, blob_prefix = _parse_gs(prefix)
-            for blob in _get_gcs_client().bucket(bucket_name).list_blobs(
-                    prefix=blob_prefix):
-                if blob.name.endswith("-labels.csv"):
-                    name = blob.name.split("/")[-1].replace("-labels.csv", "")
-                    existing.add((scale, name))
-        else:
-            p = Path(prefix)
-            if p.exists():
-                for f in p.glob("*-labels.csv"):
-                    existing.add((scale, f.stem.replace("-labels", "")))
-
+    existing = _bulk_scan_existing(output_path, scales)
     need_profiling = [(s, n) for s, n in all_shards if (s, n) not in existing]
     print(f"  {len(need_profiling)} shards need profiling "
           f"({len(existing)} already done)")

@@ -2,25 +2,61 @@
 """
 Launch shard profiling as a Cloud Run job.
 
-Creates a Cloud Run job that runs profile_shards.py across N tasks,
-each processing a round-robin partition of shards with multi-threaded
-parallelism.  No egress charges when source/output buckets are in the
-same region as Cloud Run.
+Pre-scans source and output paths to find which shards need profiling,
+writes per-task manifests to GCS, then launches a Cloud Run job where
+each task processes only its assigned shards.
 
 Usage:
     pixi run launch-profiler --source gs://bucket/exports/seg --output gs://bucket2/exports/seg
-    pixi run launch-profiler --source gs://bucket/exports/seg --output gs://bucket2/exports/seg --tasks 100
+    pixi run launch-profiler --source gs://... --output gs://... --tasks 100
+    pixi run launch-profiler --source gs://... --output gs://... --dry-run
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE
+from scripts.profile_shards import list_shards, _bulk_scan_existing, _get_gcs_client, _parse_gs
+
+
+def write_profiler_manifests(output_path: str, shards: list,
+                             num_tasks: int) -> str:
+    """Write per-task manifest files to GCS.
+
+    Each manifest is a JSON array of [scale, shard_name] pairs.
+    Returns the manifest URI prefix.
+    """
+    # Cap tasks to number of shards
+    num_tasks = min(num_tasks, len(shards))
+
+    # Round-robin distribute
+    tasks = {i: [] for i in range(num_tasks)}
+    for idx, (scale, name) in enumerate(shards):
+        tasks[idx % num_tasks].append([scale, name])
+
+    manifest_prefix = f"{output_path}/profiler-manifests"
+    bucket_name, blob_prefix = _parse_gs(manifest_prefix)
+    client = _get_gcs_client()
+    bucket = client.bucket(bucket_name)
+
+    def _upload(task_idx):
+        blob_path = f"{blob_prefix}/task-{task_idx}.json"
+        data = json.dumps(tasks[task_idx], separators=(",", ":"))
+        bucket.blob(blob_path).upload_from_string(
+            data, content_type="application/json")
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(_upload, range(num_tasks)))
+
+    print(f"  Written {num_tasks} manifests to {manifest_prefix}/")
+    return manifest_prefix
 
 
 def main():
@@ -41,7 +77,7 @@ def main():
     )
     parser.add_argument(
         "--tasks", type=int, default=100,
-        help="Number of Cloud Run tasks (default: 100)",
+        help="Max number of Cloud Run tasks (default: 100)",
     )
     parser.add_argument(
         "--workers", type=int, default=4,
@@ -53,7 +89,7 @@ def main():
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Print the gcloud command without running it",
+        help="Scan and show what needs profiling without launching",
     )
     args = parser.parse_args()
 
@@ -69,20 +105,26 @@ def main():
         print("Error: DOCKER_IMAGE not set in .env. Run 'pixi run deploy' first.")
         sys.exit(1)
 
-    job_name = f"{env.get('BASE_JOB_NAME', 'tensorstore-dvid-export')}-profiler"
+    scales = [int(s.strip()) for s in args.scales.split(",")]
 
-    # Write env vars to temp YAML
-    env_vars = {
-        "PROFILER_SOURCE": args.source,
-        "PROFILER_OUTPUT": args.output,
-        "PROFILER_SCALES": args.scales,
-        "PROFILER_WORKERS": str(args.workers),
-    }
-    env_file = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", delete=False, prefix="profiler-env-")
-    for k, v in env_vars.items():
-        env_file.write(f"{k}: '{v}'\n")
-    env_file.close()
+    # --- Pre-scan: find which shards need profiling ---
+    print(f"Scanning source shards in {args.source}...")
+    all_shards = list_shards(args.source, scales)
+    print(f"  Found {len(all_shards)} Arrow shards")
+
+    print(f"Scanning existing -labels.csv in {args.output}...")
+    existing = _bulk_scan_existing(args.output, scales)
+    need_profiling = [(s, n) for s, n in all_shards if (s, n) not in existing]
+    print(f"  {len(need_profiling)} shards need profiling "
+          f"({len(existing)} already done)")
+
+    if not need_profiling:
+        print("All shards already profiled.")
+        return
+
+    # Cap tasks to actual shard count
+    num_tasks = min(args.tasks, len(need_profiling))
+    shards_per_task = len(need_profiling) / num_tasks
 
     # Pick CPU based on memory (Cloud Run coupling constraints)
     mem_gib = int(args.memory.replace("Gi", ""))
@@ -95,14 +137,48 @@ def main():
     else:
         cpu = 8
 
-    # Override the entrypoint to run profile_shards.py instead of main.py
+    # Show per-scale breakdown
+    by_scale = {}
+    for scale, _ in need_profiling:
+        by_scale[scale] = by_scale.get(scale, 0) + 1
+    for s in sorted(by_scale):
+        print(f"    scale {s}: {by_scale[s]} shards")
+
+    print(f"\n  Tasks: {num_tasks} ({shards_per_task:.1f} shards/task)")
+    print(f"  Workers/task: {args.workers}")
+    print(f"  Memory: {args.memory}, CPU: {cpu}")
+
+    if args.dry_run:
+        print("\n(dry run — not launched)")
+        return
+
+    # --- Write per-task manifests to GCS ---
+    print("\nWriting manifests...")
+    manifest_uri = write_profiler_manifests(
+        args.output, need_profiling, num_tasks)
+
+    # --- Create and execute Cloud Run job ---
+    job_name = f"{env.get('BASE_JOB_NAME', 'tensorstore-dvid-export')}-profiler"
+
+    env_vars = {
+        "PROFILER_SOURCE": args.source,
+        "PROFILER_OUTPUT": args.output,
+        "PROFILER_MANIFEST_URI": manifest_uri,
+        "PROFILER_WORKERS": str(args.workers),
+    }
+    env_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, prefix="profiler-env-")
+    for k, v in env_vars.items():
+        env_file.write(f"{k}: '{v}'\n")
+    env_file.close()
+
     cmd = [
         "gcloud", "run", "jobs", "create", job_name,
         f"--image={image}",
         f"--region={region}",
         f"--project={project}",
-        f"--tasks={args.tasks}",
-        f"--parallelism={args.tasks}",
+        f"--tasks={num_tasks}",
+        f"--parallelism={num_tasks}",
         "--max-retries=1",
         "--task-timeout=3600s",
         f"--memory={args.memory}",
@@ -113,23 +189,7 @@ def main():
         "--args=scripts/profile_shards.py",
     ]
 
-    print(f"Job: {job_name}")
-    print(f"  Image: {image}")
-    print(f"  Region: {region}")
-    print(f"  Tasks: {args.tasks}, workers/task: {args.workers}")
-    print(f"  Memory: {args.memory}, CPU: {cpu}")
-    print(f"  Source: {args.source}")
-    print(f"  Output: {args.output}")
-    print(f"  Scales: {args.scales}")
-
-    if args.dry_run:
-        print(f"\nCommand:\n  {' '.join(cmd)}")
-        print("\n(dry run — not launched)")
-        os.unlink(env_file.name)
-        return
-
     try:
-        # Create (or update if exists)
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0 and "already exists" in result.stderr:
             cmd[3] = "update"
@@ -138,12 +198,11 @@ def main():
             print(f"  Failed to create/update job: {result.stderr}")
             sys.exit(1)
 
-        # Execute
         exec_cmd = [
             "gcloud", "run", "jobs", "execute", job_name,
             f"--region={region}",
             f"--project={project}",
-            f"--tasks={args.tasks}",
+            f"--tasks={num_tasks}",
             "--async",
         ]
         result = subprocess.run(exec_cmd, capture_output=True, text=True)
@@ -151,7 +210,8 @@ def main():
             print(f"  Failed to execute job: {result.stderr}")
             sys.exit(1)
 
-        print(f"\nLaunched {job_name} with {args.tasks} tasks")
+        print(f"\nLaunched {job_name} with {num_tasks} tasks "
+              f"({len(need_profiling)} shards)")
         print(f"Monitor: gcloud run jobs executions list --job={job_name} "
               f"--region={region} --project={project}")
     finally:
