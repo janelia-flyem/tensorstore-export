@@ -24,10 +24,10 @@ from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE
 
 # Available memory tiers with Cloud Run CPU coupling constraints.
 # Cloud Run Gen2: CPU=1→max 4Gi, CPU=2→max 8Gi, CPU=4→max 16Gi, CPU=8→max 32Gi.
-TIER_CPU = {1: 1, 2: 1, 4: 2, 8: 2, 16: 4, 24: 6, 32: 8}
+TIER_CPU = {4: 2, 8: 2, 16: 4, 24: 6, 32: 8}
 
 # Default max tasks per tier; override with --tiers.
-DEFAULT_TIER_MAX_TASKS = {1: 5000, 2: 5000, 4: 5000, 8: 5000, 16: 5000, 24: 100, 32: 20}
+DEFAULT_TIER_MAX_TASKS = {4: 5000, 8: 5000, 16: 2500, 24: 100, 32: 20}
 
 
 def list_arrow_files(source_path: str, scales: list) -> list:

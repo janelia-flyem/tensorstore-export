@@ -10,7 +10,7 @@ from google.cloud import storage
 from google.api_core import exceptions as gcs_exceptions
 
 
-def get_bucket_info(bucket_name: str) -> dict | None:
+def get_bucket_info(bucket_name: str, project: str = "") -> dict | None:
     """Fetch bucket metadata from GCS.
 
     Returns a dict with location, location_type, storage_class,
@@ -18,7 +18,7 @@ def get_bucket_info(bucket_name: str) -> dict | None:
     Returns None if the bucket does not exist.
     Returns a dict with an 'error' key on permission errors.
     """
-    client = storage.Client()
+    client = storage.Client(project=project or None)
     bucket = client.bucket(bucket_name)
     try:
         bucket.reload()
@@ -42,7 +42,7 @@ def get_bucket_info(bucket_name: str) -> dict | None:
     }
 
 
-def create_bucket(bucket_name: str, location: str) -> bool:
+def create_bucket(bucket_name: str, location: str, project: str = "") -> bool:
     """Create a single-region GCS bucket with export-safe defaults.
 
     Creates the bucket with:
@@ -54,7 +54,7 @@ def create_bucket(bucket_name: str, location: str) -> bool:
 
     Returns True on success, False on failure (prints error).
     """
-    client = storage.Client()
+    client = storage.Client(project=project or None)
     bucket = client.bucket(bucket_name)
     bucket.location = location
     bucket.storage_class = "STANDARD"
@@ -81,13 +81,13 @@ def create_bucket(bucket_name: str, location: str) -> bool:
     return True
 
 
-def disable_soft_delete(bucket_name: str) -> int:
+def disable_soft_delete(bucket_name: str, project: str = "") -> int:
     """Disable soft delete on a bucket.
 
     Returns the previous retention_duration_seconds (0 if already disabled).
     Raises on permission errors with a helpful message.
     """
-    client = storage.Client()
+    client = storage.Client(project=project or None)
     bucket = client.bucket(bucket_name)
     bucket.reload()
 
@@ -108,13 +108,14 @@ def disable_soft_delete(bucket_name: str) -> int:
     return old_retention
 
 
-def check_write_permission(bucket_name: str, prefix: str = "") -> bool:
+def check_write_permission(bucket_name: str, prefix: str = "",
+                           project: str = "") -> bool:
     """Test that the default service account can write to the bucket.
 
     Writes a small test object and deletes it.  Returns True if
     successful, False on permission error (prints the error).
     """
-    client = storage.Client()
+    client = storage.Client(project=project or None)
     test_path = f"{prefix}/.deploy-permission-check".lstrip("/")
     blob = client.bucket(bucket_name).blob(test_path)
     try:
@@ -131,13 +132,14 @@ def check_write_permission(bucket_name: str, prefix: str = "") -> bool:
         return False
 
 
-def check_read_permission(bucket_name: str, prefix: str = "") -> bool:
+def check_read_permission(bucket_name: str, prefix: str = "",
+                          project: str = "") -> bool:
     """Test that the default service account can read from the bucket.
 
     Lists objects under the prefix.  Returns True if successful,
     False on permission error (prints the error).
     """
-    client = storage.Client()
+    client = storage.Client(project=project or None)
     bucket = client.bucket(bucket_name)
     try:
         # Just try to list one object — this tests storage.objects.list

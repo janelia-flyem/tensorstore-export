@@ -200,6 +200,7 @@ def validate_and_configure_buckets(env: dict):
         validate_bucket_region, check_write_permission, check_read_permission,
     )
 
+    project = env.get("PROJECT_ID", "")
     region = env.get("REGION", "us-central1")
     dest_uri = env.get("DEST_PATH", "")
     source_uri = env.get("SOURCE_PATH", "")
@@ -218,7 +219,7 @@ def validate_and_configure_buckets(env: dict):
     src_info = None
     src_region = None  # resolved single-region location, if available
     if source_bucket and source_bucket != dest_bucket:
-        src_info = get_bucket_info(source_bucket)
+        src_info = get_bucket_info(source_bucket, project=project)
         if src_info and "error" not in src_info:
             src_loc = src_info["location"]
             src_type = src_info.get("location_type", "region")
@@ -237,7 +238,7 @@ def validate_and_configure_buckets(env: dict):
                           f"{src_loc.lower()} (matches REGION)")
 
     # --- Destination bucket ---
-    dest_info = get_bucket_info(dest_bucket)
+    dest_info = get_bucket_info(dest_bucket, project=project)
 
     if dest_info is None:
         # Bucket doesn't exist — create it in the same region as source
@@ -252,7 +253,7 @@ def validate_and_configure_buckets(env: dict):
 
         print(f"  Destination bucket '{dest_bucket}' does not exist.")
         print(f"  Creating single-region bucket in {create_region}...")
-        if create_bucket(dest_bucket, create_region):
+        if create_bucket(dest_bucket, create_region, project=project):
             print(f"  Created '{dest_bucket}' (single-region {create_region}, "
                   f"HNS enabled, soft delete disabled)")
         else:
@@ -292,7 +293,7 @@ def validate_and_configure_buckets(env: dict):
     retention = dest_info["soft_delete_retention_seconds"]
     if retention > 0:
         try:
-            old = disable_soft_delete(dest_bucket)
+            old = disable_soft_delete(dest_bucket, project=project)
             days = old // 86400
             print(f"  \033[1mSoft delete disabled\033[0m on '{dest_bucket}' "
                   f"(was {days}-day retention). "
@@ -304,7 +305,7 @@ def validate_and_configure_buckets(env: dict):
 
     # --- Permission checks ---
     _, dest_prefix = _parse_gs_uri(dest_uri)
-    if not check_write_permission(dest_bucket, dest_prefix):
+    if not check_write_permission(dest_bucket, dest_prefix, project=project):
         print("\n  \033[1mDeploy aborted\033[0m: cannot write to destination bucket.")
         print("  Fix permissions before running export — otherwise Cloud Run tasks")
         print("  will burn CPU/memory for hours before failing at upload.")
@@ -314,7 +315,7 @@ def validate_and_configure_buckets(env: dict):
 
     if source_bucket and source_bucket != dest_bucket:
         _, src_prefix = _parse_gs_uri(source_uri)
-        if not check_read_permission(source_bucket, src_prefix):
+        if not check_read_permission(source_bucket, src_prefix, project=project):
             print("\n  \033[1mWarning\033[0m: cannot read from source bucket.")
             print("  Cloud Run tasks will fail to download Arrow shard files.")
         else:
