@@ -40,6 +40,23 @@ BATCH_SIZE = 100
 DEFAULT_STAGING_PATH = "/mnt/staging"
 
 
+def _reset_cgroup_peak() -> bool:
+    """Try to reset cgroups v2 memory.peak to current usage.
+
+    On cgroups v2 (Linux 5.19+), writing "0" to memory.peak resets the
+    high-water mark to the current usage.  This enables true per-shard peak
+    tracking without sampling gaps.
+
+    Returns True if the reset succeeded, False otherwise.
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.peak", "w") as f:
+            f.write("0\n")
+        return True
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+
+
 def _read_cgroup_memory() -> tuple:
     """Read current and peak memory usage from the container's cgroup (bytes).
 
@@ -47,8 +64,8 @@ def _read_cgroup_memory() -> tuple:
     cgroup memory accounting is unavailable (e.g., macOS local development).
 
     Peak is read from memory.peak (cgroups v2) or
-    memory.max_usage_in_bytes (cgroups v1).  This is the high-water mark
-    since the cgroup was created — it cannot be reset per shard.
+    memory.max_usage_in_bytes (cgroups v1).  If memory.peak was reset via
+    _reset_cgroup_peak(), the value reflects the peak since last reset.
     """
     current = 0
     limit = 0
@@ -402,9 +419,10 @@ class ShardProcessor:
             batches_committed = 0
             shard_start_time = time.time()
 
-            # Track per-shard peak memory by sampling current usage.
-            # cgroup memory.peak is per-container (not resettable per shard),
-            # so we track max(memory.current) across samples ourselves.
+            # Track per-shard peak memory.  Try to reset cgroups v2
+            # memory.peak for a true kernel-level per-shard high-water mark.
+            # Fall back to max(memory.current) sampling if reset unavailable.
+            peak_reset_ok = _reset_cgroup_peak()
             mem_at_start, _, _ = _read_cgroup_memory()
             shard_peak_mem = mem_at_start
             last_progress_time = shard_start_time
@@ -453,9 +471,11 @@ class ShardProcessor:
                                   chunk_x=cx, chunk_y=cy, chunk_z=cz,
                                   error=str(e)[:500])
 
-                # Commit batch to local disk — sample memory after commit
-                # since RMW is the peak memory moment.
+                # Commit batch to local disk — sample memory before and after
+                # commit to bracket the RMW peak (old + new shard coexist).
                 if batch_chunks >= BATCH_SIZE:
+                    mem_current, _, _ = _read_cgroup_memory()
+                    shard_peak_mem = max(shard_peak_mem, mem_current)
                     txn.commit_async().result()
                     batches_committed += 1
                     mem_current, _, _ = _read_cgroup_memory()
@@ -483,6 +503,8 @@ class ShardProcessor:
 
             # Commit remaining chunks
             if batch_chunks > 0:
+                mem_current, _, _ = _read_cgroup_memory()
+                shard_peak_mem = max(shard_peak_mem, mem_current)
                 txn.commit_async().result()
                 batches_committed += 1
                 mem_current, _, _ = _read_cgroup_memory()
@@ -503,10 +525,34 @@ class ShardProcessor:
             upload_elapsed = time.time() - upload_start
 
             elapsed = time.time() - shard_start_time
-            mem_current, _, cgroup_peak = _read_cgroup_memory()
+            mem_current, mem_limit, cgroup_peak = _read_cgroup_memory()
             shard_peak_mem = max(shard_peak_mem, mem_current)
             shard_peak_gib = shard_peak_mem / (1 << 30) if shard_peak_mem > 0 else 0
-            cgroup_peak_gib = cgroup_peak / (1 << 30) if cgroup_peak > 0 else 0
+            mem_limit_gib = mem_limit / (1 << 30) if mem_limit > 0 else 0
+
+            # If we reset memory.peak before this shard, cgroup_peak is the
+            # true kernel-level per-shard high-water mark (no sampling gaps).
+            # Otherwise it's the container-lifetime peak.
+            if peak_reset_ok:
+                kernel_peak_gib = cgroup_peak / (1 << 30) if cgroup_peak > 0 else 0
+            else:
+                kernel_peak_gib = 0  # not per-shard, omit to avoid confusion
+
+            # Best available per-shard peak: kernel peak if available,
+            # else sampled max(memory.current).
+            peak_gib = kernel_peak_gib if kernel_peak_gib > 0 else shard_peak_gib
+
+            # Distinct, easily queryable log for per-shard memory analysis.
+            # Query: textPayload=~"Shard memory peak"
+            logger.info("Shard memory peak",
+                         scale=scale,
+                         shard=shard_name,
+                         peak_memory_gib=round(peak_gib, 2),
+                         sampled_peak_gib=round(shard_peak_gib, 2),
+                         kernel_peak_gib=round(kernel_peak_gib, 2),
+                         memory_limit_gib=round(mem_limit_gib, 2),
+                         chunks=chunks_written,
+                         uploaded_mib=round(uploaded_bytes / (1 << 20), 1))
 
             logger.info("Shard complete",
                          scale=scale,
@@ -515,8 +561,8 @@ class ShardProcessor:
                          upload_s=round(upload_elapsed, 1),
                          uploaded_mib=round(uploaded_bytes / (1 << 20), 1),
                          uncompressed_gib=round(shard_uncompressed_bytes / (1 << 30), 3),
-                         shard_peak_memory_gib=round(shard_peak_gib, 2),
-                         cgroup_peak_memory_gib=round(cgroup_peak_gib, 2),
+                         peak_memory_gib=round(peak_gib, 2),
+                         memory_limit_gib=round(mem_limit_gib, 2),
                          batches=batches_committed,
                          chunks_written=chunks_written,
                          chunks_failed=chunks_failed,
@@ -591,9 +637,14 @@ class CloudRunWorker:
         return elapsed_minutes < self.config.max_processing_time_minutes
 
     async def run(self):
+        mem_current, mem_limit, _ = _read_cgroup_memory()
+        mem_limit_gib = mem_limit / (1 << 30) if mem_limit > 0 else 0
         logger.info("Starting worker",
                      scales=self.config.scales,
-                     downres_scales=self.config.downres_scales)
+                     downres_scales=self.config.downres_scales,
+                     memory_limit_gib=round(mem_limit_gib, 2),
+                     memory_current_gib=round(mem_current / (1 << 30), 2) if mem_current else 0,
+                     worker_memory_gib=self.config.worker_memory_gib)
 
         processed_count = 0
         failed_count = 0
@@ -609,6 +660,23 @@ class CloudRunWorker:
                 logger.warning("Time limit reached, stopping",
                                 processed=processed_count, remaining=len(my_shards) - processed_count - failed_count)
                 break
+
+            # Check memory headroom before starting a new shard.
+            mem_current, mem_limit, _ = _read_cgroup_memory()
+            if mem_limit > 0 and mem_current > 0:
+                usage_pct = mem_current / mem_limit
+                if usage_pct > 0.90:
+                    logger.error("Memory critical before shard",
+                                  scale=scale, shard=shard_name,
+                                  memory_gib=round(mem_current / (1 << 30), 2),
+                                  memory_limit_gib=round(mem_limit / (1 << 30), 2),
+                                  usage_pct=round(usage_pct * 100, 1))
+                elif usage_pct > 0.75:
+                    logger.warning("Memory pressure before shard",
+                                    scale=scale, shard=shard_name,
+                                    memory_gib=round(mem_current / (1 << 30), 2),
+                                    memory_limit_gib=round(mem_limit / (1 << 30), 2),
+                                    usage_pct=round(usage_pct * 100, 1))
 
             try:
                 success = self.processor.process_shard(scale, shard_name)

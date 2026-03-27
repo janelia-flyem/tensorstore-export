@@ -341,7 +341,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: (arrow + 1.3 * shard_on_tmpfs + 1.5) * 1.3")
+    print(f"  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")

@@ -88,39 +88,36 @@ def estimate_memory_gib(arrow_size_bytes: int, chunk_count: int = 0,
 
     Memory components:
       - Arrow file loaded into RAM by BRAID (~1× file size)
-      - Output shard file on tmpfs (chunks × compressed_KB_per_chunk)
-      - TensorStore RMW overhead (~0.3× shard size during commit)
-      - Python runtime + libraries baseline
+      - Output shard file on tmpfs (chunks × KB_per_chunk)
+      - TensorStore RMW peak: old + new shard in memory (~2× shard size)
+      - Additive headroom for Python runtime, libraries, GCS client
 
-    The compressed output size per chunk depends on the scale: coarser scales
-    have denser label data that compresses less.  KB/chunk rates below are
-    empirical maximums from the mCNS v0.11 export (March 2026).
+    KB/chunk rates are the observed MAX from the mCNS v0.11 export
+    (25,541 shards, March 2026).  See analysis/v011_shard_memory.csv.
     """
-    # Empirical max compressed KB per chunk in output shard, by scale.
-    # Measured from successful Cloud Run tasks (uploaded_mib / chunks_written).
-    # These are conservative (max, not mean) values.
+    # Observed max compressed KB per chunk in output shard, by scale.
+    # From: pixi run analyze-memory (v0.11 production data, 25,541 shards).
     KB_PER_CHUNK = {
-        0: 150,   # scale 0: sparse chunks, high compression
-        1: 200,   # scale 1
-        2: 280,   # scale 2
-        3: 400,   # scale 3: dense chunks, lower compression
-        4: 530,   # scale 4
-        5: 630,   # scale 5: densest
-        6: 750,   # scale 6 (extrapolated)
-        7: 530,   # scale 7
-        8: 570,   # scale 8
-        9: 430,   # scale 9
+        0: 14,    # p95=7,   max=14
+        1: 27,    # p95=21,  max=27
+        2: 43,    # p95=39,  max=43
+        3: 76,    # p95=67,  max=76
+        4: 126,   # p95=116, max=126
+        5: 192,   # p95=192, max=192
+        6: 249,   # p95=249, max=249
+        7: 162,   # p95=162, max=162
+        8: 150,   # p95=150, max=150
+        9: 122,   # p95=122, max=122
     }
-    kb_per_chunk = KB_PER_CHUNK.get(scale, 400)
+    kb_per_chunk = KB_PER_CHUNK.get(scale, 150)
 
     arrow_gib = arrow_size_bytes / (1 << 30)
     shard_gib = chunk_count * kb_per_chunk / (1024 * 1024)
 
-    # Memory = Arrow_in_RAM + shard_on_tmpfs × 1.3 (RMW overhead) + baseline
-    # 1.3× accounts for TensorStore reading old shard + writing new during RMW.
-    # 1.5 GiB baseline: Python runtime, libraries, decompression buffers.
-    # Final 1.3× safety margin on the total.
-    return (arrow_gib + 1.3 * shard_gib + 1.5) * 1.3
+    # During batched RMW commit, TensorStore holds old + new shard in memory,
+    # so peak tmpfs is ~2× the final shard size.  Additive 2 GiB covers
+    # Python runtime, BRAID, pyarrow, GCS client, and decompression buffers.
+    return arrow_gib + 2 * shard_gib + 2.0
 
 
 def pick_tier(mem_needed_gib: float, min_tier: int = 4) -> int:
@@ -229,7 +226,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: (arrow + 1.3 * shard_on_tmpfs + 1.5) * 1.3")
+    print(f"  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")

@@ -75,6 +75,8 @@ def classify_error(error_str: str) -> str:
         return "file_not_found"
     if "timeout" in error_str.lower():
         return "timeout"
+    if "memory" in error_str.lower() or "oom" in error_str.lower():
+        return "memory_pressure"
     return "other"
 
 
@@ -111,7 +113,10 @@ def job_exists(job_name: str, project: str, region: str) -> bool:
 
 def query_scale_logs(job_name: str, project: str, region: str,
                      limit: int, use_all: bool, execution: str = ""):
-    """Query all log types for a single scale job. Returns (chunks, shards, successes)."""
+    """Query all log types for a single scale job.
+
+    Returns (chunks, shards, successes, progress, memory_warnings, exec_filter).
+    """
     # Resolve execution for this specific job
     exec_filter = execution
     if not exec_filter and not use_all:
@@ -123,7 +128,12 @@ def query_scale_logs(job_name: str, project: str, region: str,
                                "Failed to process shard", limit, exec_filter)
     success_entries = query_logs(job_name, project, region,
                                  "Shard complete", limit, exec_filter)
-    return chunk_entries, shard_entries, success_entries, exec_filter
+    progress_entries = query_logs(job_name, project, region,
+                                  "Shard progress", limit, exec_filter)
+    memory_entries = query_logs(job_name, project, region,
+                                "Memory critical\\|Memory pressure", limit, exec_filter)
+    return (chunk_entries, shard_entries, success_entries,
+            progress_entries, memory_entries, exec_filter)
 
 
 def main():
@@ -198,15 +208,20 @@ def main():
     all_chunk_entries = []
     all_shard_entries = []
     all_success_entries = []
+    all_progress_entries = []
+    all_memory_entries = []
     executions = {}
 
     for jn in job_names:
-        chunks, shards, successes, exec_name = query_scale_logs(
+        (chunks, shards, successes,
+         progress, memory_warns, exec_name) = query_scale_logs(
             jn, project, region, args.limit, args.all, args.execution
         )
         all_chunk_entries.extend(chunks)
         all_shard_entries.extend(shards)
         all_success_entries.extend(successes)
+        all_progress_entries.extend(progress)
+        all_memory_entries.extend(memory_warns)
         if exec_name:
             executions[jn] = exec_name
 
@@ -323,7 +338,61 @@ def main():
             print(f"    {err['error'][:200]}")
         print()
 
-    if not all_errors and not shard_load_failures:
+    # Detect incomplete shards: had "Shard progress" but no "Shard complete"
+    # or "Failed to process shard".  These are likely OOM-killed tasks.
+    completed_shards = set()
+    for entry in all_success_entries:
+        payload = parse_structured_payload(entry)
+        completed_shards.add((payload.get("scale"), payload.get("shard")))
+    for entry in all_shard_entries:
+        payload = parse_structured_payload(entry)
+        completed_shards.add((payload.get("scale"), payload.get("shard")))
+
+    in_progress_shards = {}
+    for entry in all_progress_entries:
+        payload = parse_structured_payload(entry)
+        key = (payload.get("scale"), payload.get("shard"))
+        if key not in in_progress_shards:
+            in_progress_shards[key] = payload
+
+    incomplete = {k: v for k, v in in_progress_shards.items()
+                  if k not in completed_shards}
+
+    if incomplete:
+        print(f"Incomplete shards (started but no completion log): {len(incomplete)}")
+        print("  These shards had progress logs but no Shard complete or failure.")
+        print("  Likely cause: OOM kill, task timeout, or infrastructure error.")
+        for (scale, shard), payload in sorted(incomplete.items())[:20]:
+            mem = payload.get("memory_gib", 0)
+            written = payload.get("chunks_written", 0)
+            total = payload.get("total", 0)
+            print(f"  s{scale} {shard}: "
+                  f"{written}/{total} chunks, {mem:.1f}G memory at last progress")
+        if len(incomplete) > 20:
+            print(f"  ... and {len(incomplete) - 20} more")
+        print()
+
+    # Report memory pressure warnings from worker
+    if all_memory_entries:
+        mem_warnings = []
+        for entry in all_memory_entries:
+            payload = parse_structured_payload(entry)
+            mem_warnings.append(payload)
+        critical = [m for m in mem_warnings
+                    if "critical" in entry.get("textPayload", "").lower()]
+        print(f"Memory pressure events: {len(mem_warnings)} "
+              f"({len(critical)} critical)")
+        for m in mem_warnings[:10]:
+            print(f"  s{m.get('scale', '?')} {m.get('shard', '?')}: "
+                  f"{m.get('memory_gib', 0):.1f}G / "
+                  f"{m.get('memory_limit_gib', 0):.0f}G "
+                  f"({m.get('usage_pct', 0):.0f}%)")
+        if len(mem_warnings) > 10:
+            print(f"  ... and {len(mem_warnings) - 10} more")
+        print()
+
+    if (not all_errors and not shard_load_failures
+            and not incomplete and not all_memory_entries):
         print("No errors found!")
 
 

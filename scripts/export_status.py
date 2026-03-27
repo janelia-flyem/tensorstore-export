@@ -397,8 +397,13 @@ def main():
         # Memory stats for completed shards
         stats = summarize_memory(completed)
         if stats:
-            print(f"  Memory: avg {stats['peak_memory_avg']:.1f}G, "
-                  f"max {stats['peak_memory_max']:.1f}G")
+            mem_line = (f"  Memory: avg {stats['peak_memory_avg']:.1f}G, "
+                        f"max {stats['peak_memory_max']:.1f}G")
+            if stats['memory_limit'] > 0:
+                headroom = stats['memory_limit'] - stats['peak_memory_max']
+                mem_line += (f" / {stats['memory_limit']:.0f}G limit "
+                             f"({headroom:.1f}G headroom)")
+            print(mem_line)
             print(f"  Timing: avg {stats['avg_elapsed_s']:.0f}s, "
                   f"max {stats['max_elapsed_s']:.0f}s per shard")
             print(f"  Batch writes: {stats['total_batch_writes']:,} total, "
