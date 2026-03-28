@@ -8,28 +8,29 @@
 
 ## Symptoms
 
-`pixi run verify-export` reports 386 missing NG shard files:
+`pixi run verify-export` reports 393 missing NG shard files:
 
 | Scale | DVID shards | Missing NG shards |
 |-------|-------------|-------------------|
-| 0 | 21,994 | 304 |
-| 1 | 3,364 | 70 |
+| 0 | 21,994 | 308 |
+| 1 | 3,364 | 72 |
 | 2 | 606 | 9 |
 | 3 | 123 | 3 |
-| 4-9 | 38 | 0 |
+| 6 | 2 | 1 |
+| 4-5, 7-9 | 36 | 0 |
 
-This matches the exact count from the v0.11 export (304 missing at scale 0 in z-slabs 45056-59392), but the new export is a completely different DVID version (de91d3 vs 98d699).
+(Note: count increased from initial 386 to 393 after deleting shards
+for replay testing.)
 
 ## Key Finding: Zero-Upload Shards
 
 Cloud Logging reveals **740 shards** completed "successfully" with `uploaded_mib: 0.0` across scales 0-5. These shards:
 
-- Processed real chunk data (non-zero `uncompressed_gib`)
 - Committed transactions without errors (`chunks_failed: 0`)
 - Reported success (`"Shard processed successfully"`)
 - But uploaded nothing to GCS
 
-The 740 zero-upload shards are more than the 386 missing NG shards because multiple DVID shards can map to the same NG shard (many-to-one). The 386 missing are cases where ALL DVID shards mapping to that NG shard produced zero output.
+The 740 zero-upload shards are more than the 393 missing NG shards because multiple DVID shards can map to the same NG shard (many-to-one). The missing shards are cases where ALL DVID shards mapping to that NG shard produced zero output.
 
 ## Zero-Upload Shard Characteristics
 
@@ -79,84 +80,103 @@ A local reproduction using the exact mCNS NG spec, writing 56 chunks at the same
 - File appears immediately after commit, before handle deletion
 - No special close/flush needed
 
-## What's Ruled Out
+## Root Cause: DVID Exported Empty Arrow Files
 
-1. **OOM** — peak memory 0.81 GiB in 4Gi container
-2. **Coordinate mismatch** — all chunks within volume bounds, mapping verified
-3. **TensorStore sharding bug** — local reproduction works correctly
-4. **Handle lifecycle** — TensorStore flushes on commit, not on close
-5. **Zero/empty data** — 2 MiB/chunk uncompressed, matches expected 64^3 * 8 bytes
-6. **Upload code bug** — `os.walk` correctly finds files in subdirectories; other shards on the same task uploaded fine
-7. **Staging directory cleanup race** — cleanup is in `finally` block, after upload
+All 393 missing NG shards correspond to DVID Arrow files that contain
+**zero labels and zero supervoxels**. Every chunk in these shards
+decompresses to all-zero uint64 data. TensorStore correctly skips
+writing a `.shard` file when all data equals the fill value (zero).
 
-## Open Hypotheses
+**No data was lost. There is no TensorStore bug.**
 
-1. **tmpfs flush race condition** — On Cloud Run Gen2 tmpfs, `commit_async().result()` may return before the filesystem has fully materialized the file. Working shards may be large enough that the writes are already flushed by the time the upload walk happens, while small shards (few chunks, fast commits) may hit a race window.
+### Verification
 
-2. **TensorStore internal caching** — TensorStore may cache small shard files in memory and not write them to the file:// kvstore until some threshold or GC trigger. The production behavior might differ from local because of memory pressure or cgroup limits.
+1. `scripts/check_empty_shards.py` ran as a Cloud Run Job (20 tasks,
+   ~20 shards each) checking all 393 missing DVID shards.
 
-3. **Info file issue** — The local staging volume's `info` file is written fresh for each shard. If the file is somehow malformed or truncated on tmpfs, TensorStore might silently produce no output. However, we see no errors logged, and the same info content works for other shards.
+2. For each shard, the Arrow metadata (labels and supervoxels list
+   columns) was inspected without decompressing the DVID blocks.
 
-4. **Small shard threshold** — TensorStore might have an optimization where it doesn't write shard files below some minimum size. The failing shards tend to be small (few chunks). However, the local test with 56 chunks produces a file.
+3. **Result: 393/393 empty, 0 non-empty, 0 errors.**
 
-## Correlation with v0.11
+4. Direct decompression of `14336_12288_45056` (56 chunks) confirmed
+   all voxels are zero for both LABELS and SUPERVOXELS label types.
 
-The v0.11 export (98d699) had exactly 304 missing shards at scale 0 in z-slabs 45056-59392. This new export (de91d3) also has 304 missing at scale 0. However, the Cloud Logging analysis shows zero-upload shards across ALL z-values (not just z >= 45056), suggesting the z-slab correlation in v0.11 was coincidental — those just happened to be the shards where no other DVID shard contributed to the same NG shard.
+### Why DVID exports empty shards
 
-## Local Reproduction Attempts
+DVID's `export-shards` writes an Arrow file for every spatial region
+that intersects the data instance's bounding box, even if the region
+contains no segmentation labels. This produces Arrow files with valid
+chunk coordinates but empty label lists and all-zero compressed blocks.
 
-### Test shard: `67584_47104_20480` (scale 0, 3 chunks, 3 KB Arrow)
+This is a DVID issue — `export-shards` should skip regions with no
+labels to avoid unnecessary empty files.
 
-Chosen for its tiny size. All 3 chunks map to NG shard `0a8b3.shard`.
+### Why this wasn't caught earlier
 
-**Manual reproduction** (`debug_zero_upload.py`): Downloaded shard from GCS,
-replicated the exact write + commit sequence on local tmpfs (`/dev/shm`).
-Result: `8x8x8/0a8b3.shard` (1,749 bytes) produced correctly.
+The v0.11 export (98d699 source) had shards that appeared empty in the
+export but actually contained real segmentation data at the same
+coordinates. This led to a false hypothesis that TensorStore was
+dropping writes. The de91d3 source is a different DVID version where
+these same spatial regions are genuinely empty (false-merge correction
+may have removed labels from these boundary areas).
 
-**Production code path** (`debug_zero_upload_v2.py`): Ran the actual
-`ShardProcessor.process_shard()` method with a mock upload handler on
-local tmpfs. Result: shard file produced correctly.
+### Correlation with v0.11
 
-**Conclusion:** The bug does not reproduce locally, even on tmpfs with the
-exact same code, data, NG spec, and filesystem type. Something specific to
-the Cloud Run Gen2 container environment causes the shard file to not
-materialize after `commit_async().result()`.
+The v0.11 export (98d699) had exactly 304 missing shards at scale 0.
+This export (de91d3) also has ~308 missing at scale 0. The overlap is
+because both versions have the same bounding box, so DVID exports Arrow
+files for the same empty boundary regions.
 
-### TensorStore fill-value hypothesis (DISPROVEN)
+## Investigation Timeline (export-test branch)
 
-TensorStore does not write a shard file when all written data equals the
-fill value (zero for uint64). Initial hypothesis: the failing shards contain
-only background data. **This is wrong.** Direct inspection of failing shards
-shows real segmentation data:
+The investigation initially assumed a TensorStore bug because the v0.11
+export (98d699 source) had shards with real non-zero data at the same
+coordinates. Several hypotheses were tested on Cloud Run:
 
-- `67584_47104_20480` (3 chunks): 3-10% non-zero, labels include 979073363,
-  742360899, 798220710, 860600797
-- `43008_43008_71680` (6 chunks): 6.3% non-zero across all chunks, 2-3
-  unique labels per chunk
+1. **Single shard in isolation** — shard produced correctly (for shards
+   with real data like `67584_47104_20480`).
+2. **Replay task 280's 7-shard sequence** — `14336_12288_45056`
+   produced no output. Initially attributed to accumulated TensorStore
+   state.
+3. **Shared handle reuse** — refactored to one TensorStore handle per
+   scale. Same result: no `.shard` file for `14336_12288_45056`.
+4. **Single shard with new approach** — still no output. Ruled out
+   handle reuse as a factor.
+5. **Arrow metadata inspection** — discovered all 56 chunks have empty
+   labels and supervoxels lists. The data is genuinely all-zero.
+6. **Full verification via Cloud Run** — checked all 393 missing shards.
+   All are empty.
 
-The user also confirmed no segmentation is visible at these coordinates in
-neuroglancer or the original DVID source — suggesting these are real but
-sparse regions at tissue boundaries. However, the data IS non-zero and
-should produce shard output.
+The confusion arose because the v0.11 source (98d699) had real data at
+these coordinates, while the de91d3 source does not. The false-merge
+correction likely removed labels from these boundary regions.
 
-Verified locally: writing 3% non-zero data through the production code path
-correctly produces a shard file. The bug is specific to Cloud Run.
+## TensorStore Behavior (Not a Bug)
 
-## Changes Made
+TensorStore correctly optimizes away writes where all data equals the
+fill value. For `neuroglancer_precomputed` with `uint64` data type, the
+fill value is 0. When all chunks in a shard are zero, `commit_async()`
+succeeds (there are no errors) but produces no `.shard` file because
+there is no data to write. This is correct behavior.
 
-Added diagnostic logging to `_upload_shard_files()` in `src/worker.py`:
-when no shard files are found in the staging directory, logs a warning
-with the full directory listing. This will reveal on the next deploy
-whether the shard file doesn't exist at all vs exists but is being missed.
+The `uncompressed_gib` field in the worker logs was misleading — it
+reflects the raw byte count of chunks written (56 chunks x 64^3 x 8
+bytes = 0.109 GiB) regardless of whether the data is all zeros.
 
-Also changed `"Shard extends beyond volume"` from WARNING to INFO (expected
-edge-of-volume behavior, not actionable).
+## Recommendations
 
-## Next Steps
+1. **Worker: detect and skip all-zero shards.** Before writing chunks,
+   check if the Arrow metadata has empty labels/supervoxels lists. Log
+   a "Shard skipped (empty)" message and return True without writing.
+   This avoids wasting time on chunks that produce no output.
 
-- Deploy with diagnostic logging and retry the failing shards
-- If the staging dir truly has no shard file: investigate TensorStore's
-  behavior in Cloud Run's specific container filesystem / cgroup configuration
-- If the staging dir has the file: investigate the `os.walk` behavior
-- Test with `file_io_sync: true` in TensorStore context to force synchronous writes
-- Consider adding `os.sync()` after `commit_async().result()` as a workaround
+2. **DVID: skip empty regions in export-shards.** The `export-shards`
+   command should not emit Arrow files for spatial regions with no
+   labels. This would eliminate the 393 empty files (~2% of all shards)
+   and avoid confusion in downstream pipelines.
+
+3. **verify-export: distinguish empty from truly missing.** The
+   verification script should check whether missing NG shards
+   correspond to empty Arrow files and report them separately from
+   genuinely missing output.
