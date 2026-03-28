@@ -310,31 +310,6 @@ class ShardProcessor:
                 time.sleep(wait)
         raise RuntimeError("unreachable")
 
-    @staticmethod
-    def _list_staging(staging_dir: str, label: str):
-        """Log all files in the staging directory for debugging."""
-        entries = []
-        total_bytes = 0
-        for root, dirs, files in os.walk(staging_dir):
-            for fn in files:
-                fp = os.path.join(root, fn)
-                rel = os.path.relpath(fp, staging_dir)
-                try:
-                    sz = os.path.getsize(fp)
-                except OSError:
-                    sz = -1
-                entries.append(f"{rel}:{sz}")
-                if sz > 0:
-                    total_bytes += sz
-        logger.info("DEBUG staging listing",
-                     label=label,
-                     staging_dir=staging_dir,
-                     file_count=len(entries),
-                     total_bytes=total_bytes,
-                     total_gib=round(total_bytes / (1 << 30), 3),
-                     files=entries,
-                     pid=os.getpid())
-
     def upload_staging_dir(self, staging_dir: str) -> int:
         """Upload all shard files from a staging directory to GCS.
 
@@ -394,14 +369,6 @@ class ShardProcessor:
             logger.info("Shard loaded",
                          shard=shard_name,
                          chunks=reader.chunk_count)
-
-            # DEBUG: snapshot staging dir before this shard to track accumulation
-            staging_dir = os.path.dirname(
-                dest.spec(retain_context=True).to_json().get("kvstore", {}).get("path", ""))
-            if not staging_dir:
-                # Fallback: resolve from spec
-                staging_dir = dest.spec(retain_context=True).to_json().get("kvstore", {}).get("path", "?")
-            self._list_staging(staging_dir, f"BEFORE shard {shard_name}")
 
             # Per-shard bounds check: scan available_chunks once to detect
             # shards that extend beyond the volume.  Diagnostic only (warn).
@@ -481,11 +448,6 @@ class ShardProcessor:
                 # Commit batch to local disk — sample memory before and after
                 # commit to bracket the RMW peak (old + new shard coexist).
                 if batch_chunks >= BATCH_SIZE:
-                    logger.info("DEBUG committing batch",
-                                 scale=scale, shard=shard_name,
-                                 batch_num=batches_committed,
-                                 batch_chunks=batch_chunks,
-                                 total_written=chunks_written)
                     mem_current, _, _ = _read_cgroup_memory()
                     shard_peak_mem = max(shard_peak_mem, mem_current)
                     txn.commit_async().result()
@@ -515,19 +477,12 @@ class ShardProcessor:
 
             # Commit remaining chunks
             if batch_chunks > 0:
-                logger.info("DEBUG committing final batch",
-                             scale=scale, shard=shard_name,
-                             batch_chunks=batch_chunks,
-                             chunks_written=chunks_written)
                 mem_current, _, _ = _read_cgroup_memory()
                 shard_peak_mem = max(shard_peak_mem, mem_current)
                 txn.commit_async().result()
                 batches_committed += 1
                 mem_current, _, _ = _read_cgroup_memory()
                 shard_peak_mem = max(shard_peak_mem, mem_current)
-
-            # DEBUG: snapshot staging dir after this shard's commits
-            self._list_staging(staging_dir, f"AFTER shard {shard_name}")
 
             # Fail if no chunks were written (all outside bounds or all failed)
             if chunks_written == 0:
@@ -661,9 +616,7 @@ class CloudRunWorker:
         else:
             my_shards = self.processor.list_my_shards()
 
-        # Open one staging dir + TensorStore handle per scale.  Reusing a
-        # single handle per scale avoids the silent-empty-commit bug caused
-        # by repeated open/close of TensorStore on different staging dirs.
+        # Open one staging dir + TensorStore handle per scale.
         scales_needed = sorted(set(scale for scale, _ in my_shards))
         staging_dirs: Dict[int, str] = {}
         ts_handles: Dict[int, ts.TensorStore] = {}
@@ -671,23 +624,8 @@ class CloudRunWorker:
         for scale in scales_needed:
             staging_dir = os.path.join(self.processor._staging_base, f"s{scale}")
             os.makedirs(staging_dir, exist_ok=True)
-            info_path = os.path.join(staging_dir, "info")
-            with open(info_path, "w") as f:
+            with open(os.path.join(staging_dir, "info"), "w") as f:
                 f.write(self.processor._info_json)
-
-            # DEBUG: verify info file written correctly
-            info_size = os.path.getsize(info_path)
-            info_valid = False
-            try:
-                json.loads(open(info_path).read())
-                info_valid = True
-            except Exception:
-                pass
-            logger.info("DEBUG info file",
-                         scale=scale,
-                         info_size=info_size,
-                         info_valid=info_valid,
-                         staging_dir=staging_dir)
 
             ts_handles[scale] = ts.open({
                 "driver": "neuroglancer_precomputed",
@@ -696,15 +634,10 @@ class CloudRunWorker:
                 "open": True,
             }).result()
             staging_dirs[scale] = staging_dir
-
-            # DEBUG: log resolved TensorStore spec
-            resolved = ts_handles[scale].spec(retain_context=True).to_json()
             logger.info("Opened local staging volume",
                          scale=scale,
                          staging_dir=staging_dir,
-                         shape=list(ts_handles[scale].shape),
-                         dtype=str(ts_handles[scale].dtype),
-                         kvstore_path=resolved.get("kvstore", {}).get("path", "?"))
+                         shape=list(ts_handles[scale].shape))
 
         for scale, shard_name in my_shards:
             if not self._should_continue():
@@ -751,12 +684,6 @@ class CloudRunWorker:
         # Upload all accumulated shard files from staging dirs to GCS
         for scale in scales_needed:
             staging_dir = staging_dirs[scale]
-            # DEBUG: final staging snapshot before upload
-            self.processor._list_staging(staging_dir, f"BEFORE upload scale {scale}")
-            mem_current, _, _ = _read_cgroup_memory()
-            logger.info("DEBUG pre-upload memory",
-                         scale=scale,
-                         memory_gib=round(mem_current / (1 << 30), 2) if mem_current else 0)
             upload_start = time.time()
             uploaded_bytes = self.processor.upload_staging_dir(staging_dir)
             upload_elapsed = time.time() - upload_start
