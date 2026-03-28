@@ -28,7 +28,6 @@ import math
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -249,6 +248,54 @@ def launch_job(manifest_uri: str):
     subprocess.run(exec_cmd)
 
 
+def collect_empty_from_logs(output_path: str):
+    """Collect empty shard list from Cloud Logging after a Cloud Run job.
+
+    Queries the check-empty-shards job logs for "Shard is empty" events
+    and writes a JSON file suitable for precompute_manifest.py --exclude-empty.
+    """
+    import subprocess
+
+    env = load_env(ENV_FILE)
+    project = env.get("PROJECT_ID", "")
+
+    print("Querying Cloud Logging for empty shards...")
+    result = subprocess.run(
+        ["gcloud", "logging", "read",
+         'resource.type="cloud_run_job" AND '
+         'resource.labels.job_name="check-empty-shards" AND '
+         'jsonPayload.event="Shard is empty"',
+         "--project", project,
+         "--limit", "10000",
+         "--format", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Error querying logs: {result.stderr}")
+        sys.exit(1)
+
+    entries = json.loads(result.stdout)
+    empty_shards = []
+    for entry in entries:
+        jp = entry.get("jsonPayload", {})
+        if jp.get("shard") and jp.get("scale") is not None:
+            empty_shards.append({"scale": jp["scale"], "shard": jp["shard"]})
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for e in empty_shards:
+        key = (e["scale"], e["shard"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+
+    with open(output_path, "w") as f:
+        json.dump(unique, f, indent=2)
+
+    print(f"Wrote {len(unique)} empty shards to {output_path}")
+
+
 def run_local(report_path: str, max_shards: int):
     """Run checks locally (slow — downloads each Arrow file)."""
     with open(report_path) as f:
@@ -321,10 +368,15 @@ def main():
                         help="Upload manifests and launch Cloud Run job")
     parser.add_argument("--worker", action="store_true",
                         help="Run as Cloud Run worker (reads MANIFEST_URI env)")
+    parser.add_argument("--output-empty", type=str, metavar="PATH",
+                        help="Write empty shard list as JSON (for --exclude-empty "
+                             "in precompute_manifest.py). Extracts from Cloud Logging.")
     args = parser.parse_args()
 
     if args.worker:
         run_worker()
+    elif args.output_empty:
+        collect_empty_from_logs(args.output_empty)
     elif args.launch:
         if not args.report and not args.upload_manifest:
             print("Error: --launch requires --report or --upload-manifest")

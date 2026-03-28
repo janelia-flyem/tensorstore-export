@@ -202,6 +202,12 @@ def main():
         "--dry-run", action="store_true",
         help="Print tier assignments without writing manifests to GCS",
     )
+    parser.add_argument(
+        "--exclude-empty", type=str, default=None,
+        help="Path to JSON file listing empty shards to exclude. "
+             "Format: [{\"scale\": 0, \"shard\": \"name\"}, ...]. "
+             "Generate with: scripts/check_empty_shards.py --report ... --output-empty",
+    )
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
@@ -231,6 +237,17 @@ def main():
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")
         sys.exit(1)
+
+    # Exclude known-empty shards (all-zero labels/supervoxels in Arrow metadata).
+    # These produce no NG output since TensorStore skips fill-value-only writes.
+    if args.exclude_empty:
+        with open(args.exclude_empty) as f:
+            empty_list = json.load(f)
+        empty_set = {(e["scale"], e["shard"]) for e in empty_list}
+        before = len(all_files)
+        all_files = [f for f in all_files if (f[0], f[1]) not in empty_set]
+        excluded = before - len(all_files)
+        print(f"  Excluded {excluded} empty shards (from {args.exclude_empty})")
 
     # Assign to tiers
     tier_map = assign_tiers(all_files, max_tasks)

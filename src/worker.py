@@ -370,6 +370,15 @@ class ShardProcessor:
                          shard=shard_name,
                          chunks=reader.chunk_count)
 
+            # Skip shards where all chunks have empty labels/supervoxels.
+            # These produce all-zero data and TensorStore correctly writes
+            # no .shard file for fill-value-only data.
+            if reader.is_empty:
+                logger.info("Shard skipped (empty)",
+                             scale=scale, shard=shard_name,
+                             chunks=reader.chunk_count)
+                return True
+
             # Per-shard bounds check: scan available_chunks once to detect
             # shards that extend beyond the volume.  Diagnostic only (warn).
             vol_shape = tuple(dest.shape[:3])

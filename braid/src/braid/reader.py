@@ -276,6 +276,21 @@ class ShardReader:
         return len(self._chunk_index)
 
     @property
+    def is_empty(self) -> bool:
+        """True if all chunks have empty labels and supervoxels lists.
+
+        Checks the Arrow column data directly (no decompression needed).
+        An empty shard produces all-zero voxel data when decompressed,
+        and TensorStore will not write a .shard file for all-zero data.
+        """
+        labels_col = self._table.column("labels")
+        supervoxels_col = self._table.column("supervoxels")
+        for i in range(len(self._table)):
+            if len(labels_col[i]) > 0 or len(supervoxels_col[i]) > 0:
+                return False
+        return True
+
+    @property
     def available_chunks(self) -> List[Tuple[int, int, int]]:
         """List of all available chunk coordinates (x, y, z)."""
         return list(self._chunk_index.keys())
