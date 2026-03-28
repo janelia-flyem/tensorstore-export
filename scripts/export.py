@@ -34,6 +34,116 @@ from scripts.precompute_manifest import (
 )
 
 
+SHARDS_PER_CHECK_TASK = 100  # shards per Cloud Run task for zero-check
+
+
+def _remove_zero_shards(all_files: list, env: dict, source_path: str) -> list:
+    """Filter out empty shards by running a Cloud Run job to check Arrow metadata.
+
+    Uploads a manifest of all shards, launches a Cloud Run job that checks
+    each shard's labels/supervoxels columns, collects the empty list from
+    Cloud Logging, and returns the filtered file list.
+    """
+    import math
+    from google.cloud import storage
+
+    image = _get_image(env)
+    if not image:
+        print("  Warning: DOCKER_IMAGE not set, skipping --remove-zeros")
+        return all_files
+
+    project = env.get("PROJECT_ID", "")
+    region = env.get("REGION", "us-central1")
+    bucket_name, source_prefix = source_path.replace("gs://", "").split("/", 1)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    # Build flat shard list and upload per-task manifests
+    shard_list = [{"scale": s, "shard": n} for s, n, _, _ in all_files]
+    num_tasks = math.ceil(len(shard_list) / SHARDS_PER_CHECK_TASK)
+    manifest_prefix = f"{source_prefix}/manifests-check-empty"
+
+    print(f"\n  Uploading {num_tasks} zero-check manifests ({len(shard_list)} shards)...")
+    for i in range(num_tasks):
+        chunk = shard_list[i * SHARDS_PER_CHECK_TASK:(i + 1) * SHARDS_PER_CHECK_TASK]
+        blob = bucket.blob(f"{manifest_prefix}/task-{i}.json")
+        blob.upload_from_string(
+            json.dumps(chunk, separators=(",", ":")),
+            content_type="application/json",
+        )
+
+    manifest_uri = f"{source_path}/manifests-check-empty"
+    job_name = "check-empty-shards"
+
+    # Delete existing job if any
+    subprocess.run(
+        ["gcloud", "run", "jobs", "delete", job_name,
+         "--project", project, "--region", region, "--quiet"],
+        capture_output=True,
+    )
+
+    # Create and execute
+    print(f"  Launching Cloud Run job: {job_name} ({num_tasks} tasks)...")
+    create_cmd = [
+        "gcloud", "run", "jobs", "create", job_name,
+        "--project", project, "--region", region,
+        "--image", image,
+        "--tasks", str(num_tasks),
+        "--task-timeout", "600s",
+        "--max-retries", "1",
+        "--memory", "2Gi", "--cpu", "1",
+        "--set-env-vars",
+        f"SOURCE_PATH={source_path},MANIFEST_URI={manifest_uri}",
+        "--command", "python",
+        "--args", "scripts/check_empty_shards.py,--worker",
+    ]
+    result = subprocess.run(create_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  Warning: failed to create zero-check job: {result.stderr[:200]}")
+        print("  Continuing without zero filtering.")
+        return all_files
+
+    exec_result = subprocess.run(
+        ["gcloud", "run", "jobs", "execute", job_name,
+         "--project", project, "--region", region, "--wait"],
+        capture_output=True, text=True,
+    )
+    if exec_result.returncode != 0:
+        print(f"  Warning: zero-check job failed: {exec_result.stderr[:200]}")
+        print("  Continuing without zero filtering.")
+        return all_files
+
+    # Collect empty shards from Cloud Logging
+    print("  Collecting results from Cloud Logging...")
+    log_result = subprocess.run(
+        ["gcloud", "logging", "read",
+         'resource.type="cloud_run_job" AND '
+         'resource.labels.job_name="check-empty-shards" AND '
+         'jsonPayload.event="Shard is empty"',
+         "--project", project,
+         "--limit", "50000",
+         "--format", "json"],
+        capture_output=True, text=True,
+    )
+    if log_result.returncode != 0:
+        print(f"  Warning: failed to read logs: {log_result.stderr[:200]}")
+        return all_files
+
+    entries = json.loads(log_result.stdout)
+    empty_set = set()
+    for entry in entries:
+        jp = entry.get("jsonPayload", {})
+        if jp.get("shard") and jp.get("scale") is not None:
+            empty_set.add((jp["scale"], jp["shard"]))
+
+    before = len(all_files)
+    all_files = [f for f in all_files if (f[0], f[1]) not in empty_set]
+    excluded = before - len(all_files)
+    print(f"  Excluded {excluded} empty shards ({len(all_files)} remaining)")
+
+    return all_files
+
+
 def _get_image(env: dict) -> str:
     """Get the Docker image URI from .env (set by deploy)."""
     return env.get("DOCKER_IMAGE", "")
@@ -292,6 +402,12 @@ def main():
         help="Suffix for Cloud Run job names (default: derived from --manifest-dir). "
              "E.g., 'retry' produces jobs named {BASE_JOB_NAME}-retry-tier-{N}gi.",
     )
+    parser.add_argument(
+        "--remove-zeros", action="store_true",
+        help="Pre-filter empty shards (all-zero labels/supervoxels) via a "
+             "Cloud Run job before building manifests. Adds ~2 minutes but "
+             "avoids assigning empty shards to export tasks.",
+    )
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
@@ -346,6 +462,10 @@ def main():
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")
         sys.exit(1)
+
+    # --- Optional: filter empty shards via Cloud Run ---
+    if args.remove_zeros:
+        all_files = _remove_zero_shards(all_files, env, source_path)
 
     # --- Step 2: Assign to tiers ---
     tier_map = assign_tiers(all_files, max_tasks)
