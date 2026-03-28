@@ -310,28 +310,8 @@ class ShardProcessor:
                 time.sleep(wait)
         raise RuntimeError("unreachable")
 
-    def _create_local_volume(self, scale: int, shard_name: str) -> str:
-        """Create a local staging directory with the neuroglancer info file.
-
-        Returns the staging directory path.  The info file is written from
-        the cached copy downloaded at startup.
-        """
-        staging_dir = os.path.join(
-            self._staging_base, f"s{scale}_{shard_name}")
-        os.makedirs(staging_dir, exist_ok=True)
-        info_path = os.path.join(staging_dir, "info")
-        with open(info_path, "w") as f:
-            f.write(self._info_json)
-        # Verify the file was written correctly
-        written_size = os.path.getsize(info_path)
-        if written_size != len(self._info_json.encode("utf-8")):
-            logger.error("Info file size mismatch",
-                          expected=len(self._info_json.encode("utf-8")),
-                          written=written_size, path=info_path)
-        return staging_dir
-
-    def _upload_shard_files(self, staging_dir: str) -> int:
-        """Upload shard files from local staging to the GCS destination.
+    def upload_staging_dir(self, staging_dir: str) -> int:
+        """Upload all shard files from a staging directory to GCS.
 
         Walks the staging directory and uploads every file except 'info',
         preserving the directory structure (e.g., s0/070e7.shard).
@@ -341,6 +321,7 @@ class ShardProcessor:
         Returns the number of bytes uploaded.
         """
         uploaded_bytes = 0
+        file_count = 0
         for root, _dirs, files in os.walk(staging_dir):
             for fn in files:
                 if fn == "info":
@@ -349,33 +330,35 @@ class ShardProcessor:
                 rel_path = os.path.relpath(local_path, staging_dir)
                 blob_path = f"{self._dest_prefix}/{rel_path}"
                 blob = self.dest_bucket_obj.blob(blob_path)
-                # Use resumable upload with 8MB chunks to avoid loading
-                # the entire shard file into memory.  Default upload
-                # buffers the whole file, which OOMs for large shards.
                 blob.chunk_size = 8 * (1 << 20)  # 8 MiB
                 blob.upload_from_filename(local_path)
-                uploaded_bytes += os.path.getsize(local_path)
+                size = os.path.getsize(local_path)
+                uploaded_bytes += size
+                file_count += 1
+
+        if file_count == 0:
+            logger.warning("No shard files in staging directory",
+                           staging_dir=staging_dir)
+
         return uploaded_bytes
 
-    def process_shard(self, scale: int, shard_name: str) -> bool:
-        """Process a single shard: read from GCS, write to local disk, upload.
+    def process_shard(self, scale: int, shard_name: str,
+                      dest: ts.TensorStore) -> bool:
+        """Process a single shard: read from GCS, write chunks to local volume.
 
-        1. Downloads Arrow+CSV from GCS and decompresses chunks via BRAID.
-        2. Writes chunks to a local neuroglancer precomputed volume using
-           batched transactions (BATCH_SIZE chunks per batch).  Each batch
-           commit does a read-modify-write on local disk, keeping memory flat.
-        3. Uploads the finished shard file(s) to GCS.
-        4. Cleans up the local staging directory.
+        The TensorStore handle and staging directory are managed by the caller
+        (CloudRunWorker.run).  This method only reads DVID data and writes
+        chunks via batched transactions.
 
         Args:
             scale: Scale level (0, 1, 2, ...)
             shard_name: Shard origin name (e.g., "30720_24576_28672")
+            dest: Pre-opened TensorStore handle for the local staging volume
 
         Returns:
             True if the shard was processed (even with some chunk errors).
             False only if the shard could not be loaded at all.
         """
-        staging_dir = None
         try:
             logger.info("Processing shard", scale=scale, shard=shard_name)
 
@@ -387,15 +370,6 @@ class ShardProcessor:
                          shard=shard_name,
                          chunks=reader.chunk_count)
 
-            # Create local staging volume with info file
-            staging_dir = self._create_local_volume(scale, shard_name)
-            dest = ts.open({
-                "driver": "neuroglancer_precomputed",
-                "kvstore": {"driver": "file", "path": staging_dir},
-                "scale_index": scale,
-                "open": True,
-            }).result()
-
             # Per-shard bounds check: scan available_chunks once to detect
             # shards that extend beyond the volume.  Diagnostic only (warn).
             vol_shape = tuple(dest.shape[:3])
@@ -406,7 +380,7 @@ class ShardProcessor:
                     if v > max_voxel[d]:
                         max_voxel[d] = v
             if any(mv > vs for mv, vs in zip(max_voxel, vol_shape)):
-                logger.warning("Shard extends beyond volume",
+                logger.info("Shard extends beyond volume",
                                scale=scale, shard=shard_name,
                                shard_max_voxel=tuple(max_voxel),
                                volume_shape=vol_shape)
@@ -519,11 +493,6 @@ class ShardProcessor:
                              chunks_failed=chunks_failed)
                 return False
 
-            # Upload finished shard file(s) to GCS
-            upload_start = time.time()
-            uploaded_bytes = self._upload_shard_files(staging_dir)
-            upload_elapsed = time.time() - upload_start
-
             elapsed = time.time() - shard_start_time
             mem_current, mem_limit, cgroup_peak = _read_cgroup_memory()
             shard_peak_mem = max(shard_peak_mem, mem_current)
@@ -551,15 +520,12 @@ class ShardProcessor:
                          sampled_peak_gib=round(shard_peak_gib, 2),
                          kernel_peak_gib=round(kernel_peak_gib, 2),
                          memory_limit_gib=round(mem_limit_gib, 2),
-                         chunks=chunks_written,
-                         uploaded_mib=round(uploaded_bytes / (1 << 20), 1))
+                         chunks=chunks_written)
 
             logger.info("Shard complete",
                          scale=scale,
                          shard=shard_name,
                          elapsed_s=round(elapsed, 1),
-                         upload_s=round(upload_elapsed, 1),
-                         uploaded_mib=round(uploaded_bytes / (1 << 20), 1),
                          uncompressed_gib=round(shard_uncompressed_bytes / (1 << 30), 3),
                          peak_memory_gib=round(peak_gib, 2),
                          memory_limit_gib=round(mem_limit_gib, 2),
@@ -574,16 +540,11 @@ class ShardProcessor:
                           scale=scale, shard=shard_name, error=str(e))
             return False
 
-        finally:
-            # Clean up local staging to free disk for the next shard
-            if staging_dir and os.path.isdir(staging_dir):
-                shutil.rmtree(staging_dir, ignore_errors=True)
-
     def downres_scale(self, scale: int) -> bool:
         """Generate a scale by downsampling the previous scale from the destination.
 
         Reads scale N-1 from the neuroglancer precomputed volume on GCS,
-        downsamples 2× in each dimension using majority vote, and writes
+        downsamples 2x in each dimension using majority vote, and writes
         scale N.  Requires scale N-1 to be fully written.
 
         Args:
@@ -655,6 +616,29 @@ class CloudRunWorker:
         else:
             my_shards = self.processor.list_my_shards()
 
+        # Open one staging dir + TensorStore handle per scale.
+        scales_needed = sorted(set(scale for scale, _ in my_shards))
+        staging_dirs: Dict[int, str] = {}
+        ts_handles: Dict[int, ts.TensorStore] = {}
+
+        for scale in scales_needed:
+            staging_dir = os.path.join(self.processor._staging_base, f"s{scale}")
+            os.makedirs(staging_dir, exist_ok=True)
+            with open(os.path.join(staging_dir, "info"), "w") as f:
+                f.write(self.processor._info_json)
+
+            ts_handles[scale] = ts.open({
+                "driver": "neuroglancer_precomputed",
+                "kvstore": {"driver": "file", "path": staging_dir},
+                "scale_index": scale,
+                "open": True,
+            }).result()
+            staging_dirs[scale] = staging_dir
+            logger.info("Opened local staging volume",
+                         scale=scale,
+                         staging_dir=staging_dir,
+                         shape=list(ts_handles[scale].shape))
+
         for scale, shard_name in my_shards:
             if not self._should_continue():
                 logger.warning("Time limit reached, stopping",
@@ -679,7 +663,7 @@ class CloudRunWorker:
                                     usage_pct=round(usage_pct * 100, 1))
 
             try:
-                success = self.processor.process_shard(scale, shard_name)
+                success = self.processor.process_shard(scale, shard_name, ts_handles[scale])
 
                 if success:
                     processed_count += 1
@@ -696,6 +680,22 @@ class CloudRunWorker:
                 failed_count += 1
                 logger.error("Unexpected error processing shard",
                               shard=shard_name, scale=scale, error=str(e))
+
+        # Upload all accumulated shard files from staging dirs to GCS
+        for scale in scales_needed:
+            staging_dir = staging_dirs[scale]
+            upload_start = time.time()
+            uploaded_bytes = self.processor.upload_staging_dir(staging_dir)
+            upload_elapsed = time.time() - upload_start
+            logger.info("Upload complete",
+                         scale=scale,
+                         uploaded_bytes=uploaded_bytes,
+                         uploaded_gib=round(uploaded_bytes / (1 << 30), 3),
+                         elapsed_s=round(upload_elapsed, 1))
+
+        # Clean up staging dirs to free tmpfs memory
+        for staging_dir in staging_dirs.values():
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
         # Phase 2: Generate downres scales from previous scale data
         for scale in sorted(self.config.downres_scales):
