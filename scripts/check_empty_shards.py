@@ -57,24 +57,11 @@ def check_shard_empty(source_path: str, scale: int, shard_name: str) -> dict:
             "error": str(e)[:200],
         }
 
-    chunks_with_labels = 0
-    chunks_with_supervoxels = 0
-    total_chunks = reader.chunk_count
-
-    for cx, cy, cz in reader.available_chunks:
-        info = reader.get_chunk_info(cx, cy, cz)
-        if info.get("labels"):
-            chunks_with_labels += 1
-        if info.get("supervoxels"):
-            chunks_with_supervoxels += 1
-
     return {
         "shard": shard_name,
         "scale": scale,
-        "total_chunks": total_chunks,
-        "chunks_with_labels": chunks_with_labels,
-        "chunks_with_supervoxels": chunks_with_supervoxels,
-        "is_empty": chunks_with_labels == 0 and chunks_with_supervoxels == 0,
+        "total_chunks": reader.chunk_count,
+        "is_empty": reader.is_empty,
     }
 
 

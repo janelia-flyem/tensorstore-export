@@ -277,17 +277,23 @@ class ShardReader:
 
     @property
     def is_empty(self) -> bool:
-        """True if all chunks have empty labels and supervoxels lists.
+        """True if no chunk contains non-zero labels or supervoxels.
 
         Checks the Arrow column data directly (no decompression needed).
-        An empty shard produces all-zero voxel data when decompressed,
-        and TensorStore will not write a .shard file for all-zero data.
+        A shard is empty when every chunk's label and supervoxel lists
+        contain only zero (background) or are empty.  Such shards produce
+        all-zero voxel data when decompressed, and TensorStore will not
+        write a .shard file for all-zero (fill-value) data.
         """
         labels_col = self._table.column("labels")
         supervoxels_col = self._table.column("supervoxels")
         for i in range(len(self._table)):
-            if len(labels_col[i]) > 0 or len(supervoxels_col[i]) > 0:
-                return False
+            for val in labels_col[i].as_py():
+                if val != 0:
+                    return False
+            for val in supervoxels_col[i].as_py():
+                if val != 0:
+                    return False
         return True
 
     @property
