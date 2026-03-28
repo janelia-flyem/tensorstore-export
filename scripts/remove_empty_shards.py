@@ -254,6 +254,12 @@ def main():
         "--delete", action="store_true",
         help="Delete confirmed empty shards from GCS (default: detect only)",
     )
+    parser.add_argument(
+        "--output", type=str, metavar="PATH",
+        help="Write confirmed empty shard list to a local JSON file. "
+             "Format: [{\"scale\": 0, \"shard\": \"name\"}, ...]. "
+             "Useful for comparing against verify-export output.",
+    )
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
@@ -303,6 +309,13 @@ def main():
     if not confirmed:
         print("\nNo confirmed empty shards.")
         return
+
+    if args.output:
+        out = sorted([{"scale": s, "shard": n} for s, n in confirmed],
+                     key=lambda e: (e["scale"], e["shard"]))
+        with open(args.output, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"  Wrote {len(out)} empty shards to {args.output}")
 
     if not args.delete:
         print(f"\n{len(confirmed)} empty shards found. "
