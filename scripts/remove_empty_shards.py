@@ -209,6 +209,10 @@ def delete_shards(confirmed: set, source_path: str, env: dict):
         if csv_exists:
             csv_blob.delete()
 
+        print(f"  DELETED s{scale}/{shard_name}: "
+              f"{arrow_size:,} bytes, {chunk_count} chunks, "
+              f"{bpc:.0f} bytes/chunk")
+
         deleted.append({
             "scale": scale,
             "shard": shard_name,
@@ -260,6 +264,13 @@ def main():
              "Format: [{\"scale\": 0, \"shard\": \"name\"}, ...]. "
              "Useful for comparing against verify-export output.",
     )
+    parser.add_argument(
+        "--from-missing", type=str, metavar="REPORT_PATH",
+        help="Delete shards listed as missing in a verify-export JSON report. "
+             "Skips the scan + Cloud Run verification stages — assumes all "
+             "missing shards are empty (verified separately). Still applies "
+             "the bytes-per-chunk safety check before each deletion.",
+    )
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
@@ -267,6 +278,21 @@ def main():
     if not source_path:
         print("Error: SOURCE_PATH not set in .env")
         sys.exit(1)
+
+    # Fast path: delete shards from a verify-export missing report
+    if args.from_missing:
+        with open(args.from_missing) as f:
+            results = json.load(f)
+        confirmed = set()
+        for r in results:
+            for entry in r["missing"]:
+                for dvid_name in entry["dvid_shards"]:
+                    confirmed.add((r["scale"], dvid_name))
+        print(f"Loaded {len(confirmed)} missing shards from {args.from_missing}")
+        print(f"Deleting with bytes-per-chunk safety check "
+              f"(threshold={EMPTY_BYTES_PER_CHUNK_THRESHOLD})...\n")
+        delete_shards(confirmed, source_path, env)
+        return
 
     scales_str = args.scales or env.get("SCALES", "0")
     scales = [int(s.strip()) for s in scales_str.split(",")]
