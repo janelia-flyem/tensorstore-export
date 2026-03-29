@@ -478,6 +478,34 @@ def parent_shards_to_child_shards(
     return sorted(child_shard_set)
 
 
+def shard_chunk_coords(
+    shard_number: int, scale_params: dict
+) -> List[Tuple[int, int, int]]:
+    """Enumerate all (cx, cy, cz) chunk coordinates within a shard.
+
+    Args:
+        shard_number: The shard number.
+        scale_params: Dict with keys: coord_bits, preshift_bits,
+                      minishard_bits, shard_bits, grid_shape, chunk_size,
+                      vol_size.
+
+    Returns:
+        List of (cx, cy, cz) chunk coordinate tuples.
+    """
+    hierarchy = get_shard_chunk_hierarchy(scale_params)
+    shard_shape = hierarchy["shard_shape_in_chunks"]
+    grid_shape = hierarchy["grid_shape_in_chunks"]
+
+    origin = shard_origin_in_chunks(shard_number, scale_params)
+
+    coords = []
+    for dz in range(min(shard_shape[2], grid_shape[2] - origin[2])):
+        for dy in range(min(shard_shape[1], grid_shape[1] - origin[1])):
+            for dx in range(min(shard_shape[0], grid_shape[0] - origin[0])):
+                coords.append((origin[0] + dx, origin[1] + dy, origin[2] + dz))
+    return coords
+
+
 def dvid_to_ng_shard_number(
     shard_name: str, scale_params: dict
 ) -> int:

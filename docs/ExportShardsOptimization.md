@@ -48,51 +48,40 @@ the calibration pool.
 Both use the same volume (mCNS, 94,088 × 78,317 × 134,576 at s0), same NG spec,
 same chunk size (64³), same sharding parameters.
 
-### What data we have for each
+### Data available
 
 | Data | v0.11 | false-merge-corrected |
 |------|-------|-----------------------|
 | Arrow file sizes | Yes | Yes |
 | CSV chunk counts | Yes | Yes |
-| Label profiles (`-labels.csv` from `profile_shards.py`) | **Yes** (21,834 files at `gs://flyem-dvid-exports/mCNS-98d699/segmentation/`) | **No** — needs `profile_shards.py` run |
-| NG output shard sizes (per-shard) | **Yes** (25,541-row CSV at `analysis/v011_shard_memory.csv`) | **Totals/max/p95 per scale only** — no per-shard CSV |
-| Full correlation CSV (input→output) | **Yes** | **No** — needs both label profiles and per-shard NG sizes |
+| Label profiles (`-labels.csv`) | Yes (s0-s9) | Yes (s0-s9) |
+| Full correlation CSV | `analysis/v011_shard_memory.csv` (25,541 rows) | `analysis/fmc_shard_memory.csv` (25,739 rows) |
 
-### Measured NG output shard sizes
+### Cross-dataset comparison
 
-| Scale | v0.11 shards | v0.11 total | v0.11 max | FMC shards | FMC total | FMC max |
-|-------|-------------|-------------|-----------|-----------|-----------|---------|
-| s0 | 21,690 | 2,558 GB | 457 MB | 21,690 | 2,565 GB | 457 MB |
-| s1 | 3,294 | 970 GB | 782 MB | 3,294 | 974 GB | 792 MB |
-| s2 | 597 | 251 GB | 1,438 MB | 597 | 252 GB | 1,443 MB |
-| s3 | 120 | 65 GB | 2,539 MB | 120 | 65 GB | 2,568 MB |
-| s4 | 25 | 17 GB | 2,905 MB | 25 | 17 GB | 2,939 MB |
-| s5 | 8 | 4.2 GB | 2,145 MB | 8 | 4.2 GB | 2,145 MB |
-| s6 | 2 | 846 MB | 842 MB | 2 | 859 MB | 859 MB |
-| s7 | 1 | 138 MB | — | 1 | 141 MB | — |
-| s8 | 1 | 22 MB | — | 1 | 23 MB | — |
-| s9 | 1 | 3.6 MB | — | 1 | 3.8 MB | — |
+NG output sizes differ by 0–1.2% between v0.11 and FMC. The regression
+coefficients (`BYTES_PER_UNIQUE_LABEL`, `BYTES_PER_SV`) are identical within
+rounding at all scales with sufficient data (s0-s5), confirming these are
+properties of the compressed_segmentation encoding, not dataset-specific.
 
-NG output sizes differ by 0–1.2% between the two datasets. However, we have
-**not measured** whether the label counts differ — the false-merge-corrected
-dataset removed proofread merges, but we don't know how many additional unique
-labels that produced. Running `profile_shards.py` on both datasets would answer
-this and tell us whether the regression coefficients are stable across label
-states, or whether the similar NG sizes simply reflect similar label densities.
+FMC has slightly higher max bytes-per-chunk at s3-s9 (1–4% above v0.11),
+reflecting marginally higher label density after merge removal.
+`BYTES_PER_CHUNK` uses the max across both datasets.
 
-## Regression Analysis (v0.11, 25,541 shards)
+## Regression Analysis
 
-From `analysis/v011_shard_memory.csv`, fitting `ng_output_bytes = coeff × predictor`
-(least-squares through origin):
+Fitting `ng_output_bytes = coeff × predictor` (least-squares through origin),
+validated on both v0.11 (25,541 shards) and FMC (25,739 shards). Coefficients
+shown are from FMC; v0.11 produces identical values within rounding.
 
-| Scale | N | B/chunk | R²(chunk) | B/unique_label | R²(UL) | B/supervoxel | R²(SV) |
-|-------|------|---------|-----------|----------------|--------|--------------|--------|
-| s0 | 21,533 | 5,275 | 0.725 | 395 | 0.956 | 347 | 0.958 |
-| s1 | 3,261 | 15,602 | 0.806 | 342 | 0.962 | 287 | 0.970 |
-| s2 | 591 | 31,102 | 0.890 | 153 | 0.976 | 125 | 0.983 |
-| s3 | 118 | 60,633 | 0.953 | 55 | 0.990 | 44 | 0.990 |
-| s4 | 25 | 114,754 | 0.982 | 23 | 0.996 | 18 | 0.992 |
-| s5 | 8 | 195,951 | 0.999 | 13 | 0.999 | 10 | 0.996 |
+| Scale | N | B/unique_label | R²(UL) | B/supervoxel | R²(SV) |
+|-------|------|----------------|--------|--------------|--------|
+| s0 | 21,690 | 394 | 0.956 | 348 | 0.959 |
+| s1 | 3,294 | 341 | 0.962 | 288 | 0.970 |
+| s2 | 597 | 153 | 0.977 | 125 | 0.984 |
+| s3 | 120 | 55 | 0.990 | 44 | 0.991 |
+| s4 | 25 | 23 | 0.996 | 18 | 0.993 |
+| s5 | 8 | 13 | 0.999 | 10 | 0.997 |
 
 **Key findings:**
 
@@ -104,92 +93,95 @@ From `analysis/v011_shard_memory.csv`, fitting `ng_output_bytes = coeff × predi
    sparse tissue, while a dense interior shard has 30,000 chunks packed with
    labels. Same chunk count, wildly different output size.
 
-3. **The per-scale coefficients vary significantly.** `B/chunk` spans 37×
-   (5,275 at s0 → 195,951 at s5). `B/unique_label` spans 30× (395 at s0 → 13 at
-   s5). This means any formula needs per-scale constants.
+3. **The per-scale coefficients vary significantly.** `B/unique_label` spans 30×
+   (394 at s0 → 13 at s5). This means any formula needs per-scale constants.
 
-4. **`total_sv` and `total_labels` are identical in v0.11** (agglomerated labels =
-   supervoxels for this particular export). They would differ for a
-   supervoxel-only export.
+4. **Coefficients are stable across datasets.** v0.11 and FMC produce identical
+   regression coefficients despite FMC having merges removed. This confirms the
+   coefficients are a property of compressed_segmentation encoding geometry, not
+   the specific label state.
 
-## Two Prediction Tiers
+## Prediction Model
 
-### Tier 1: Chunk-count model (conservative, no profiling)
+### Label-aware model (primary)
 
-The actual chunk count per shard is available cheaply from the companion CSV
-files in the DVID export (`wc -l` minus header). For downres scales, it comes
-from `chunks_per_shard()` in `ng_sharding.py`.
+```
+output_shard_bytes ≈ total_unique_labels × BYTES_PER_UNIQUE_LABEL[scale]
+```
+
+R² > 0.95 at all scales, validated across two datasets. The number of unique
+labels per shard is obtainable for all scales through a cascading prediction
+chain (see below).
+
+### Label prediction chain
+
+Each step pre-computes the next scale's per-chunk label predictions so the
+manifest can use them directly:
+
+1. `profile_shards.py` on s0 Arrow files → writes s0 -labels.csv (actual)
+   AND s1 predicted labels (from set union of 8 parent s0 chunks per s1 chunk)
+2. An aggregation step merges partial s1 predictions into per-shard files
+3. s0→s1 manifest reads s1 -labels.csv → `BYTES_PER_UNIQUE_LABEL[1]` → tier
+4. s0→s1 worker writes s1 output, reads back chunks, counts actual labels,
+   groups 8 s1 chunks per s2 chunk → writes s2 partial predictions
+5. Aggregation merges s2 partials → per-shard s2 -labels.csv
+6. s1→s2 manifest reads s2 -labels.csv → tier assignment
+7. And so on (worker at scale N produces sN+1 predictions, unless last scale)
+
+All -labels.csv files are stored in the source Arrow+CSV bucket under
+`s{N}/` directories (creating new scale directories as needed). This keeps
+label metadata co-located with source data in the same single-region bucket.
+
+### Chunk-count fallback (deprecated)
+
+When no -labels.csv exists for a scale, falls back to a conservative
+chunk-count model:
 
 ```
 output_shard_bytes ≈ num_chunks × BYTES_PER_CHUNK[scale]
 ```
 
 This uses the worst-case bytes-per-chunk observed across all shards at that
-scale. It overestimates for most shards because the brain sparsely fills the
-bounding volume — boundary shards and tissue-edge shards have much lower label
-density per chunk than the worst-case interior shard. At s0, the median
-overestimate is 3× and the 95th percentile is 20×. But it never underestimates,
-so it's safe for tier placement (overestimation only wastes memory headroom).
-
-### Tier 2: Label-aware model (precise, requires profiling)
-
-When per-shard label profiles are available (from running `profile_shards.py`
-against the DVID Arrow files), use the label-based predictor:
-
-```
-output_shard_bytes ≈ total_unique_labels × BYTES_PER_UNIQUE_LABEL[scale]
-```
-
-This produces much tighter tier assignments (R² > 0.95 at all scales),
-potentially saving 20–30% on Cloud Run costs by avoiding unnecessary bumps to
-larger tiers.
-
-For s1+ (downres), we don't have DVID Arrow files to profile. The chunk-count
-model is the only option unless we develop a way to estimate child-scale label
-counts from parent-scale data.
+scale. It overestimates by 2–5× at median (20× at p95 for s0) because the
+brain sparsely fills the bounding volume. Safe for tier placement but wastes
+cost. The label-aware model should be used for all production exports.
 
 ## Derived Constants
 
-### `BYTES_PER_CHUNK` (chunk-count model)
+### `BYTES_PER_UNIQUE_LABEL` (primary model)
 
-`max(ng_output_bytes / chunk_count)` across all shards at each scale. This is
-**not** `max_shard_file / full_shard_chunks` — the densest bytes-per-chunk shard
-is often a partially-filled shard with high label density, not a full 32K-chunk
-interior shard. (At s4, the densest shard has 22,565 chunks, not 32,768.)
+Regression coefficients validated across both datasets (v0.11 and FMC produce
+identical coefficients within rounding, confirming these are properties of the
+compressed_segmentation encoding rather than dataset-specific):
 
-From v0.11 analysis (25,541 shards):
+| Scale | B/unique_label | R²(UL) | B/supervoxel | R²(SV) |
+|-------|---------------|--------|-------------|--------|
+| s0 | 394 | 0.956 | 348 | 0.959 |
+| s1 | 341 | 0.962 | 288 | 0.970 |
+| s2 | 153 | 0.977 | 125 | 0.984 |
+| s3 | 55 | 0.990 | 44 | 0.991 |
+| s4 | 23 | 0.996 | 18 | 0.993 |
+| s5 | 13 | 0.999 | 10 | 0.997 |
 
-| Scale | Bytes/chunk | Source shard | Chunks | Output |
-|-------|-------------|-------------|--------|--------|
-| s0 | 13,932 | 36864_43008_108544 | 32,768 | 457 MB |
-| s1 | 27,919 | 26624_34816_49152 | 24,603 | 687 MB |
-| s2 | 44,482 | 6144_10240_26624 | 1,558 | 69 MB |
-| s3 | 77,480 | 6144_2048_2048 | 32,768 | 2,539 MB |
-| s4 | 128,757 | 2048_0_0 | 22,565 | 2,905 MB |
-| s5 | 196,923 | 0_0_2048 | 6,138 | 1,209 MB |
-| s6 | 255,166 | 0_0_0 | 3,301 | 842 MB |
-| s7 | 166,127 | 0_0_0 | 828 | 138 MB |
-| s8 | 153,717 | 0_0_0 | 143 | 22 MB |
-| s9 | 125,268 | 0_0_0 | 29 | 3.6 MB |
+### `BYTES_PER_CHUNK` (fallback only)
 
-**Limitation**: this is a worst-case upper bound. The brain sparsely fills the
-bounding volume, so most shards have much lower bytes-per-chunk than the max.
-At s0, the median overestimate is 3.0× and the 95th percentile is 20×. This
-means the chunk-count model reliably avoids under-allocation (OOM) but wastes
-tier capacity for most shards. The label-aware model is much tighter.
+Used only when no -labels.csv exists for a scale.
+`max(ng_output_bytes / chunk_count)` across all shards, taking the maximum
+across both datasets. Overestimates by 2–5× at median due to sparse volume
+fill, but never underestimates.
 
-### `BYTES_PER_UNIQUE_LABEL` (label-aware model)
-
-Regression coefficients from v0.11 (single-dataset; needs validation with FMC):
-
-| Scale | Coefficient | R² |
-|-------|-------------|------|
-| s0 | 395 | 0.956 |
-| s1 | 342 | 0.962 |
-| s2 | 153 | 0.976 |
-| s3 | 55 | 0.990 |
-| s4 | 23 | 0.996 |
-| s5 | 13 | 0.999 |
+| Scale | Bytes/chunk | v0.11 | FMC |
+|-------|-------------|-------|-----|
+| s0 | 13,932 | 13,932 | 13,932 |
+| s1 | 27,919 | 27,919 | 27,919 |
+| s2 | 44,482 | 44,482 | 44,482 |
+| s3 | 78,376 | 77,480 | 78,376 |
+| s4 | 130,244 | 128,757 | 130,244 |
+| s5 | 199,396 | 196,923 | 199,396 |
+| s6 | 258,999 | 255,166 | 258,999 |
+| s7 | 170,713 | 166,127 | 170,713 |
+| s8 | 159,269 | 153,717 | 159,269 |
+| s9 | 129,385 | 125,268 | 129,385 |
 
 ### Fixed overheads
 

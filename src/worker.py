@@ -10,20 +10,25 @@ Each worker processes shards one at a time until the time limit is reached.
 """
 
 import base64
+import csv
+import io
 import json
 import os
 import shutil
 import time
 import asyncio
+from collections import defaultdict
 from pathlib import Path
 from typing import Tuple, Dict, Any, List
 
+import numpy as np
 import structlog
 import tensorstore as ts
 from google.cloud import storage
 from pydantic import BaseModel
 
 from braid import ShardReader, LabelType
+from src.ng_sharding import shard_chunk_coords, load_ng_spec_from_dict
 
 logger = structlog.get_logger()
 
@@ -593,6 +598,64 @@ class ShardProcessor:
                           scale=scale, error=str(e))
             return False
 
+    def _upload_label_csvs(self, scale: int, shard_number: int,
+                           actual_labels: dict):
+        """Upload actual label counts and next-scale predictions to source bucket.
+
+        Args:
+            scale: Current scale.
+            shard_number: NG shard number.
+            actual_labels: {(cx, cy, cz): set_of_labels} from read-back.
+        """
+        spec_params = load_ng_spec_from_dict(self.config.ng_spec)
+        scale_params = spec_params[scale]
+        shard_bits = scale_params["shard_bits"]
+        hex_digits = -(-shard_bits // 4)
+        shard_hex = f"{shard_number:0{hex_digits}x}"
+
+        # Actual labels CSV for this scale
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["x", "y", "z", "num_labels", "num_supervoxels",
+                         "unique_labels"])
+        for (cx, cy, cz) in sorted(actual_labels.keys()):
+            ul = len(actual_labels[(cx, cy, cz)])
+            writer.writerow([cx, cy, cz, ul, ul, ul])
+
+        blob_path = (f"{self._source_prefix}/s{scale}/"
+                     f"{shard_hex}-labels.csv")
+        blob = self.source_bucket_obj.blob(blob_path)
+        blob.upload_from_string(out.getvalue(), content_type="text/csv")
+        logger.info("Uploaded actual labels CSV",
+                     scale=scale, shard_hex=shard_hex,
+                     chunks=len(actual_labels))
+
+        # Next-scale predicted labels (unless last scale in spec)
+        max_scale = max(spec_params.keys())
+        if scale < max_scale:
+            child_groups = defaultdict(set)
+            for (cx, cy, cz), label_set in actual_labels.items():
+                child_coord = (cx // 2, cy // 2, cz // 2)
+                child_groups[child_coord] |= label_set
+
+            out = io.StringIO()
+            writer = csv.writer(out)
+            writer.writerow(["x", "y", "z", "num_labels",
+                             "num_supervoxels", "unique_labels"])
+            for (cx, cy, cz) in sorted(child_groups.keys()):
+                ul = len(child_groups[(cx, cy, cz)])
+                writer.writerow([cx, cy, cz, ul, ul, ul])
+
+            next_scale = scale + 1
+            blob_path = (f"{self._source_prefix}/s{scale}/"
+                         f"{shard_hex}-s{next_scale}-predicted.csv")
+            blob = self.source_bucket_obj.blob(blob_path)
+            blob.upload_from_string(out.getvalue(), content_type="text/csv")
+            logger.info("Uploaded predicted labels CSV",
+                         scale=scale, shard_hex=shard_hex,
+                         target_scale=next_scale,
+                         predicted_chunks=len(child_groups))
+
     def downres_shard(self, scale: int, shard_bbox: dict) -> Tuple[bool, int]:
         """Generate one output shard at `scale` by downsampling scale-1 from GCS.
 
@@ -671,10 +734,64 @@ class ShardProcessor:
             mem_current, _, _ = _read_cgroup_memory()
             shard_peak_mem = max(shard_peak_mem, mem_current)
 
+            # Read back chunks from tmpfs to count actual unique labels
+            # and compute next-scale predictions.
+            label_readback_start = time.time()
+            actual_labels = {}  # (cx, cy, cz) -> set of unique label values
+
+            if self.config.ng_spec:
+                spec_params = load_ng_spec_from_dict(self.config.ng_spec)
+                scale_params = spec_params.get(scale)
+                if scale_params:
+                    chunk_coords = shard_chunk_coords(shard_number, scale_params)
+                    chunk_size = scale_params["chunk_size"]
+
+                    # Open a read-only handle to the staged shard on tmpfs
+                    local_reader = ts.open({
+                        "driver": "neuroglancer_precomputed",
+                        "kvstore": {"driver": "file", "path": staging_dir},
+                        "scale_index": scale,
+                        "open": True,
+                    }).result()
+
+                    for cx, cy, cz in chunk_coords:
+                        vx0 = cx * chunk_size[0]
+                        vy0 = cy * chunk_size[1]
+                        vz0 = cz * chunk_size[2]
+                        vx1 = min(vx0 + chunk_size[0], scale_params["vol_size"][0])
+                        vy1 = min(vy0 + chunk_size[1], scale_params["vol_size"][1])
+                        vz1 = min(vz0 + chunk_size[2], scale_params["vol_size"][2])
+                        try:
+                            chunk = local_reader[
+                                vx0:vx1, vy0:vy1, vz0:vz1, :
+                            ].read().result()
+                            labels = set(np.unique(chunk).tolist())
+                            # Skip all-zero chunks (background only)
+                            if labels != {0}:
+                                actual_labels[(cx, cy, cz)] = labels
+                        except Exception:
+                            pass  # skip chunks that fail to read
+
+                    label_readback_elapsed = time.time() - label_readback_start
+                    logger.info("Label readback complete",
+                                scale=scale, shard_number=shard_number,
+                                chunks_read=len(actual_labels),
+                                elapsed_s=round(label_readback_elapsed, 2))
+
             # Upload shard file(s) to GCS
             upload_start = time.time()
             uploaded_bytes = self.upload_staging_dir(staging_dir)
             upload_elapsed = time.time() - upload_start
+
+            # Upload label CSVs to source bucket after shard upload
+            if actual_labels:
+                try:
+                    self._upload_label_csvs(
+                        scale, shard_number, actual_labels)
+                except Exception as e:
+                    logger.warning("Failed to upload label CSVs",
+                                   scale=scale, shard_number=shard_number,
+                                   error=str(e)[:200])
 
             elapsed = time.time() - shard_start
 

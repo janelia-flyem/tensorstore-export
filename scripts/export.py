@@ -33,6 +33,7 @@ from scripts.precompute_manifest import (
     distribute_tasks,
     generate_downres_manifests,
 )
+from scripts.aggregate_predicted_labels import aggregate_labels
 
 
 SHARDS_PER_CHECK_TASK = 100  # shards per Cloud Run task for zero-check
@@ -486,7 +487,10 @@ def main():
             sys.exit(1)
         print(f"\nUsing image: {image}")
 
-        # Launch one Cloud Run job per tier per scale
+        # Launch one Cloud Run job per tier per scale.
+        # When --wait is used, process scales sequentially: after each scale
+        # completes, run aggregation to produce label files for the next
+        # scale's manifest (label-aware tier assignment).
         for target_scale in sorted(all_scale_results.keys()):
             tier_info = all_scale_results[target_scale]
             if not tier_info:
@@ -513,6 +517,27 @@ def main():
                     print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
                 else:
                     print(f"  {job_name}: FAILED to execute")
+
+            # After scale completes (--wait), aggregate predictions for next scale
+            if args.wait and target_scale + 1 in downres_scales:
+                next_scale = target_scale + 1
+                print(f"\nAggregating label predictions for s{next_scale}...")
+                try:
+                    aggregate_labels(
+                        source_path, next_scale, str(spec_path_resolved))
+                except Exception as e:
+                    print(f"  Warning: aggregation failed: {e}")
+                    print(f"  s{next_scale} will use chunk-count model.")
+
+                # Re-generate manifests for the next scale using label data
+                print(f"Re-generating manifests for s{next_scale} "
+                      f"with label-aware model...")
+                next_results = generate_downres_manifests(
+                    str(spec_path_resolved), source_path, scales,
+                    [next_scale], max_tasks, dry_run=False,
+                )
+                if next_scale in next_results:
+                    all_scale_results[next_scale] = next_results[next_scale]
 
         print("\nMonitor progress:")
         print("  pixi run export-status")

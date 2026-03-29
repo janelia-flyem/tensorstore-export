@@ -91,6 +91,14 @@ def main():
         "--dry-run", action="store_true",
         help="Scan and show what needs profiling without launching",
     )
+    parser.add_argument(
+        "--wait", action="store_true",
+        help="Block until profiler completes, then aggregate s1 predictions",
+    )
+    parser.add_argument(
+        "--ng-spec",
+        help="Path to NG spec JSON (for post-profiler aggregation; default: NG_SPEC_PATH from .env)",
+    )
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
@@ -215,7 +223,7 @@ def main():
             f"--region={region}",
             f"--project={project}",
             f"--tasks={num_tasks}",
-            "--async",
+            "--wait" if args.wait else "--async",
         ]
         result = subprocess.run(exec_cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -224,8 +232,26 @@ def main():
 
         print(f"\nLaunched {job_name} with {num_tasks} tasks "
               f"({len(need_profiling)} shards)")
-        print(f"Monitor: gcloud run jobs executions list --job={job_name} "
-              f"--region={region} --project={project}")
+
+        if args.wait:
+            # Aggregate s1 predictions after profiler completes
+            ng_spec = args.ng_spec or env.get("NG_SPEC_PATH", "")
+            if ng_spec:
+                from scripts.aggregate_predicted_labels import aggregate_labels
+                spec_path = Path(ng_spec)
+                if not spec_path.is_absolute():
+                    spec_path = Path(__file__).resolve().parent.parent / spec_path
+                print("\nAggregating s1 label predictions...")
+                try:
+                    aggregate_labels(args.output, target_scale=1,
+                                     ng_spec_path=str(spec_path))
+                except Exception as e:
+                    print(f"  Warning: aggregation failed: {e}")
+            else:
+                print("\nSkipping s1 aggregation (no --ng-spec or NG_SPEC_PATH)")
+        else:
+            print(f"Monitor: gcloud run jobs executions list --job={job_name} "
+                  f"--region={region} --project={project}")
     finally:
         os.unlink(env_file.name)
 

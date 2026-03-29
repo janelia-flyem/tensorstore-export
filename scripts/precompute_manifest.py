@@ -90,7 +90,7 @@ def list_arrow_files(source_path: str, scales: list) -> list:
 
 # Max observed bytes per chunk in output .shard file, by scale.
 # Derived as: max(ng_output_bytes / chunk_count) across all shards at each
-# scale, from analysis/v011_shard_memory.csv (25,541 shards).
+# scale, taking the maximum across all calibrated datasets (v0.11 and FMC).
 #
 # IMPORTANT: this is NOT max_shard_size / full_shard_chunks.  The densest
 # bytes-per-chunk shard is often a partially-filled shard with high label
@@ -101,19 +101,19 @@ def list_arrow_files(source_path: str, scales: list) -> list:
 # much lower bytes-per-chunk.  The label-aware model (BYTES_PER_UNIQUE_LABEL)
 # is much tighter when label profiles are available.
 #
-# Source: v0.11 (gs://flyem-male-cns/v0.11/segmentation).
-# Refresh after each new dataset: see docs/ExportShardsOptimization.md §13.
+# Sources: v0.11 + false-merge-corrected (max across both datasets).
+# Refresh after each new dataset: see docs/ExportShardsOptimization.md.
 BYTES_PER_CHUNK = {
-    0:  13_932,   # 13.6 KB — shard 36864_43008_108544 (32,768 chunks)
-    1:  27_919,   # 27.3 KB — shard 26624_34816_49152  (24,603 chunks)
-    2:  44_482,   # 43.4 KB — shard 6144_10240_26624   (1,558 chunks)
-    3:  77_480,   # 75.7 KB — shard 6144_2048_2048     (32,768 chunks)
-    4: 128_757,   # 125.7 KB — shard 2048_0_0          (22,565 chunks)
-    5: 196_923,   # 192.3 KB — shard 0_0_2048          (6,138 chunks)
-    6: 255_166,   # 249.2 KB — shard 0_0_0             (3,301 chunks)
-    7: 166_127,   # 162.2 KB — shard 0_0_0             (828 chunks)
-    8: 153_717,   # 150.1 KB — shard 0_0_0             (143 chunks)
-    9: 125_268,   # 122.3 KB — shard 0_0_0             (29 chunks)
+    0:  13_932,   # 13.6 KB — v0.11 = FMC
+    1:  27_919,   # 27.3 KB — v0.11 = FMC
+    2:  44_482,   # 43.4 KB — v0.11 = FMC
+    3:  78_376,   # 76.5 KB — FMC > v0.11 (77,480)
+    4: 130_244,   # 127.2 KB — FMC > v0.11 (128,757)
+    5: 199_396,   # 194.7 KB — FMC > v0.11 (196,923)
+    6: 258_999,   # 252.9 KB — FMC > v0.11 (255,166)
+    7: 170_713,   # 166.7 KB — FMC > v0.11 (166,127)
+    8: 159_269,   # 155.5 KB — FMC > v0.11 (153,717)
+    9: 129_385,   # 126.4 KB — FMC > v0.11 (125,268)
 }
 
 # Fixed overhead for shard processing (s0): Python + BRAID + pyarrow +
@@ -125,6 +125,15 @@ SHARD_PROC_OVERHEAD_GIB = 2.0
 # read cache (bounded by cache_pool at 256 MB).  Lighter than shard
 # processing — no pyarrow/BRAID/Arrow overhead.
 DOWNRES_OVERHEAD_GIB = 1.5
+
+# Bytes per unique label in the output shard file, by scale.
+# Derived from linear regression of (total_unique_labels, ng_output_bytes)
+# across production shards.  R² > 0.95 for all scales.
+# Much tighter than BYTES_PER_CHUNK when label profiles are available.
+#
+# Sources: v0.11 + false-merge-corrected (max across both datasets).
+# Refresh after each new dataset: see docs/ExportShardsOptimization.md.
+BYTES_PER_UNIQUE_LABEL = {0: 394, 1: 341, 2: 153, 3: 55, 4: 23, 5: 13}
 
 
 def estimate_tmpfs_gib(chunk_count: int, scale: int) -> float:
@@ -230,6 +239,73 @@ def estimate_downres_memory_gib(chunk_count: int, scale: int) -> float:
     return tmpfs_gib + DOWNRES_OVERHEAD_GIB
 
 
+def estimate_downres_memory_label_aware(total_unique_labels: int,
+                                       scale: int) -> float:
+    """Estimate memory for a downres shard using the label-aware model.
+
+    Uses the linear relationship between total unique labels and output
+    shard size (R² > 0.95).  Much tighter than the chunk-count model.
+
+    Args:
+        total_unique_labels: Sum of unique_labels across all chunks in shard.
+        scale: Target scale index.
+
+    Returns:
+        Estimated memory in GiB.
+    """
+    bpul = BYTES_PER_UNIQUE_LABEL.get(scale, 13)
+    output_gib = total_unique_labels * bpul / (1 << 30)
+    return output_gib + DOWNRES_OVERHEAD_GIB
+
+
+def _read_shard_labels(source_path: str, scale: int) -> dict:
+    """Read all -labels.csv files for a scale and return per-shard label totals.
+
+    Args:
+        source_path: GCS or local path to the export root.
+        scale: Scale index to read labels for.
+
+    Returns:
+        Dict mapping shard_hex (str) -> total_unique_labels (int).
+        Empty dict if no label files found.
+    """
+    import csv as csv_mod
+    import io
+
+    prefix = f"{source_path}/s{scale}/"
+    shard_labels = {}
+
+    if prefix.startswith("gs://"):
+        from google.cloud import storage as gcs_storage
+        rest = prefix[len("gs://"):]
+        bucket_name, _, blob_prefix = rest.partition("/")
+        client = gcs_storage.Client()
+        bucket = client.bucket(bucket_name)
+
+        for blob in bucket.list_blobs(prefix=blob_prefix):
+            if not blob.name.endswith("-labels.csv"):
+                continue
+            shard_hex = blob.name.split("/")[-1].replace("-labels.csv", "")
+            text = blob.download_as_text()
+            total = 0
+            for row in csv_mod.DictReader(io.StringIO(text)):
+                total += int(row["unique_labels"])
+            shard_labels[shard_hex] = total
+    else:
+        from pathlib import Path as P
+        p = P(prefix)
+        if p.exists():
+            for f in p.glob("*-labels.csv"):
+                shard_hex = f.stem.replace("-labels", "")
+                total = 0
+                with open(f) as fh:
+                    for row in csv_mod.DictReader(fh):
+                        total += int(row["unique_labels"])
+                shard_labels[shard_hex] = total
+
+    return shard_labels
+
+
 def generate_downres_manifests(
     ng_spec_path: str,
     source_path: str,
@@ -314,10 +390,23 @@ def generate_downres_manifests(
               f"(from {len(parent_shards)} parent shards at s{parent_scale})")
 
         # Step 3: Compute shard bboxes and estimate memory.
+        # Try label-aware model first (much tighter); fall back to chunk-count.
+        shard_labels = _read_shard_labels(source_path, target_scale)
+        if shard_labels:
+            hex_digits = -(-child_params["shard_bits"] // 4)
+            print(f"  Using label-aware model ({len(shard_labels)} shard label files)")
+        else:
+            print(f"  No label files for s{target_scale}, using chunk-count model")
+
         shard_entries = []  # (scale, shard_number, estimated_mem, bbox_dict)
         for sn in child_shards:
             bbox = shard_bbox(sn, child_params)
-            mem = estimate_downres_memory_gib(bbox["num_chunks"], target_scale)
+            shard_hex = f"{sn:0{hex_digits}x}" if shard_labels else ""
+            if shard_hex in shard_labels:
+                mem = estimate_downres_memory_label_aware(
+                    shard_labels[shard_hex], target_scale)
+            else:
+                mem = estimate_downres_memory_gib(bbox["num_chunks"], target_scale)
             shard_entries.append((target_scale, sn, mem, bbox))
 
         # Step 4: Assign to tiers.
