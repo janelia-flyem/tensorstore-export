@@ -107,6 +107,12 @@ from src.ng_sharding import (
     ng_shard_filename,
     load_ng_spec,
     load_ng_spec_from_dict,
+    get_shard_chunk_hierarchy,
+    shard_origin_in_chunks,
+    chunks_per_shard,
+    shard_bbox,
+    parent_shards_to_child_shards,
+    enumerate_shard_bboxes,
 )
 
 
@@ -443,3 +449,210 @@ class TestLoadNgSpec:
                     f"Scale {i}: shard {shard} >= 2^{params['shard_bits']}"
             else:
                 assert shard == 0, f"Scale {i}: shard_bits=0 but shard={shard}"
+
+
+# =========================================================================
+# Shard chunk hierarchy tests — verified against TensorStore C++ reference
+#
+# Reference:
+#   ~/tensorstore/tensorstore/driver/neuroglancer_precomputed/metadata_test.cc
+#     - TEST(GetChunksPerVolumeShardFunctionTest, AllShardsFull)
+#     - TEST(GetChunksPerVolumeShardFunctionTest, PartialShards1Dim)
+#     - TEST(GetChunksPerVolumeShardFunctionTest, PartialShards2Dims)
+# =========================================================================
+
+
+class TestGetShardChunkHierarchy:
+    """Test get_shard_chunk_hierarchy against TensorStore's
+    GetChunksPerVolumeShardFunction test vectors."""
+
+    # TensorStore test setup:
+    #   ShardingSpec: hash=identity, preshift=1, minishard=2, shard=3
+    #   Volume: [99, 98, 97], Chunk: [50, 25, 13]
+    #   Grid: [2, 4, 8], z_bits: [1, 2, 3]
+    TS_PARAMS = {
+        "coord_bits": [1, 2, 3],
+        "preshift_bits": 1,
+        "minishard_bits": 2,
+        "shard_bits": 3,
+        "grid_shape": [2, 4, 8],
+        "chunk_size": [50, 25, 13],
+        "vol_size": [99, 98, 97],
+    }
+
+    def test_shard_shape_in_chunks(self):
+        """Shard shape should be [2, 2, 2] chunks for the TS test case."""
+        h = get_shard_chunk_hierarchy(self.TS_PARAMS)
+        assert h["shard_shape_in_chunks"] == [2, 2, 2]
+
+    def test_minishard_shape_in_chunks(self):
+        """Minishard shape: preshift=1 consumes 1 bit from x (the first dim
+        with bits), giving [2, 1, 1]."""
+        h = get_shard_chunk_hierarchy(self.TS_PARAMS)
+        assert h["minishard_shape_in_chunks"] == [2, 1, 1]
+
+    def test_all_shards_full(self):
+        """AllShardsFull: all 8 shards have 8 chunks."""
+        for sn in range(8):
+            assert chunks_per_shard(sn, self.TS_PARAMS) == 8
+
+    def test_partial_shards_1dim(self):
+        """PartialShards1Dim: grid [2, 4, 7], shards 6-7 have 4 chunks."""
+        params = dict(self.TS_PARAMS, grid_shape=[2, 4, 7])
+        # Shards 0-5: 8 chunks each, shards 6-7: 4 chunks each
+        expected = [8, 8, 8, 8, 8, 8, 4, 4]
+        for sn in range(8):
+            assert chunks_per_shard(sn, params) == expected[sn], \
+                f"shard {sn}: expected {expected[sn]}, got {chunks_per_shard(sn, params)}"
+
+    def test_partial_shards_2dims(self):
+        """PartialShards2Dims: grid [2, 3, 7], mixed chunk counts."""
+        params = dict(self.TS_PARAMS, grid_shape=[2, 3, 7])
+        # Shards with y=2..3 (shard 1,3,5,7) lose 1 of 2 y-chunks
+        expected = [8, 4, 8, 4, 8, 4, 4, 2]
+        for sn in range(8):
+            assert chunks_per_shard(sn, params) == expected[sn], \
+                f"shard {sn}: expected {expected[sn]}, got {chunks_per_shard(sn, params)}"
+
+    def test_mcns_scale0_shard_shape(self):
+        """mCNS v0.11 scale 0: shard shape should be [32, 32, 32] chunks."""
+        spec_path = str(Path(__file__).parent.parent / "examples" /
+                        "mcns-v0.11-export-specs.json")
+        spec = load_ng_spec(spec_path)
+        h = get_shard_chunk_hierarchy(spec[0])
+        assert h["shard_shape_in_chunks"] == [32, 32, 32]
+
+    def test_mcns_scale0_minishard_shape(self):
+        """mCNS v0.11 scale 0: minishard shape should be [8, 8, 8] chunks."""
+        spec_path = str(Path(__file__).parent.parent / "examples" /
+                        "mcns-v0.11-export-specs.json")
+        spec = load_ng_spec(spec_path)
+        h = get_shard_chunk_hierarchy(spec[0])
+        assert h["minishard_shape_in_chunks"] == [8, 8, 8]
+
+    def test_mcns_shard_shape_covers_grid(self):
+        """For every scale, shard shape * max_shards >= grid_shape per dim.
+
+        The shard shape times the number of shards along each dimension
+        must cover the full grid. This is a necessary condition for
+        correct spatial coverage.
+        """
+        spec_path = str(Path(__file__).parent.parent / "examples" /
+                        "mcns-v0.11-export-specs.json")
+        spec = load_ng_spec(spec_path)
+        for i, params in spec.items():
+            h = get_shard_chunk_hierarchy(params)
+            for d in range(3):
+                ss = h["shard_shape_in_chunks"][d]
+                gs = h["grid_shape_in_chunks"][d]
+                assert ss > 0, f"Scale {i}: shard_shape[{d}] = 0"
+                assert ss <= gs, \
+                    f"Scale {i}: shard_shape[{d}] = {ss} > grid[{d}] = {gs}"
+
+
+class TestShardOriginAndBbox:
+    """Test shard_origin_in_chunks and shard_bbox."""
+
+    TS_PARAMS = TestGetShardChunkHierarchy.TS_PARAMS
+
+    def test_shard_0_origin(self):
+        assert shard_origin_in_chunks(0, self.TS_PARAMS) == [0, 0, 0]
+
+    def test_shard_1_origin(self):
+        """Shard 1 -> y offset by 2 chunks."""
+        assert shard_origin_in_chunks(1, self.TS_PARAMS) == [0, 2, 0]
+
+    def test_shard_2_origin(self):
+        """Shard 2 -> z offset by 2 chunks."""
+        assert shard_origin_in_chunks(2, self.TS_PARAMS) == [0, 0, 2]
+
+    def test_all_shard_origins_unique(self):
+        """All 8 shard origins should be distinct."""
+        origins = [tuple(shard_origin_in_chunks(sn, self.TS_PARAMS))
+                   for sn in range(8)]
+        assert len(set(origins)) == 8
+
+    def test_shard_bbox_voxel_extent(self):
+        """shard_bbox returns voxel coordinates, clipped to volume."""
+        bb = shard_bbox(0, self.TS_PARAMS)
+        assert bb["shard_origin"] == [0, 0, 0]
+        # shard_extent: min(2*50, 99-0)=99, min(2*25, 98-0)=50, min(2*13, 97-0)=26
+        assert bb["shard_extent"] == [99, 50, 26]
+        assert bb["num_chunks"] == 8
+
+    def test_shard_bbox_boundary(self):
+        """Boundary shard has clipped extent.
+
+        Shard 7 origin is [0, 2, 6] in chunk space because x has only 1 bit
+        which gets consumed by preshift, so x-origin is always 0.
+        Voxel origin = (0, 50, 78), extent clipped to vol bounds.
+        """
+        bb = shard_bbox(7, self.TS_PARAMS)
+        assert bb["shard_origin"] == [0, 50, 78]
+        # shard_extent: min(2*50, 99-0)=99, min(2*25, 98-50)=48, min(2*13, 97-78)=19
+        assert bb["shard_extent"] == [99, 48, 19]
+
+    def test_mcns_shard0_bbox(self):
+        """mCNS v0.11 scale 0 shard 0: origin at (0,0,0), extent = 32*64 = 2048."""
+        spec_path = str(Path(__file__).parent.parent / "examples" /
+                        "mcns-v0.11-export-specs.json")
+        spec = load_ng_spec(spec_path)
+        bb = shard_bbox(0, spec[0])
+        assert bb["shard_origin"] == [0, 0, 0]
+        assert bb["shard_extent"] == [2048, 2048, 2048]
+        assert bb["num_chunks"] == 32768  # 32^3
+
+
+class TestParentShardsToChildShards:
+    """Test the shard derivation chain for downres."""
+
+    @pytest.fixture
+    def spec(self):
+        spec_path = str(Path(__file__).parent.parent / "examples" /
+                        "mcns-v0.11-export-specs.json")
+        return load_ng_spec(spec_path)
+
+    def test_single_parent_produces_children(self, spec):
+        """A single parent shard should produce 1 or more child shards."""
+        children = parent_shards_to_child_shards([0], spec[0], spec[1])
+        assert len(children) >= 1
+        assert 0 in children  # origin shard maps to origin
+
+    def test_child_shards_in_valid_range(self, spec):
+        """All derived child shards must be valid shard numbers."""
+        children = parent_shards_to_child_shards([0, 1, 2], spec[0], spec[1])
+        max_shard = 1 << spec[1]["shard_bits"]
+        for sn in children:
+            assert 0 <= sn < max_shard, f"Invalid child shard {sn}"
+
+    def test_derivation_chain_decreases_shard_count(self, spec):
+        """Each downres level should have fewer or equal shards."""
+        # Start with all possible s0 shards (full grid)
+        s0_max = 1 << spec[0]["shard_bits"]
+        s0_shards = [sn for sn in range(s0_max) if chunks_per_shard(sn, spec[0]) > 0]
+
+        prev_shards = s0_shards
+        for target_scale in range(1, 5):
+            children = parent_shards_to_child_shards(
+                prev_shards, spec[target_scale - 1], spec[target_scale]
+            )
+            assert len(children) <= len(prev_shards), \
+                f"s{target_scale} has more shards ({len(children)}) than " \
+                f"s{target_scale-1} ({len(prev_shards)})"
+            prev_shards = children
+
+    def test_empty_parent_produces_no_children(self, spec):
+        """No parent shards -> no child shards."""
+        children = parent_shards_to_child_shards([], spec[0], spec[1])
+        assert children == []
+
+    def test_enumerate_shard_bboxes_total_chunks(self, spec):
+        """Total chunks from enumerate_shard_bboxes should match grid volume.
+
+        Uses scale 5 (shard_bits=4 -> 16 shards) for speed.
+        """
+        params = spec[5]
+        bboxes = enumerate_shard_bboxes(params)
+        total = sum(bb["num_chunks"] for bb in bboxes)
+        grid = params["grid_shape"]
+        assert total == grid[0] * grid[1] * grid[2]

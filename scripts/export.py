@@ -31,6 +31,7 @@ from scripts.precompute_manifest import (
     list_arrow_files,
     assign_tiers,
     distribute_tasks,
+    generate_downres_manifests,
 )
 
 
@@ -152,7 +153,8 @@ def _get_image(env: dict) -> str:
 def _create_or_update_job(job_name: str, image: str, env: dict,
                           ng_spec_b64: str, memory: str, cpu: int,
                           tasks: int, manifest_uri: str,
-                          label_type: str, downres: str) -> bool:
+                          label_type: str, downres: str,
+                          downres_mode: bool = False) -> bool:
     """Create or update a Cloud Run job for a tier."""
     env_vars = {
         "SOURCE_PATH": env["SOURCE_PATH"],
@@ -166,6 +168,8 @@ def _create_or_update_job(job_name: str, image: str, env: dict,
     }
     if downres:
         env_vars["DOWNRES_SCALES"] = downres
+    if downres_mode:
+        env_vars["DOWNRES_MODE"] = "1"
 
     # Write env vars to temp YAML (NG_SPEC contains chars that break
     # gcloud's --set-env-vars comma-separated format).
@@ -408,6 +412,12 @@ def main():
              "Cloud Run job before building manifests. Adds ~2 minutes but "
              "avoids assigning empty shards to export tasks.",
     )
+    parser.add_argument(
+        "--downres-mode", action="store_true",
+        help="Generate downres manifests and launch Cloud Run jobs with "
+             "DOWNRES_MODE=1.  Requires --downres to specify target scales. "
+             "Uses the manifest chain approach: s0 shards -> s1 -> s2 -> ...",
+    )
     args = parser.parse_args()
 
     env = load_env(ENV_FILE) if ENV_FILE.exists() else load_env(ENV_EXAMPLE)
@@ -444,6 +454,70 @@ def main():
         ).decode()
     else:
         ng_spec_b64 = ""
+
+    # --- Downres mode: generate manifests + launch with DOWNRES_MODE=1 ---
+    if args.downres_mode:
+        if not downres:
+            print("Error: --downres-mode requires --downres to specify target scales.")
+            sys.exit(1)
+        if not ng_spec_path:
+            print("Error: NG_SPEC_PATH must be configured in .env for --downres-mode.")
+            sys.exit(1)
+
+        downres_scales = [int(s.strip()) for s in downres.split(",")]
+        spec_path_resolved = Path(ng_spec_path)
+        if not spec_path_resolved.is_absolute():
+            spec_path_resolved = Path(__file__).resolve().parent.parent / spec_path_resolved
+
+        print(f"Generating downres manifests for scales {downres_scales}...")
+        all_scale_results = generate_downres_manifests(
+            str(spec_path_resolved), source_path, scales, downres_scales,
+            max_tasks, dry_run=args.dry_run,
+        )
+
+        if args.dry_run:
+            print("\n(dry run — no manifests written, no jobs launched)")
+            return
+
+        # Get Docker image
+        image = _get_image(env)
+        if not image:
+            print("Error: DOCKER_IMAGE not set in .env. Run 'pixi run deploy' first.")
+            sys.exit(1)
+        print(f"\nUsing image: {image}")
+
+        # Launch one Cloud Run job per tier per scale
+        for target_scale in sorted(all_scale_results.keys()):
+            tier_info = all_scale_results[target_scale]
+            if not tier_info:
+                continue
+
+            print(f"\nLaunching downres jobs for scale {target_scale}...")
+            for gib in sorted(tier_info.keys()):
+                manifest_uri, num_tasks = tier_info[gib]
+                cpu = TIER_CPU.get(gib, 2)
+                memory = f"{gib}Gi"
+                job_name = f"{base_name}-downres-s{target_scale}-tier-{gib}gi"
+
+                ok = _create_or_update_job(
+                    job_name, image, env, ng_spec_b64,
+                    memory, cpu, num_tasks, manifest_uri,
+                    label_type, "", downres_mode=True,
+                )
+                if not ok:
+                    print(f"  {job_name}: FAILED to create/update")
+                    continue
+
+                ok = _execute_job(job_name, project, region, num_tasks, args.wait)
+                if ok:
+                    print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
+                else:
+                    print(f"  {job_name}: FAILED to execute")
+
+        print("\nMonitor progress:")
+        print("  pixi run export-status")
+        print("  pixi run export-errors")
+        return
 
     # --- Pre-built manifest path (retry flow) ---
     if args.manifest_dir:

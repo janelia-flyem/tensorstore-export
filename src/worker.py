@@ -593,6 +593,118 @@ class ShardProcessor:
                           scale=scale, error=str(e))
             return False
 
+    def downres_shard(self, scale: int, shard_bbox: dict) -> Tuple[bool, int]:
+        """Generate one output shard at `scale` by downsampling scale-1 from GCS.
+
+        1. Open source scale (N-1) from the dest bucket on GCS (read-only)
+        2. Create tmpfs staging dir with info file
+        3. Open local staging TensorStore (file driver)
+        4. ts.copy(downsampled[bbox], local_dest[bbox]).result()
+        5. Upload shard file(s) to GCS
+        6. Delete staging dir
+
+        Args:
+            scale: Scale level to generate (must be >= 1)
+            shard_bbox: Dict with shard_number, shard_origin, shard_extent,
+                        num_chunks from ng_sharding.shard_bbox()
+
+        Returns:
+            (success, uploaded_bytes) tuple
+        """
+        shard_number = shard_bbox["shard_number"]
+        x0, y0, z0 = shard_bbox["shard_origin"]
+        sx, sy, sz = shard_bbox["shard_extent"]
+        shard_start = time.time()
+
+        staging_dir = os.path.join(
+            self._staging_base, f"downres-s{scale}-{shard_number}"
+        )
+
+        try:
+            logger.info("Downres shard start",
+                        scale=scale, shard_number=shard_number,
+                        origin=(x0, y0, z0), extent=(sx, sy, sz),
+                        num_chunks=shard_bbox["num_chunks"])
+
+            # Reset cgroup peak for per-shard memory tracking
+            peak_reset_ok = _reset_cgroup_peak()
+            mem_at_start, _, _ = _read_cgroup_memory()
+            shard_peak_mem = mem_at_start
+
+            # Open source scale (N-1) from GCS with bounded cache
+            source_spec = {
+                "driver": "neuroglancer_precomputed",
+                "kvstore": self.config.dest_path,
+                "scale_index": scale - 1,
+                "open": True,
+                "context": {
+                    "cache_pool": {"total_bytes_limit": 256 * (1 << 20)},
+                },
+            }
+            source = ts.open(source_spec).result()
+            downsampled = ts.downsample(source, [2, 2, 2, 1], "mode")
+
+            # Create staging dir and write info file
+            os.makedirs(staging_dir, exist_ok=True)
+            with open(os.path.join(staging_dir, "info"), "w") as f:
+                f.write(self._info_json)
+
+            # Open local staging volume
+            local_dest = ts.open({
+                "driver": "neuroglancer_precomputed",
+                "kvstore": {"driver": "file", "path": staging_dir},
+                "scale_index": scale,
+                "open": True,
+            }).result()
+
+            # Copy the downsampled region into local staging
+            logger.info("Downres shard copy start",
+                        scale=scale, shard_number=shard_number,
+                        source_domain=str(source.domain),
+                        dest_domain=str(local_dest.domain))
+
+            ts.copy(
+                downsampled[x0:x0+sx, y0:y0+sy, z0:z0+sz, :],
+                local_dest[x0:x0+sx, y0:y0+sy, z0:z0+sz, :],
+            ).result()
+
+            mem_current, _, _ = _read_cgroup_memory()
+            shard_peak_mem = max(shard_peak_mem, mem_current)
+
+            # Upload shard file(s) to GCS
+            upload_start = time.time()
+            uploaded_bytes = self.upload_staging_dir(staging_dir)
+            upload_elapsed = time.time() - upload_start
+
+            elapsed = time.time() - shard_start
+
+            # Memory reporting
+            mem_current, mem_limit, cgroup_peak = _read_cgroup_memory()
+            shard_peak_mem = max(shard_peak_mem, mem_current)
+            peak_gib = (cgroup_peak / (1 << 30) if peak_reset_ok and cgroup_peak
+                        else shard_peak_mem / (1 << 30))
+
+            logger.info("Downres shard complete",
+                        scale=scale, shard_number=shard_number,
+                        elapsed_s=round(elapsed, 1),
+                        upload_s=round(upload_elapsed, 1),
+                        uploaded_gib=round(uploaded_bytes / (1 << 30), 3),
+                        peak_memory_gib=round(peak_gib, 2),
+                        num_chunks=shard_bbox["num_chunks"])
+
+            return True, uploaded_bytes
+
+        except Exception as e:
+            logger.error("Failed to downres shard",
+                         scale=scale, shard_number=shard_number,
+                         error=str(e))
+            return False, 0
+
+        finally:
+            # Always clean up staging dir to free tmpfs
+            if os.path.isdir(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
 
 class CloudRunWorker:
     """Main Cloud Run worker that finds and processes shards until time limit."""
@@ -707,6 +819,8 @@ class CloudRunWorker:
             shutil.rmtree(staging_dir, ignore_errors=True)
 
         # Phase 2: Generate downres scales from previous scale data
+        # (legacy path — only used when downres_scales is set directly,
+        # not in manifest-driven DOWNRES_MODE)
         for scale in sorted(self.config.downres_scales):
             if not self._should_continue():
                 logger.warning("Time limit reached, skipping downres", scale=scale)
@@ -721,6 +835,81 @@ class CloudRunWorker:
                      elapsed_minutes=round(elapsed, 1),
                      processed=processed_count,
                      failed=failed_count)
+
+    async def run_downres(self):
+        """Run manifest-driven per-shard downres processing.
+
+        Loads a downres manifest (list of shard bboxes), iterates over
+        assigned output shards, calls downres_shard() for each.
+        """
+        mem_current, mem_limit, _ = _read_cgroup_memory()
+        mem_limit_gib = mem_limit / (1 << 30) if mem_limit > 0 else 0
+        logger.info("Starting downres worker",
+                     memory_limit_gib=round(mem_limit_gib, 2),
+                     memory_current_gib=round(mem_current / (1 << 30), 2) if mem_current else 0,
+                     worker_memory_gib=self.config.worker_memory_gib)
+
+        # Load downres manifest (raw dicts with shard_origin, shard_extent, etc.)
+        prefix = self.config.manifest_uri.rstrip("/")
+        task_uri = f"{prefix}/task-{self.processor._task_index}.json"
+        bucket_name, blob_path = _parse_gs_uri(task_uri)
+        blob = self.processor.storage_client.bucket(bucket_name).blob(blob_path)
+        entries = json.loads(blob.download_as_text())
+
+        logger.info("Loaded downres manifest",
+                     manifest_uri=task_uri,
+                     assigned_shards=len(entries))
+
+        processed_count = 0
+        failed_count = 0
+        total_uploaded = 0
+
+        for entry in entries:
+            if not self._should_continue():
+                logger.warning("Time limit reached, stopping downres",
+                               processed=processed_count,
+                               remaining=len(entries) - processed_count - failed_count)
+                break
+
+            # Check memory headroom
+            mem_current, mem_limit, _ = _read_cgroup_memory()
+            if mem_limit > 0 and mem_current > 0:
+                usage_pct = mem_current / mem_limit
+                if usage_pct > 0.90:
+                    logger.error("Memory critical before downres shard",
+                                 scale=entry["scale"],
+                                 shard_number=entry["shard_number"],
+                                 memory_gib=round(mem_current / (1 << 30), 2),
+                                 usage_pct=round(usage_pct * 100, 1))
+                elif usage_pct > 0.75:
+                    logger.warning("Memory pressure before downres shard",
+                                   scale=entry["scale"],
+                                   shard_number=entry["shard_number"],
+                                   memory_gib=round(mem_current / (1 << 30), 2),
+                                   usage_pct=round(usage_pct * 100, 1))
+
+            shard_bbox = {
+                "shard_number": entry["shard_number"],
+                "shard_origin": entry["shard_origin"],
+                "shard_extent": entry["shard_extent"],
+                "num_chunks": entry["num_chunks"],
+            }
+
+            success, uploaded_bytes = self.processor.downres_shard(
+                entry["scale"], shard_bbox
+            )
+            if success:
+                processed_count += 1
+                total_uploaded += uploaded_bytes
+            else:
+                failed_count += 1
+
+        elapsed = (time.time() - self.start_time) / 60
+        logger.info("Downres worker finished",
+                     elapsed_minutes=round(elapsed, 1),
+                     processed=processed_count,
+                     failed=failed_count,
+                     total_uploaded_gib=round(total_uploaded / (1 << 30), 3))
 
 
 def create_config_from_env() -> WorkerConfig:
@@ -776,7 +965,10 @@ async def main():
     try:
         config = create_config_from_env()
         worker = CloudRunWorker(config)
-        await worker.run()
+        if os.environ.get("DOWNRES_MODE") == "1":
+            await worker.run_downres()
+        else:
+            await worker.run()
     except Exception as e:
         logger.error("Worker failed to start", error=str(e))
         raise

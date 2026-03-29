@@ -9,10 +9,13 @@ designed to produce bit-identical results to the C++ reference in:
 
 Key reference functions and their Python equivalents:
 
-  C++ GetCompressedZIndexBits  ->  get_compressed_z_index_bits
-  C++ EncodeCompressedZIndex   ->  compressed_z_index
-  C++ GetChunkShardInfo        ->  chunk_shard_info  (identity hash only)
-  C++ GetShardKey              ->  ng_shard_filename
+  C++ GetCompressedZIndexBits       ->  get_compressed_z_index_bits
+  C++ EncodeCompressedZIndex        ->  compressed_z_index
+  C++ GetChunkShardInfo             ->  chunk_shard_info  (identity hash only)
+  C++ GetShardKey                   ->  ng_shard_filename
+  C++ CompressedMortonBitIterator   ->  _CompressedMortonBitIterator
+  C++ GetShardChunkHierarchy        ->  get_shard_chunk_hierarchy
+  C++ GetChunksPerVolumeShardFunction -> chunks_per_shard / shard_origin_in_chunks
 """
 
 import json
@@ -140,6 +143,339 @@ def ng_shard_filename(shard_number: int, shard_bits: int) -> str:
     """
     hex_digits = -(-shard_bits // 4)  # CeilOfRatio(shard_bits, 4)
     return f"{shard_number:0{hex_digits}x}.shard"
+
+
+class _CompressedMortonBitIterator:
+    """Python port of TensorStore's CompressedMortonBitIterator.
+
+    Walks through bits in compressed Morton code order.  At each step,
+    cycles through dimensions x(0)->y(1)->z(2), skipping any dimension
+    that has exhausted its z_index_bits.
+
+    Source:
+      ~/tensorstore/tensorstore/driver/neuroglancer_precomputed/metadata.cc
+    """
+
+    __slots__ = ("z_index_bits", "cur_bit_for_dim", "dim_i")
+
+    def __init__(self, z_index_bits: Sequence[int]):
+        self.z_index_bits = list(z_index_bits)
+        self.cur_bit_for_dim = [0, 0, 0]
+        self.dim_i = 0
+
+    def _get_next_dim(self) -> int:
+        """Advance dim_i to the next dimension that still has bits."""
+        while self.cur_bit_for_dim[self.dim_i] == self.z_index_bits[self.dim_i]:
+            self.dim_i = (self.dim_i + 1) % 3
+        return self.dim_i
+
+    def _next(self):
+        """Consume one bit from the current dimension, rotate to the next."""
+        self.cur_bit_for_dim[self.dim_i] += 1
+        self.dim_i = (self.dim_i + 1) % 3
+
+    def advance(self, n: int):
+        """Advance by *n* compressed-Morton bits."""
+        for _ in range(n):
+            self._get_next_dim()
+            self._next()
+
+    def get_cell_shape(self, grid_shape: Sequence[int]) -> List[int]:
+        """Shape of the cell covered by bits consumed so far.
+
+        Returns min(grid_shape[i], 1 << cur_bit_for_dim[i]) per dim.
+        """
+        return [
+            min(grid_shape[i], 1 << self.cur_bit_for_dim[i])
+            for i in range(3)
+        ]
+
+
+def get_shard_chunk_hierarchy(scale_params: dict) -> dict:
+    """Compute the shard chunk hierarchy for a given scale.
+
+    This is the Python equivalent of TensorStore's GetShardChunkHierarchy().
+    It determines how the compressed Morton code bits are partitioned into
+    preshift (within-minishard), minishard, and shard portions, and computes
+    the minishard and shard shapes in chunks.
+
+    Args:
+        scale_params: Dict with keys: coord_bits, preshift_bits,
+                      minishard_bits, shard_bits, grid_shape.
+
+    Returns:
+        Dict with keys:
+            z_index_bits: bits per dimension (same as coord_bits)
+            grid_shape_in_chunks: grid shape
+            minishard_shape_in_chunks: [sx, sy, sz] minishard extent
+            shard_shape_in_chunks: [sx, sy, sz] shard extent
+            non_shard_bits: total preshift+minishard bits (clamped)
+            shard_bits: effective shard bits (clamped)
+
+    Raises:
+        ValueError: If total bits exceed the sharding spec capacity.
+    """
+    z_index_bits = list(scale_params["coord_bits"])
+    grid_shape = list(scale_params["grid_shape"])
+    preshift_bits = scale_params["preshift_bits"]
+    minishard_bits = scale_params["minishard_bits"]
+    shard_bits = scale_params["shard_bits"]
+
+    total_z_index_bits = sum(z_index_bits)
+
+    if total_z_index_bits > preshift_bits + minishard_bits + shard_bits:
+        raise ValueError(
+            f"total_z_index_bits ({total_z_index_bits}) > "
+            f"preshift_bits + minishard_bits + shard_bits "
+            f"({preshift_bits} + {minishard_bits} + {shard_bits}): "
+            f"shards do not correspond to rectangular regions"
+        )
+
+    within_minishard_bits = min(preshift_bits, total_z_index_bits)
+    non_shard_bits = min(
+        minishard_bits + preshift_bits, total_z_index_bits
+    )
+    effective_shard_bits = min(shard_bits, total_z_index_bits - non_shard_bits)
+
+    bit_it = _CompressedMortonBitIterator(z_index_bits)
+
+    # Advance past within-minishard bits to get minishard shape.
+    bit_it.advance(within_minishard_bits)
+    minishard_shape = bit_it.get_cell_shape(grid_shape)
+
+    # Advance past remaining non-shard bits to get shard shape.
+    bit_it.advance(non_shard_bits - within_minishard_bits)
+    shard_shape = bit_it.get_cell_shape(grid_shape)
+
+    return {
+        "z_index_bits": z_index_bits,
+        "grid_shape_in_chunks": grid_shape,
+        "minishard_shape_in_chunks": minishard_shape,
+        "shard_shape_in_chunks": shard_shape,
+        "non_shard_bits": non_shard_bits,
+        "shard_bits": effective_shard_bits,
+    }
+
+
+def shard_origin_in_chunks(
+    shard_number: int, scale_params: dict
+) -> List[int]:
+    """Compute the chunk-space origin of a shard.
+
+    This is the inverse mapping: given a shard number, return the (x, y, z)
+    origin in chunk coordinates of the rectangular region that shard covers.
+
+    Matches the shard-to-origin logic in TensorStore's
+    GetChunksPerVolumeShardFunction.
+
+    Args:
+        shard_number: The shard number.
+        scale_params: Dict with keys: coord_bits, preshift_bits,
+                      minishard_bits, shard_bits, grid_shape.
+
+    Returns:
+        [ox, oy, oz] chunk-space origin of the shard.
+    """
+    hierarchy = get_shard_chunk_hierarchy(scale_params)
+    z_index_bits = hierarchy["z_index_bits"]
+    non_shard_bits = hierarchy["non_shard_bits"]
+    effective_shard_bits = hierarchy["shard_bits"]
+
+    bit_it = _CompressedMortonBitIterator(z_index_bits)
+    # Skip past the non-shard bits (preshift + minishard).
+    bit_it.advance(non_shard_bits)
+
+    origin = [0, 0, 0]
+    for bit_i in range(effective_shard_bits):
+        dim_i = bit_it._get_next_dim()
+        if (shard_number >> bit_i) & 1:
+            origin[dim_i] |= 1 << bit_it.cur_bit_for_dim[dim_i]
+        bit_it._next()
+
+    return origin
+
+
+def chunks_per_shard(
+    shard_number: int, scale_params: dict
+) -> int:
+    """Compute the number of chunks in a specific shard.
+
+    Matches TensorStore's GetChunksPerVolumeShardFunction.  For shards at
+    the volume boundary, the count is reduced because the shard extends
+    beyond the grid.
+
+    Args:
+        shard_number: The shard number.
+        scale_params: Dict with keys: coord_bits, preshift_bits,
+                      minishard_bits, shard_bits, grid_shape.
+
+    Returns:
+        Number of chunks in this shard.
+    """
+    hierarchy = get_shard_chunk_hierarchy(scale_params)
+    z_index_bits = hierarchy["z_index_bits"]
+    grid_shape = hierarchy["grid_shape_in_chunks"]
+    non_shard_bits = hierarchy["non_shard_bits"]
+    effective_shard_bits = hierarchy["shard_bits"]
+
+    if (shard_number >> effective_shard_bits) != 0:
+        return 0  # Invalid shard number
+
+    bit_it = _CompressedMortonBitIterator(z_index_bits)
+    bit_it.advance(non_shard_bits)
+    cell_shape = bit_it.get_cell_shape(grid_shape)
+
+    origin = [0, 0, 0]
+    for bit_i in range(effective_shard_bits):
+        dim_i = bit_it._get_next_dim()
+        if (shard_number >> bit_i) & 1:
+            origin[dim_i] |= 1 << bit_it.cur_bit_for_dim[dim_i]
+        bit_it._next()
+
+    num_chunks = 1
+    for dim_i in range(3):
+        num_chunks *= min(grid_shape[dim_i] - origin[dim_i], cell_shape[dim_i])
+    return num_chunks
+
+
+def shard_bbox(shard_number: int, scale_params: dict) -> dict:
+    """Compute the voxel bounding box for a shard.
+
+    Args:
+        shard_number: The shard number.
+        scale_params: Dict with keys: coord_bits, preshift_bits,
+                      minishard_bits, shard_bits, grid_shape, chunk_size,
+                      vol_size.
+
+    Returns:
+        Dict with keys:
+            shard_number: the input shard number
+            shard_origin: (x0, y0, z0) voxel coordinates
+            shard_extent: (sx, sy, sz) voxel size (clipped to volume bounds)
+            num_chunks: actual number of chunks in this shard
+    """
+    hierarchy = get_shard_chunk_hierarchy(scale_params)
+    shard_shape = hierarchy["shard_shape_in_chunks"]
+    chunk_size = scale_params["chunk_size"]
+    vol_size = scale_params["vol_size"]
+
+    origin_chunks = shard_origin_in_chunks(shard_number, scale_params)
+    num_chunks = chunks_per_shard(shard_number, scale_params)
+
+    # Voxel origin
+    voxel_origin = [origin_chunks[d] * chunk_size[d] for d in range(3)]
+
+    # Voxel extent: shard shape in voxels, clipped to volume bounds
+    voxel_extent = [
+        min(shard_shape[d] * chunk_size[d], vol_size[d] - voxel_origin[d])
+        for d in range(3)
+    ]
+
+    return {
+        "shard_number": shard_number,
+        "shard_origin": voxel_origin,
+        "shard_extent": voxel_extent,
+        "num_chunks": num_chunks,
+    }
+
+
+def enumerate_shard_bboxes(scale_params: dict) -> List[dict]:
+    """Enumerate all non-empty shard bboxes for a scale.
+
+    Args:
+        scale_params: Dict with keys from _parse_scale_params.
+
+    Returns:
+        List of shard_bbox dicts for every shard that has >0 chunks.
+    """
+    shard_bits = scale_params["shard_bits"]
+    max_shards = 1 << shard_bits if shard_bits > 0 else 1
+    result = []
+    for sn in range(max_shards):
+        nc = chunks_per_shard(sn, scale_params)
+        if nc > 0:
+            result.append(shard_bbox(sn, scale_params))
+    return result
+
+
+def parent_shards_to_child_shards(
+    parent_shard_numbers: List[int],
+    parent_params: dict,
+    child_params: dict,
+) -> List[int]:
+    """Derive child-scale shard numbers from parent-scale shard numbers.
+
+    For each parent shard, computes its chunk grid range, maps those
+    coordinates to the child scale (divide by 2 in each dim), and
+    computes the child shard numbers that overlap.
+
+    This is the core function for the sparse shard derivation chain:
+    s0 shards (from DVID Arrow files) -> s1 shards -> s2 shards -> ...
+
+    Args:
+        parent_shard_numbers: List of shard numbers at scale N-1.
+        parent_params: Scale params for scale N-1.
+        child_params: Scale params for scale N.
+
+    Returns:
+        Sorted list of unique shard numbers at scale N.
+    """
+    parent_hierarchy = get_shard_chunk_hierarchy(parent_params)
+    parent_shard_shape = parent_hierarchy["shard_shape_in_chunks"]
+    parent_grid = parent_hierarchy["grid_shape_in_chunks"]
+
+    child_grid = child_params["grid_shape"]
+    child_coord_bits = child_params["coord_bits"]
+
+    child_shard_set = set()
+
+    for parent_sn in parent_shard_numbers:
+        # Parent shard's chunk-space origin and extent
+        p_origin = shard_origin_in_chunks(parent_sn, parent_params)
+        p_extent = [
+            min(parent_shard_shape[d], parent_grid[d] - p_origin[d])
+            for d in range(3)
+        ]
+
+        # Map parent chunk range to child chunk coordinates (divide by 2).
+        # Parent chunk (cx, cy, cz) at parent scale covers voxels that
+        # correspond to child chunk (cx // 2, cy // 2, cz // 2).
+        c_min = [p_origin[d] // 2 for d in range(3)]
+        c_max = [
+            min((p_origin[d] + p_extent[d] - 1) // 2, child_grid[d] - 1)
+            for d in range(3)
+        ]
+
+        # Find all child shard numbers that overlap this range.
+        # For efficiency, compute the child shard hierarchy to step by
+        # shard-shape rather than iterating every chunk.
+        child_hierarchy = get_shard_chunk_hierarchy(child_params)
+        child_shard_shape = child_hierarchy["shard_shape_in_chunks"]
+
+        # Step through child chunk space at shard granularity
+        cx = c_min[0]
+        while cx <= c_max[0]:
+            cy = c_min[1]
+            while cy <= c_max[1]:
+                cz = c_min[2]
+                while cz <= c_max[2]:
+                    # Compute child shard number for this chunk coord
+                    morton = compressed_z_index(
+                        (cx, cy, cz), child_coord_bits
+                    )
+                    shard, _ = chunk_shard_info(
+                        morton,
+                        child_params["preshift_bits"],
+                        child_params["minishard_bits"],
+                        child_params["shard_bits"],
+                    )
+                    child_shard_set.add(shard)
+                    # Step by child shard shape to skip to next shard boundary
+                    cz += child_shard_shape[2]
+                cy += child_shard_shape[1]
+            cx += child_shard_shape[0]
+
+    return sorted(child_shard_set)
 
 
 def dvid_to_ng_shard_number(
