@@ -1,204 +1,291 @@
-# Export Optimization: S0-Only DVID Export + Cloud Run Downres
+# Export Shard Optimization
 
-This document analyzes the per-scale throughput degradation observed in the mCNS
-DVID `export-shards` and makes the case for exporting only scale 0 from DVID,
-then generating scales 1–9 via TensorStore downsampling on Cloud Run.
+## The Core Problem: Predicting Output Shard Size
 
-## 1. The Problem: Dramatic Per-Scale Throughput Degradation
+Each Cloud Run task needs a memory tier (4, 8, 16, 24, or 32 GiB). The dominant
+variable cost is the **output `.shard` file on tmpfs** — a neuroglancer
+precomputed shard file using compressed_segmentation + gzip encoding,
+byte-identical to what ends up on GCS. Predicting this file's size determines
+which tier a shard needs. Too small → OOM kill. Too large → wasted cost.
 
-The mCNS export log shows that DVID's `export-shards` throughput degrades severely
-at higher scales. The overall average of 12,962 blocks/sec reported in
-`mCNS-ExportAnalysis.md` masks a 12× per-scale divergence:
+**Our approach**: derive a formula that predicts output shard file size from
+measurable input characteristics — number of chunks, number of unique labels,
+number of supervoxels, and scale — then calibrate the constants from real
+production data. As we export additional datasets, we refine the constants and
+validate that the relationships hold.
 
-| Scale | Blocks | Throughput (blocks/sec) | Relative | Time spent |
-|-------|--------|------------------------|----------|------------|
-| 0 | 510.5M | 11,570 | 1.00× | ~8h 16m (0 → 510M) |
-| 1 (early Z) | ~20M | 7,650 | 0.66× | |
-| 1 (mid Z) | ~20M | 8,930 | 0.77× | |
-| 1 (late Z) | ~27M | 5,130 | 0.44× | |
-| **1 total** | **66.6M** | **~6,100 avg** | **0.53×** | **~3h** |
-| 2 | 8.8M | 2,810 | 0.24× | ~52m |
-| 3 | 1.2M | 1,482 | 0.13× | ~13m |
-| 4+ | 0.2M | 979 | 0.08× | ~4m |
-
-**Measured from two concurrent DVID export instances** (identical chunk coordinates,
-slightly different timestamps — likely two replicas or a resumed run).
-
-### Why lower scales are slower
-
-Lower-resolution scales have **more labels per block** because each block covers
-more physical space. This means:
-
-- **Larger DVID blocks**: Mean compressed block size grows from ~5 KB (scale 0)
-  to ~265 KB (scale 5) — a 53× increase. Each block requires more zstd
-  compression work and more I/O.
-- **Larger label lists**: The `labels` and `supervoxels` fields in the Arrow
-  schema are `list<uint64>`. At lower scales, blocks intersect more bodies, so
-  these lists grow, increasing per-block Arrow serialization overhead.
-- **Agglomerated label lookup**: The shard writer goroutines look up agglomerated
-  labels from DVID's in-memory versioned label mapping for every block. More
-  labels per block = more lookups per block.
-- **Fewer shards, less parallelism**: Scale 0 has 21,994 shard writers running
-  concurrently; scale 2 has 606; scale 4 has 25. The 50 `chunkHandler`
-  goroutines feed into fewer and fewer shard writers, reducing pipeline
-  parallelism.
-- **Within-scale degradation**: Even within scale 1, throughput drops from
-  ~8,900 blocks/sec at mid-Z to ~5,100 at late-Z. This likely reflects
-  increasing block density (more label boundaries) deeper into the volume, plus
-  potential Badger DB key-range effects.
-
-## 2. Time Budget: Current vs S0-Only
-
-### Current pipeline (all scales from DVID)
-
-| Phase | Duration | Notes |
-|-------|----------|-------|
-| DVID export (s0–s9) | 12h 35m | Bottleneck |
-| GCS upload (4.3 TB) | ~1h | Over Janelia–Google interconnect |
-| Cloud Run conversion | 1h 18m | All scales in parallel |
-| **Total** | **~15h** | |
-
-### Proposed: S0-only export + Cloud Run downres
-
-| Phase | Duration | Notes |
-|-------|----------|-------|
-| DVID export (s0 only) | **~8h 16m** | 510.5M blocks at ~11,570/sec |
-| GCS upload (2.84 TB) | **~40m** | 66% of current upload |
-| Cloud Run s0 conversion | ~1h | Same as current s0 portion |
-| Cloud Run downres s1 | ~15–30m | TensorStore `ts.downsample` + `ts.copy` |
-| Cloud Run downres s2–s9 | ~10–20m | Each scale 8× fewer voxels, highly parallel |
-| **Total** | **~10–11h** | |
-
-### Time savings breakdown
-
-| Component | Current | Proposed | Savings |
-|-----------|---------|----------|---------|
-| DVID export | 12h 35m | 8h 16m | **4h 19m** (34%) |
-| GCS upload | ~1h | ~40m | **~20m** |
-| Cloud Run | 1h 18m | ~1h 30m | -12m (downres adds time) |
-| **Total** | **~15h** | **~10–11h** | **~4–5h (27–33%)** |
-
-The DVID export savings alone (4h 19m) dwarf the added Cloud Run downres time.
-
-## 3. Cloud Run Downres: Already Implemented
-
-The worker already has a complete `downres_scale()` implementation
-(`src/worker.py:552–594`) using TensorStore's native downsampling:
-
-```python
-downsampled = ts.downsample(source, [2, 2, 2, 1], "mode")
-ts.copy(downsampled, dest).result()
-```
-
-- Uses majority-vote mode — correct for uint64 segmentation labels
-- Reads scale N-1 from the destination volume on GCS
-- Writes scale N to the destination volume
-- Activated via `DOWNRES_SCALES` env var or `--downres` CLI flag
-- Already integrated into the worker's two-phase execution (Phase 1: shards,
-  Phase 2: downres)
-
-### Sequential dependency
-
-Scale N+1 requires scale N to be fully written. This creates a sequential chain:
+### The formula
 
 ```
-s0 conversion (parallel) → s1 downres → s2 downres → ... → s9 downres
+output_shard_bytes = f(num_chunks, num_unique_labels, num_supervoxels, scale)
 ```
 
-However, each downres step processes 8× fewer voxels than the previous scale,
-so the chain converges quickly:
+Once we can predict output shard size, memory follows directly:
 
-| Scale | Voxels (relative to s0) | Estimated downres time |
-|-------|------------------------|----------------------|
-| 1 | 1/8 | 15–30m |
-| 2 | 1/64 | 2–5m |
-| 3 | 1/512 | <1m |
-| 4–9 | <1/4096 | seconds each |
+```
+memory = input_in_ram + tmpfs(output_shard) + fixed_overhead
+```
 
-The total sequential downres chain (s1 through s9) should take **20–40 minutes**
-on Cloud Run, far less than the 4h 19m saved on the DVID side.
+| Component | s0 (Arrow source) | s1+ (downres) |
+|-----------|-------------------|---------------|
+| **Input in RAM** | Arrow file (~1× file size, known) | Source read cache (0.25 GiB, bounded) |
+| **tmpfs** | 2× output shard (RMW peak) | 1× output shard (fresh staging dir) |
+| **Fixed overhead** | ~2.0 GiB (Python + BRAID + pyarrow + TS + GCS) | ~1.5 GiB (Python + TS + GCS) |
 
-## 4. Label Fidelity: DVID vs TensorStore Majority Vote
+The Arrow file size is known from `gsutil ls`. The fixed overhead is measurable
+from cgroup data. **The only unknown is the output shard file size.**
 
-The previous recommendation in `mCNS-ExportAnalysis.md` §6 noted that "using
-DVID's downres guarantees the neuroglancer volume exactly matches what DVID
-serves." This is worth examining:
+## Reference Datasets
 
-- **DVID's downres** uses majority vote on 2×2×2 neighborhoods, computed
-  incrementally as mutations occur (`datatype/common/downres/`).
-- **TensorStore's `ts.downsample` with `"mode"`** also performs majority vote on
-  2×2×2 neighborhoods.
+We calibrate from real production exports. Each new dataset we export adds to
+the calibration pool.
 
-The algorithms are equivalent for a static dataset. Differences could arise only
-if:
-1. DVID's incremental downres has not been fully propagated (stale downres) —
-   in which case the TensorStore result is actually *more* correct since it
-   downsamples from the latest scale 0 data.
-2. Tie-breaking differs (when a 2×2×2 block has no majority label). This is an
-   edge case that does not affect practical neuroglancer visualization.
+| Dataset | Source Arrow+CSV | Output NG shards | Labels |
+|---------|-----------------|------------------|--------|
+| **v0.11** | `gs://flyem-male-cns/dvid-exports/mCNS-98d699/segmentation` | `gs://flyem-male-cns/v0.11/segmentation` | Agglomerated (proofread) |
+| **false-merge-corrected** | `gs://flyem-dvid-shards/mCNS-de91d3/segmentation` | `gs://flyem-ng-staging/false-merge-corrected/segmentation` | Merges removed |
 
-**For an export of a finalized dataset, TensorStore's downres from scale 0 is at
-least as correct as DVID's pre-computed downres.**
+Both use the same volume (mCNS, 94,088 × 78,317 × 134,576 at s0), same NG spec,
+same chunk size (64³), same sharding parameters.
 
-## 5. Additional Benefits
+### What data we have for each
 
-### Reduced DVID server load
-Exporting only scale 0 means the DVID server's Badger DB scan covers only the
-scale 0 key range, avoiding the slower lower-scale key ranges entirely. This
-frees the server sooner for other operations.
+| Data | v0.11 | false-merge-corrected |
+|------|-------|-----------------------|
+| Arrow file sizes | Yes | Yes |
+| CSV chunk counts | Yes | Yes |
+| Label profiles (`-labels.csv` from `profile_shards.py`) | **Yes** (21,834 files at `gs://flyem-dvid-exports/mCNS-98d699/segmentation/`) | **No** — needs `profile_shards.py` run |
+| NG output shard sizes (per-shard) | **Yes** (25,541-row CSV at `analysis/v011_shard_memory.csv`) | **Totals/max/p95 per scale only** — no per-shard CSV |
+| Full correlation CSV (input→output) | **Yes** | **No** — needs both label profiles and per-shard NG sizes |
 
-### Reduced GCS storage for source data
-Only 2.84 TB of Arrow files (scale 0) instead of 4.30 TB (all scales) — a 34%
-reduction in source bucket storage.
+### Measured NG output shard sizes
 
-### Simpler DVID export configuration
-No need to configure `num_scales` in the export spec. Export scale 0 only,
-and the pipeline handles the rest.
+| Scale | v0.11 shards | v0.11 total | v0.11 max | FMC shards | FMC total | FMC max |
+|-------|-------------|-------------|-----------|-----------|-----------|---------|
+| s0 | 21,690 | 2,558 GB | 457 MB | 21,690 | 2,565 GB | 457 MB |
+| s1 | 3,294 | 970 GB | 782 MB | 3,294 | 974 GB | 792 MB |
+| s2 | 597 | 251 GB | 1,438 MB | 597 | 252 GB | 1,443 MB |
+| s3 | 120 | 65 GB | 2,539 MB | 120 | 65 GB | 2,568 MB |
+| s4 | 25 | 17 GB | 2,905 MB | 25 | 17 GB | 2,939 MB |
+| s5 | 8 | 4.2 GB | 2,145 MB | 8 | 4.2 GB | 2,145 MB |
+| s6 | 2 | 846 MB | 842 MB | 2 | 859 MB | 859 MB |
+| s7 | 1 | 138 MB | — | 1 | 141 MB | — |
+| s8 | 1 | 22 MB | — | 1 | 23 MB | — |
+| s9 | 1 | 3.6 MB | — | 1 | 3.8 MB | — |
 
-### Overlap-friendly
-The S0-only approach composes well with the "streaming upload" optimization
-(start uploading and processing shards while DVID is still exporting). Since
-scale 0 shards complete in ZYX strip order, Cloud Run workers can begin
-converting early shards immediately, and the downres chain can start as soon
-as scale 0 is fully written.
+NG output sizes differ by 0–1.2% between the two datasets. However, we have
+**not measured** whether the label counts differ — the false-merge-corrected
+dataset removed proofread merges, but we don't know how many additional unique
+labels that produced. Running `profile_shards.py` on both datasets would answer
+this and tell us whether the regression coefficients are stable across label
+states, or whether the similar NG sizes simply reflect similar label densities.
 
-## 6. Revised Recommendation
+## Regression Analysis (v0.11, 25,541 shards)
 
-The original recommendation ("time savings don't justify the added complexity")
-was based on an assumption of uniform export throughput. The measured 12×
-throughput degradation at lower scales changes the calculus:
+From `analysis/v011_shard_memory.csv`, fitting `ng_output_bytes = coeff × predictor`
+(least-squares through origin):
 
-| Factor | Original analysis | Updated with per-scale data |
-|--------|------------------|---------------------------|
-| DVID time saved | "~2.8 hours" | **4h 19m** (measured) |
-| Added complexity | "Cloud Run would need to compute downres" | Already implemented |
-| Sequential dependency | Noted as a concern | ~20–40m total, negligible vs savings |
-| Label fidelity | "Guarantees match with DVID" | Equivalent for finalized datasets |
+| Scale | N | B/chunk | R²(chunk) | B/unique_label | R²(UL) | B/supervoxel | R²(SV) |
+|-------|------|---------|-----------|----------------|--------|--------------|--------|
+| s0 | 21,533 | 5,275 | 0.725 | 395 | 0.956 | 347 | 0.958 |
+| s1 | 3,261 | 15,602 | 0.806 | 342 | 0.962 | 287 | 0.970 |
+| s2 | 591 | 31,102 | 0.890 | 153 | 0.976 | 125 | 0.983 |
+| s3 | 118 | 60,633 | 0.953 | 55 | 0.990 | 44 | 0.990 |
+| s4 | 25 | 114,754 | 0.982 | 23 | 0.996 | 18 | 0.992 |
+| s5 | 8 | 195,951 | 0.999 | 13 | 0.999 | 10 | 0.996 |
 
-**Recommendation: Export only scale 0 from DVID and generate scales 1–9 via
-TensorStore downsampling on Cloud Run.** This reduces total pipeline time from
-~15 hours to ~10–11 hours with no code changes required — only configuration:
+**Key findings:**
+
+1. **Label count is a much better predictor than chunk count.** R² > 0.95 at all
+   scales for unique labels or supervoxels, vs 0.72–0.98 for chunk count.
+
+2. **Chunk count alone is weak at s0** (R² = 0.725) because shards vary
+   enormously in label density — a boundary shard may have 30,000 chunks of
+   sparse tissue, while a dense interior shard has 30,000 chunks packed with
+   labels. Same chunk count, wildly different output size.
+
+3. **The per-scale coefficients vary significantly.** `B/chunk` spans 37×
+   (5,275 at s0 → 195,951 at s5). `B/unique_label` spans 30× (395 at s0 → 13 at
+   s5). This means any formula needs per-scale constants.
+
+4. **`total_sv` and `total_labels` are identical in v0.11** (agglomerated labels =
+   supervoxels for this particular export). They would differ for a
+   supervoxel-only export.
+
+## Two Prediction Tiers
+
+### Tier 1: Chunk-count model (conservative, no profiling)
+
+The actual chunk count per shard is available cheaply from the companion CSV
+files in the DVID export (`wc -l` minus header). For downres scales, it comes
+from `chunks_per_shard()` in `ng_sharding.py`.
+
+```
+output_shard_bytes ≈ num_chunks × BYTES_PER_CHUNK[scale]
+```
+
+This uses the worst-case bytes-per-chunk observed across all shards at that
+scale. It overestimates for most shards because the brain sparsely fills the
+bounding volume — boundary shards and tissue-edge shards have much lower label
+density per chunk than the worst-case interior shard. At s0, the median
+overestimate is 3× and the 95th percentile is 20×. But it never underestimates,
+so it's safe for tier placement (overestimation only wastes memory headroom).
+
+### Tier 2: Label-aware model (precise, requires profiling)
+
+When per-shard label profiles are available (from running `profile_shards.py`
+against the DVID Arrow files), use the label-based predictor:
+
+```
+output_shard_bytes ≈ total_unique_labels × BYTES_PER_UNIQUE_LABEL[scale]
+```
+
+This produces much tighter tier assignments (R² > 0.95 at all scales),
+potentially saving 20–30% on Cloud Run costs by avoiding unnecessary bumps to
+larger tiers.
+
+For s1+ (downres), we don't have DVID Arrow files to profile. The chunk-count
+model is the only option unless we develop a way to estimate child-scale label
+counts from parent-scale data.
+
+## Derived Constants
+
+### `BYTES_PER_CHUNK` (chunk-count model)
+
+`max(ng_output_bytes / chunk_count)` across all shards at each scale. This is
+**not** `max_shard_file / full_shard_chunks` — the densest bytes-per-chunk shard
+is often a partially-filled shard with high label density, not a full 32K-chunk
+interior shard. (At s4, the densest shard has 22,565 chunks, not 32,768.)
+
+From v0.11 analysis (25,541 shards):
+
+| Scale | Bytes/chunk | Source shard | Chunks | Output |
+|-------|-------------|-------------|--------|--------|
+| s0 | 13,932 | 36864_43008_108544 | 32,768 | 457 MB |
+| s1 | 27,919 | 26624_34816_49152 | 24,603 | 687 MB |
+| s2 | 44,482 | 6144_10240_26624 | 1,558 | 69 MB |
+| s3 | 77,480 | 6144_2048_2048 | 32,768 | 2,539 MB |
+| s4 | 128,757 | 2048_0_0 | 22,565 | 2,905 MB |
+| s5 | 196,923 | 0_0_2048 | 6,138 | 1,209 MB |
+| s6 | 255,166 | 0_0_0 | 3,301 | 842 MB |
+| s7 | 166,127 | 0_0_0 | 828 | 138 MB |
+| s8 | 153,717 | 0_0_0 | 143 | 22 MB |
+| s9 | 125,268 | 0_0_0 | 29 | 3.6 MB |
+
+**Limitation**: this is a worst-case upper bound. The brain sparsely fills the
+bounding volume, so most shards have much lower bytes-per-chunk than the max.
+At s0, the median overestimate is 3.0× and the 95th percentile is 20×. This
+means the chunk-count model reliably avoids under-allocation (OOM) but wastes
+tier capacity for most shards. The label-aware model is much tighter.
+
+### `BYTES_PER_UNIQUE_LABEL` (label-aware model)
+
+Regression coefficients from v0.11 (single-dataset; needs validation with FMC):
+
+| Scale | Coefficient | R² |
+|-------|-------------|------|
+| s0 | 395 | 0.956 |
+| s1 | 342 | 0.962 |
+| s2 | 153 | 0.976 |
+| s3 | 55 | 0.990 |
+| s4 | 23 | 0.996 |
+| s5 | 13 | 0.999 |
+
+### Fixed overheads
+
+| Component | Value | Measured from |
+|-----------|-------|---------------|
+| `SHARD_PROC_OVERHEAD_GIB` | 2.0 GiB | cgroup memory.current at worker startup (s0 processing) |
+| `DOWNRES_OVERHEAD_GIB` | 1.5 GiB | Python + TensorStore + GCS + 256 MB source cache |
+
+## How to Calibrate for a New Dataset
+
+### Step 1: Profile source shards (get label counts)
 
 ```bash
-# DVID export spec: set num_scales=1 (or omit lower scales)
-# Cloud Run:
-pixi run export --scales 0 --downres 1,2,3,4,5,6,7,8,9
+pixi run launch-profiler \
+  --source gs://bucket/dvid-exports/dataset/segmentation \
+  --output gs://bucket/dvid-exports/dataset/segmentation \
+  --tasks 200
 ```
 
-## 7. Open Questions
+Runs `profile_shards.py` on Cloud Run. Produces `{shard}-labels.csv` files with
+per-chunk stats: `x, y, z, num_labels, num_supervoxels, unique_labels`.
 
-1. **Downres parallelism**: Currently each worker can downres one scale. Could
-   we launch a dedicated Cloud Run job per scale in the chain (s1 job waits for
-   s0 completion, s2 job waits for s1, etc.)? This would decouple downres from
-   shard processing tasks.
+### Step 2: Export and measure NG output
 
-2. **Partial overlap**: Can we start downres for scale 1 before *all* of scale 0
-   is written? TensorStore reads from the destination volume — if scale 0 shards
-   are written shard-by-shard, we might be able to downres completed regions
-   incrementally. This would require careful coordination but could reduce the
-   sequential gap.
+After the export completes, measure actual NG shard file sizes.
 
-3. **Validation**: Before production use, run a comparison: export all scales
-   from DVID (current method) and export s0 + downres s1–s9 (proposed method),
-   then diff the outputs at each scale to confirm equivalence.
+### Step 3: Run correlation analysis
 
+```bash
+pixi run analyze-memory \
+  --source gs://bucket/dvid-exports/dataset/segmentation \
+  --labels gs://bucket/dvid-exports/dataset/segmentation \
+  --dest gs://bucket/ng-output/dataset/segmentation \
+  --ng-spec examples/dataset-export-specs.json \
+  --output analysis/dataset_shard_memory.csv
+```
+
+Produces a per-shard CSV and console report with regression coefficients.
+
+### Step 4: Update constants
+
+- Compare new `BYTES_PER_UNIQUE_LABEL` coefficients against existing values.
+  Take the max across all datasets for the chunk-count model.
+- If max shard sizes at any scale exceed current `BYTES_PER_CHUNK` values, update.
+- If fixed overheads differ (check cgroup logs), update.
+
+## Outstanding Work
+
+1. **Validate downres memory predictions**: After running manifest-driven downres
+   jobs, compare predicted memory (from formula) against actual peak memory (from
+   cgroup "Shard memory peak" logs) to calibrate `DOWNRES_OVERHEAD_GIB`.
+
+---
+
+## Appendix: S0-Only Export Rationale
+
+The pipeline exports only scale 0 from DVID and generates scales 1–9 via
+TensorStore downsampling on Cloud Run. This saves ~4 hours per export due to
+DVID's dramatic per-scale throughput degradation (12× slowdown at lower scales).
+
+See `ExportShardsByDownresPlan.md` for the manifest-driven per-shard downres
+implementation.
+
+### Per-scale DVID throughput
+
+| Scale | Blocks | Throughput (blocks/sec) | Relative |
+|-------|--------|------------------------|----------|
+| 0 | 510.5M | 11,570 | 1.00× |
+| 1 | 66.6M | ~6,100 | 0.53× |
+| 2 | 8.8M | 2,810 | 0.24× |
+| 3 | 1.2M | 1,482 | 0.13× |
+| 4+ | 0.2M | 979 | 0.08× |
+
+### Time savings
+
+| Component | All scales from DVID | S0-only + Cloud Run downres | Savings |
+|-----------|---------------------|----------------------------|---------|
+| DVID export | 12h 35m | 8h 16m | 4h 19m |
+| GCS upload | ~1h | ~40m | ~20m |
+| Cloud Run | 1h 18m | ~1h 30m | -12m |
+| **Total** | **~15h** | **~10–11h** | **~4–5h** |
+
+### Label fidelity
+
+TensorStore's `ts.downsample(source, [2,2,2,1], "mode")` uses the same
+majority-vote algorithm as DVID's downres. For a finalized dataset, the results
+are equivalent.
+
+### Parent→child scale size ratios
+
+| Pair | Ratio (child/parent total NG bytes) |
+|------|--------------------------------------|
+| s0→s1 | 0.379 |
+| s1→s2 | 0.259 |
+| s2→s3 | 0.257 |
+| s3→s4 | 0.266 |
+| s4→s5 | 0.244 |
+
+After s0→s1, the ratio stabilizes at ~0.25–0.26.

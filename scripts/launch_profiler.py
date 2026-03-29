@@ -152,8 +152,20 @@ def main():
         print("\n(dry run — not launched)")
         return
 
+    # --- Delete stale manifests from previous runs ---
+    manifest_prefix = f"{args.output}/profiler-manifests/"
+    print(f"\nDeleting stale manifests under {manifest_prefix} ...")
+    result = subprocess.run(
+        ["gsutil", "-m", "-q", "rm", "-r", manifest_prefix],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print("  Deleted.")
+    elif "No URLs matched" in result.stderr or "CommandException" in result.stderr:
+        print("  No stale manifests found.")
+
     # --- Write per-task manifests to GCS ---
-    print("\nWriting manifests...")
+    print("Writing manifests...")
     manifest_uri = write_profiler_manifests(
         args.output, need_profiling, num_tasks)
 

@@ -9,7 +9,7 @@ Current gaps:
 1. **No post-export reconciliation**: `find_failed_shards.py` compares completed shards from Cloud Logging against source Arrow files, but it depends on log retention and has a 50K entry limit. It doesn't verify that NG shard files actually exist on GCS.
 2. **Silent chunk clipping**: When a chunk falls outside `dest.shape` (line 394 of `worker.py`), the worker silently `continue`s with no log. If all chunks in a shard are clipped, the shard appears to succeed (returns `True`) with `chunks_written=0`.
 3. **No coordinate validation**: The worker trusts that DVID chunk coordinates match the NG spec volume extents. There's no warning if chunks are outside bounds or if a DVID shard contains chunks that would map to multiple NG shards.
-4. **Compressed Z-index correctness**: The DVID-to-neuroglancer shard mapping depends on a compressed Z-index (not a standard Morton code). The `analyze_v011_memory.py` script initially implemented a standard Morton code, producing completely wrong shard numbers. Any coordinate/sharding code must be verified against TensorStore's reference implementation.
+4. **Compressed Z-index correctness**: The DVID-to-neuroglancer shard mapping depends on a compressed Z-index (not a standard Morton code). The `analyze_memory.py` script initially implemented a standard Morton code, producing completely wrong shard numbers. Any coordinate/sharding code must be verified against TensorStore's reference implementation.
 
 ## 1. Worker-Level Validation
 
@@ -93,7 +93,7 @@ For each scale:
    - NG shards with no corresponding DVID shard (orphaned output)
    - Count mismatches per scale
 
-This is similar to what `analyze_v011_memory.py` does for the mapping, but focused on completeness verification rather than size correlation.
+This is similar to what `analyze_memory.py` does for the mapping, but focused on completeness verification rather than size correlation.
 
 ### 2b. Integrate into `export --wait` flow
 
@@ -146,9 +146,9 @@ Any Python code that computes shard numbers from chunk coordinates must be teste
 
 ### 3d. Centralize the implementation
 
-The compressed Z-index computation currently lives in `scripts/analyze_v011_memory.py`. It should be extracted into a shared module (e.g., `src/ng_sharding.py` or `braid/src/braid/ng_sharding.py`) so that:
+The compressed Z-index computation currently lives in `scripts/analyze_memory.py`. It should be extracted into a shared module (e.g., `src/ng_sharding.py` or `braid/src/braid/ng_sharding.py`) so that:
 - `scripts/verify_export.py` can use it for reconciliation
-- `scripts/analyze_v011_memory.py` can use it for shard mapping
+- `scripts/analyze_memory.py` can use it for shard mapping
 - `src/worker.py` can use it for per-shard validation
 - Unit tests can verify it against TensorStore reference vectors
 

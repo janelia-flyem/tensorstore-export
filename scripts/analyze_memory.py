@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Analyze v0.11 export data to derive a label-aware memory formula.
+Analyze export data to derive a label-aware memory formula.
 
 Correlates per-shard label profiles (from -labels.csv files) with actual
 neuroglancer output shard sizes to build an empirical model for memory
-estimation.  The output replaces the conservative KB_PER_CHUNK lookup in
-precompute_manifest.py with a label-aware formula.
+estimation.  The output feeds the tier-assignment constants in
+precompute_manifest.py.
 
 Data sources (all on GCS, read-only):
   - DVID Arrow shard files (for arrow_bytes)
@@ -14,15 +14,16 @@ Data sources (all on GCS, read-only):
   - NG spec JSON (for scale-to-resolution mapping and sharding params)
 
 Output:
-  - analysis/v011_shard_memory.csv: full correlation dataset
+  - Per-shard correlation CSV (one row per matched shard)
   - Console report: per-scale stats, regression, tier comparison, formula
 
 Usage:
     pixi run analyze-memory \\
-      --source gs://flyem-male-cns/dvid-exports/mCNS-98d699/segmentation \\
-      --labels gs://flyem-dvid-exports/mCNS-98d699/segmentation \\
-      --dest gs://flyem-male-cns/v0.11/segmentation \\
-      --ng-spec examples/mcns-v0.11-export-specs.json
+      --source gs://bucket/dvid-exports/dataset/segmentation \\
+      --labels gs://bucket/dvid-exports/dataset/segmentation \\
+      --dest gs://bucket/ng-output/dataset/segmentation \\
+      --ng-spec examples/dataset-export-specs.json \\
+      --output analysis/dataset_shard_memory.csv
 """
 
 import argparse
@@ -312,9 +313,12 @@ def analyze(rows):
     for scale in sorted(by_scale):
         sr = by_scale[scale]
         n = len(sr)
-        if n < 10:
-            print(f"\n  Scale {scale}: {n} shards (skipping — too few)")
+        print(f"\n  Scale {scale} ({n} shards):")
+        if n < 3:
+            print("    (too few shards for regression)")
             continue
+        if n < 10:
+            print("    (small sample — interpret with caution)")
 
         y = [r["ng_output_bytes"] for r in sr]
         sv = [r["total_sv"] for r in sr]
@@ -334,7 +338,6 @@ def analyze(rows):
         pred = [best_a * xi for xi in best_x]
         errs = sorted(abs(yi - pi) / yi for yi, pi in zip(y, pred) if yi > 0)
 
-        print(f"\n  Scale {scale} ({n} shards):")
         print(f"    ng = {a_sv:.0f} * total_sv"
               f"                        R²={r2_sv:.4f}")
         print(f"    ng = {a_lab:.0f} * total_labels (list len)"
@@ -488,7 +491,7 @@ def analyze(rows):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze v0.11 export to derive label-aware memory formula.",
+        description="Analyze export data to derive label-aware memory formula.",
     )
     parser.add_argument(
         "--source", required=True,
@@ -511,15 +514,15 @@ def main():
         help="Comma-separated scales (default: 0-9)",
     )
     parser.add_argument(
-        "--output", default="analysis/v011_shard_memory.csv",
-        help="Output CSV path (default: analysis/v011_shard_memory.csv)",
+        "--output", default="analysis/shard_memory.csv",
+        help="Output CSV path (default: analysis/shard_memory.csv)",
     )
     args = parser.parse_args()
 
     scales = [int(s) for s in args.scales.split(",")]
     scale_info = load_ng_spec(args.ng_spec)
 
-    print("Analyzing v0.11 memory profile")
+    print("Analyzing memory profile")
     print(f"  Source: {args.source}")
     print(f"  Labels: {args.labels}")
     print(f"  Dest:   {args.dest}")

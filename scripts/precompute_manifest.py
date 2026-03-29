@@ -77,49 +77,79 @@ def list_arrow_files(source_path: str, scales: list) -> list:
     return all_files
 
 
-# Observed max compressed KB per chunk in output shard, by scale.
-# From: pixi run analyze-memory (v0.11 production data, 25,541 shards).
-KB_PER_CHUNK = {
-    0: 14,    # p95=7,   max=14
-    1: 27,    # p95=21,  max=27
-    2: 43,    # p95=39,  max=43
-    3: 76,    # p95=67,  max=76
-    4: 126,   # p95=116, max=126
-    5: 192,   # p95=192, max=192
-    6: 249,   # p95=249, max=249
-    7: 162,   # p95=162, max=162
-    8: 150,   # p95=150, max=150
-    9: 122,   # p95=122, max=122
+# ---------------------------------------------------------------------------
+# Memory estimation — empirical calibration from production data
+# ---------------------------------------------------------------------------
+#
+# The output .shard file on tmpfs uses compressed_segmentation + gzip encoding,
+# byte-identical to the final GCS output.  tmpfs consumption is the dominant
+# variable cost; everything else is fixed overhead.
+#
+# See docs/ExportShardsOptimization.md §12 for derivation and calibration
+# instructions.
+
+# Max observed bytes per chunk in output .shard file, by scale.
+# Derived as: max(ng_output_bytes / chunk_count) across all shards at each
+# scale, from analysis/v011_shard_memory.csv (25,541 shards).
+#
+# IMPORTANT: this is NOT max_shard_size / full_shard_chunks.  The densest
+# bytes-per-chunk shard is often a partially-filled shard with high label
+# density, not a full 32K-chunk interior shard.
+#
+# This is a conservative worst-case upper bound.  The brain sparsely fills
+# the bounding volume, so most shards (especially boundary shards) have
+# much lower bytes-per-chunk.  The label-aware model (BYTES_PER_UNIQUE_LABEL)
+# is much tighter when label profiles are available.
+#
+# Source: v0.11 (gs://flyem-male-cns/v0.11/segmentation).
+# Refresh after each new dataset: see docs/ExportShardsOptimization.md §13.
+BYTES_PER_CHUNK = {
+    0:  13_932,   # 13.6 KB — shard 36864_43008_108544 (32,768 chunks)
+    1:  27_919,   # 27.3 KB — shard 26624_34816_49152  (24,603 chunks)
+    2:  44_482,   # 43.4 KB — shard 6144_10240_26624   (1,558 chunks)
+    3:  77_480,   # 75.7 KB — shard 6144_2048_2048     (32,768 chunks)
+    4: 128_757,   # 125.7 KB — shard 2048_0_0          (22,565 chunks)
+    5: 196_923,   # 192.3 KB — shard 0_0_2048          (6,138 chunks)
+    6: 255_166,   # 249.2 KB — shard 0_0_0             (3,301 chunks)
+    7: 166_127,   # 162.2 KB — shard 0_0_0             (828 chunks)
+    8: 153_717,   # 150.1 KB — shard 0_0_0             (143 chunks)
+    9: 125_268,   # 122.3 KB — shard 0_0_0             (29 chunks)
 }
+
+# Fixed overhead for shard processing (s0): Python + BRAID + pyarrow +
+# TensorStore + GCS client + decompression buffers.  Measured from cgroup
+# memory.current at worker startup before any shard processing begins.
+SHARD_PROC_OVERHEAD_GIB = 2.0
+
+# Fixed overhead for downres: Python + TensorStore + GCS client + source
+# read cache (bounded by cache_pool at 256 MB).  Lighter than shard
+# processing — no pyarrow/BRAID/Arrow overhead.
+DOWNRES_OVERHEAD_GIB = 1.5
+
+
+def estimate_tmpfs_gib(chunk_count: int, scale: int) -> float:
+    """Estimate the output .shard file size on tmpfs.
+
+    Uses the worst-case bytes-per-chunk rate observed across production
+    datasets.  Conservative for boundary shards and sparse regions.
+    """
+    bpc = BYTES_PER_CHUNK.get(scale, 80_000)
+    return chunk_count * bpc / (1 << 30)
 
 
 def estimate_memory_gib(arrow_size_bytes: int, chunk_count: int = 0,
                         scale: int = 0) -> float:
-    """Estimate total memory needed to process a shard.
+    """Estimate total memory to process a DVID Arrow shard.
 
-    Cloud Run Gen 2 uses an in-memory filesystem (tmpfs), NOT disk-backed
-    storage.  Writes to /mnt/staging consume the container's memory budget.
-    The output neuroglancer shard file lives on tmpfs and grows as chunks are
-    committed via TensorStore's batched read-modify-write.
+    Memory = Arrow in RAM + output .shard on tmpfs (×2 for RMW) + fixed overhead.
 
-    Memory components:
-      - Arrow file loaded into RAM by BRAID (~1× file size)
-      - Output shard file on tmpfs (chunks × KB_per_chunk)
-      - TensorStore RMW peak: old + new shard in memory (~2× shard size)
-      - Additive headroom for Python runtime, libraries, GCS client
-
-    KB/chunk rates are the observed MAX from the mCNS v0.11 export
-    (25,541 shards, March 2026).  See analysis/v011_shard_memory.csv.
+    The RMW factor: during batched transaction commits, TensorStore holds
+    both the old and new shard file on tmpfs simultaneously, so peak tmpfs
+    is ~2× the final shard size.
     """
-    kb_per_chunk = KB_PER_CHUNK.get(scale, 150)
-
     arrow_gib = arrow_size_bytes / (1 << 30)
-    shard_gib = chunk_count * kb_per_chunk / (1024 * 1024)
-
-    # During batched RMW commit, TensorStore holds old + new shard in memory,
-    # so peak tmpfs is ~2× the final shard size.  Additive 2 GiB covers
-    # Python runtime, BRAID, pyarrow, GCS client, and decompression buffers.
-    return arrow_gib + 2 * shard_gib + 2.0
+    tmpfs_gib = estimate_tmpfs_gib(chunk_count, scale)
+    return arrow_gib + 2 * tmpfs_gib + SHARD_PROC_OVERHEAD_GIB
 
 
 def pick_tier(mem_needed_gib: float, min_tier: int = 4) -> int:
@@ -189,18 +219,15 @@ def distribute_tasks(shards: list, max_tasks: int) -> dict:
 def estimate_downres_memory_gib(chunk_count: int, scale: int) -> float:
     """Estimate memory for a downres shard.
 
-    Lighter than shard processing: no Arrow file, no BRAID/pyarrow overhead.
-    Memory components:
-      - Output shard on tmpfs (chunks × KB_per_chunk)
-      - Source read cache (~0.25 GiB, bounded by TensorStore cache_pool)
-      - Baseline: Python + TensorStore + GCS client (~1.5 GiB)
-      - Safety factor: 1.3x
+    Memory = output .shard on tmpfs + fixed overhead.
+
+    No RMW factor: downres writes to a fresh staging dir (no pre-existing
+    shard), so there's only one copy on tmpfs.  No Arrow/pyarrow/BRAID
+    overhead — the source is read from GCS via byte-range requests with a
+    bounded cache.
     """
-    kb_per_chunk = KB_PER_CHUNK.get(scale, 150)
-    shard_gib = chunk_count * kb_per_chunk / (1024 * 1024)
-    source_cache_gib = 0.25
-    baseline_gib = 1.5
-    return (source_cache_gib + shard_gib + baseline_gib) * 1.3
+    tmpfs_gib = estimate_tmpfs_gib(chunk_count, scale)
+    return tmpfs_gib + DOWNRES_OVERHEAD_GIB
 
 
 def generate_downres_manifests(
