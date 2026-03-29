@@ -229,9 +229,14 @@ Exporting only scale 0 would save ~2.8 hours of export time and ~1.5 TB of uploa
 but introduces complexity (Cloud Run would need to compute downres) and a
 sequential dependency (scale N+1 depends on scale N being fully written).
 
-**Recommendation**: Use DVID's pre-computed downres shards (current approach). The
+**Original recommendation**: Use DVID's pre-computed downres shards (current approach). The
 time savings don't justify the added complexity, and using DVID's downres guarantees
 the neuroglancer volume exactly matches what DVID serves.
+
+**Updated recommendation (March 2026)**: Per-scale throughput analysis shows the
+DVID export is 12× slower at scale 4 than scale 0, saving 4h 19m by exporting
+only scale 0. The downres code is already implemented in the worker. See
+[ExportShardsOptimization.md](ExportShardsOptimization.md) for the full analysis.
 
 ### A better optimization target
 
