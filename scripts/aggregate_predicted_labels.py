@@ -110,6 +110,7 @@ def aggregate_labels(source_path: str, target_scale: int,
     # (each file has exact union within its parent shard; max is closer
     # to the true union than sum).
     chunk_labels = {}  # (cx, cy, cz) -> max unique_labels
+    files_read = 0
 
     def _read_one(path):
         return _read_csv_rows(path)
@@ -121,8 +122,12 @@ def aggregate_labels(source_path: str, target_scale: int,
                 key = (cx, cy, cz)
                 if key not in chunk_labels or ul > chunk_labels[key]:
                     chunk_labels[key] = ul
+            files_read += 1
+            if files_read % 1000 == 0 or files_read == len(pred_files):
+                print(f"  Reading predictions: {files_read}/{len(pred_files)} files, "
+                      f"{len(chunk_labels):,} chunks so far")
 
-    print(f"  Merged {len(chunk_labels)} unique chunk predictions")
+    print(f"  Merged {len(chunk_labels):,} unique chunk predictions")
 
     # Step 3: Group chunks by target shard number
     coord_bits = target_params["coord_bits"]
@@ -131,10 +136,16 @@ def aggregate_labels(source_path: str, target_scale: int,
     shard_bits = target_params["shard_bits"]
 
     shard_chunks = defaultdict(list)  # shard_number -> [(cx, cy, cz, ul)]
+    grouped = 0
+    total_chunks = len(chunk_labels)
+    log_interval = max(1, total_chunks // 10)
     for (cx, cy, cz), ul in chunk_labels.items():
         morton = compressed_z_index((cx, cy, cz), coord_bits)
         sn, _ = chunk_shard_info(morton, preshift, minishard_bits, shard_bits)
         shard_chunks[sn].append((cx, cy, cz, ul))
+        grouped += 1
+        if grouped % log_interval == 0:
+            print(f"  Grouping: {grouped:,}/{total_chunks:,} chunks")
 
     print(f"  Grouped into {len(shard_chunks)} target shards")
 
@@ -153,6 +164,7 @@ def aggregate_labels(source_path: str, target_scale: int,
         csv_path = f"{source_path}/s{target_scale}/{shard_hex}-labels.csv"
         _write_string(csv_path, out.getvalue())
 
+    total_to_write = len(shard_chunks)
     with ThreadPoolExecutor(max_workers=16) as pool:
         futures = {
             pool.submit(_write_shard_csv, sn, chunks): sn
@@ -161,6 +173,8 @@ def aggregate_labels(source_path: str, target_scale: int,
         for future in as_completed(futures):
             future.result()  # propagate exceptions
             written += 1
+            if written % 500 == 0 or written == total_to_write:
+                print(f"  Writing label CSVs: {written}/{total_to_write}")
 
     print(f"  Written {written} label files to {source_path}/s{target_scale}/")
     return written

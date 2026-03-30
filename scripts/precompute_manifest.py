@@ -642,12 +642,27 @@ def main():
         tier_uri = f"{source_path}/manifests/tier-{gib}gi"
         gcs_bucket = storage_client.bucket(bucket_name)
 
-        for task_idx, shard_list in tasks.items():
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _upload_manifest(item):
+            task_idx, shard_list = item
             blob = gcs_bucket.blob(f"{tier_prefix}/task-{task_idx}.json")
             blob.upload_from_string(
                 json.dumps(shard_list, separators=(",", ":")),
                 content_type="application/json",
             )
+
+        uploaded = 0
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            futures = {
+                pool.submit(_upload_manifest, item): item
+                for item in tasks.items()
+            }
+            for future in as_completed(futures):
+                future.result()
+                uploaded += 1
+                if uploaded % 500 == 0 or uploaded == num_tasks:
+                    print(f"    Writing manifests: {uploaded}/{num_tasks}")
 
         print(f"    Written {num_tasks} task manifests: {tier_uri}/task-*.json")
         manifest_prefixes[gib] = tier_uri
@@ -667,18 +682,9 @@ def main():
         json.dumps(summary, indent=2), content_type="application/json")
     print(f"\n  Written summary: {source_path}/manifests/summary.json")
 
-    # Print execution commands
-    scales_arg = ",".join(str(s) for s in scales)
-    print(f"\nExecution commands:")
-    for gib in sorted(tier_map.keys()):
-        shards = tier_map[gib]
-        tier_max = max_tasks.get(gib, 1000)
-        num_tasks = min(tier_max, len(shards))
-        cpu = TIER_CPU.get(gib, 2)
-        uri = manifest_prefixes.get(gib, "")
-        print(f"  pixi run generate-scale --scales {scales_arg} "
-              f"--tasks {num_tasks} --memory {gib}Gi --cpu {cpu} "
-              f"--manifest-uri {uri}")
+    # Print next step
+    print("\nNext step:")
+    print("  pixi run export --wait")
 
 
 if __name__ == "__main__":
