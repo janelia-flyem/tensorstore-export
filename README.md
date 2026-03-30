@@ -58,7 +58,8 @@ pixi run deploy
   ...
 
 --- Deployment ---
-  SCALES [0,1,2,3,4,5,6,7,8,9]: ↵
+  SCALES [0]: ↵
+  DOWNRES_SCALES [1,2,3,4,5,6,7,8,9]: ↵
   ...
 
 Writing neuroglancer info file ...
@@ -70,59 +71,82 @@ All values are saved to `.env` for future runs. You can also edit `.env` directl
 
 ### Export
 
-After deploying, run the export. This single command scans all Arrow source
-files, assigns shards to memory tiers, writes per-task manifests to GCS,
-and launches a Cloud Run job per tier:
+Export runs in two phases: **s0 from DVID Arrow shards**, then **s1-s9 via downsampling**.
+
+#### Phase 1: Export s0
+
+Scans Arrow source files at scale 0, assigns shards to memory tiers, writes
+per-task manifests to GCS, and launches a Cloud Run job per tier:
 
 ```bash
 pixi run export
 ```
 
 ```
-Scanning Arrow files across 10 scales...
-  Found 26125 Arrow files
-  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB
+Scanning Arrow files across 1 scales...
+  Found 21690 Arrow files
 
 Tier assignments:
-  4Gi (cpu=2): 23204 shards, 5000 tasks, total=3034.4GB, max_arrow=629MB
-  8Gi (cpu=2): 2756 shards, 2756 tasks, total=1400.3GB, max_arrow=3133MB
-  16Gi (cpu=4): 162 shards, 162 tasks, total=278.8GB, max_arrow=6634MB
-  24Gi (cpu=6): 3 shards, 3 tasks, total=17.3GB, max_arrow=6647MB
-
-Writing 7921 task manifests to GCS...
-  500/7921 manifests written
-  ...
-  4Gi: 5000 tasks → gs://.../manifests/tier-4gi/
-  8Gi: 2756 tasks → gs://.../manifests/tier-8gi/
-  16Gi: 162 tasks → gs://.../manifests/tier-16gi/
-  24Gi: 3 tasks → gs://.../manifests/tier-24gi/
+  4Gi (cpu=2): 19204 shards, 5000 tasks
+  8Gi (cpu=2): 2321 shards, 2321 tasks
+  16Gi (cpu=4): 162 shards, 162 tasks
+  24Gi (cpu=6): 3 shards, 3 tasks
 
 Launching 4 tier job(s)...
   tensorstore-dvid-export-tier-4gi: launched (5000 tasks, 4Gi, cpu=2)
-  tensorstore-dvid-export-tier-8gi: launched (2756 tasks, 8Gi, cpu=2)
-  tensorstore-dvid-export-tier-16gi: launched (162 tasks, 16Gi, cpu=4)
-  tensorstore-dvid-export-tier-24gi: launched (3 tasks, 24Gi, cpu=6)
+  ...
 ```
 
-Each task reads only its own small manifest file
-(`task-0.json`, `task-1.json`, ...) listing the shards it should process.
-Tasks within a tier are load-balanced by total Arrow file bytes.
+Each task reads its own small manifest file (`task-0.json`, `task-1.json`, ...)
+listing the shards it should process. Tasks within a tier are load-balanced by
+Arrow file size.
 
-Options for `export`:
+#### Phase 2: Downres s1-s9
+
+After s0 completes, generate each subsequent scale by reading the previous
+scale from the destination volume and downsampling 2x in each dimension
+(majority vote). Run one scale at a time — scale N-1 must be fully written
+before scale N starts:
+
+```bash
+# Generate s1 from s0
+pixi run export --downres-mode --downres 1
+
+# After s1 completes, aggregate label predictions for s2 tier assignment
+pixi run aggregate-labels --target-scale 2
+
+# Generate s2 from s1
+pixi run export --downres-mode --downres 2
+
+# Repeat for s3-s9...
+```
+
+The `aggregate-labels` step is optional but recommended — it produces
+per-shard label counts that the manifest generator uses for tighter memory
+tier assignment (label-aware model). Without it, the chunk-count model is
+used, which is more conservative.
+
+To automate the full chain (launch scale, wait for completion, aggregate
+labels, launch next scale):
+
+```bash
+pixi run export --downres-mode --downres 1,2,3,4,5,6,7,8,9 --wait
+```
+
+#### Export options
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--scales` | Scales to include | from `.env` |
-| `--label-type` | `labels` (agglomerated, default) or `supervoxels` (raw IDs) | `labels` |
-| `--downres` | Scales to generate by downsampling previous scale | none |
+| `--scales` | Source scales with DVID Arrow shards | from `.env` |
+| `--downres-mode` | Generate scales by downsampling instead of from DVID shards | |
+| `--downres` | Target scales for downres (e.g., `1` or `1,2,3,...,9`) | from `.env` |
+| `--label-type` | `labels` (agglomerated) or `supervoxels` (raw IDs) | `labels` |
 | `--tiers` | Override max tasks per tier (e.g., `4:3000,8:50`) | auto |
-| `--dry-run` | Scan and show tiers without writing manifests or launching | |
-| `--wait` | Block until all jobs complete | async |
+| `--dry-run` | Show tier assignments without writing manifests or launching | |
+| `--wait` | Block until jobs complete (for downres: run aggregation between scales) | async |
 
 Use `pixi run precompute-manifest --dry-run` to preview tier assignments
 without launching any jobs.
-
-By default, workers export **agglomerated labels** — the standard segmentation view where proofreading merges are applied. Use `--label-type supervoxels` to export the raw supervoxel IDs from the DVID blocks instead.
 
 ### Monitoring Progress
 
@@ -131,6 +155,10 @@ pixi run export-status    # task counts, memory, timing, in-flight shards
 pixi run export-errors    # error summary across all tiers
 pixi run export-errors --details  # full details of every failed chunk
 ```
+
+Both commands work for s0 export jobs and downres jobs. For downres jobs,
+they query the appropriate log event names (`Downres shard complete` vs
+`Shard complete`) automatically.
 
 `export-status` queries Cloud Run execution status and Cloud Logging for
 structured events. It shows per-tier shard/chunk completion, memory usage,
@@ -175,35 +203,42 @@ pixi run find-failed -- --retry-tier 16
 pixi run export --manifest-dir manifests-retry --job-suffix retry
 ```
 
-### Multi-Scale Processing
-
-Workers support two sources for each scale:
-
-**From DVID export shards** (default): DVID pre-computes downsampled blocks at each scale. Workers ingest them directly — no computation needed, output exactly matches what DVID serves.
-
-**From previous scale** (downres mode): For scales not materialized in DVID, `--downres N` generates scale N by reading the already-written scale N-1 from the destination volume and downsampling 2× in each dimension using majority vote. Scale N-1 must be fully written first.
-
 ### Memory Sizing
 
-Memory per shard is dominated by two components: the Arrow file in RAM and
-the output neuroglancer shard on tmpfs (Cloud Run Gen 2 uses in-memory
-filesystem). The formula used by `precompute-manifest`:
+Cloud Run Gen 2 uses in-memory filesystem (tmpfs), so the output shard file
+consumes container memory. `precompute-manifest` assigns shards to memory
+tiers (4/8/16/24/32 GiB) automatically based on estimated peak memory.
+
+**s0 export** (from DVID Arrow shards):
 
 ```
-memory_gib = (arrow_gib + 1.3 * shard_on_tmpfs_gib + 1.5) * 1.3
+memory = arrow_in_ram + 2 * shard_on_tmpfs + 2.0 GiB overhead
 ```
 
-| Component | Size | Notes |
-|-----------|------|-------|
-| Arrow file | 1x arrow_size | Fully in RAM via `blob.download_as_bytes()` |
-| Output shard on tmpfs | chunks x KB/chunk | Grows during batched RMW commits |
-| TensorStore RMW overhead | ~1.3x shard size | During commit |
-| Python baseline | ~1.5 GiB | Runtime, libraries, buffers |
-| Safety margin | 1.3x total | |
+| Component | Notes |
+|-----------|-------|
+| Arrow file in RAM | Fully loaded via `blob.download_as_bytes()` |
+| Output shard on tmpfs (2x) | RMW during batched transaction commits |
+| Fixed overhead (2.0 GiB) | Python + pyarrow + BRAID + TensorStore + GCS client |
 
-The `precompute-manifest` command assigns shards to tiers (4/8/16/24/32 GiB)
-automatically. In the mCNS v0.11 production run, all 26,125 shards completed
-with zero OOM failures. No tier exceeded 50% of its memory budget.
+**Downres** (from previous scale):
+
+```
+memory = shard_on_tmpfs + 3.5 GiB overhead
+```
+
+| Component | Notes |
+|-----------|-------|
+| Output shard on tmpfs | Written to local staging, then uploaded |
+| Fixed overhead (3.5 GiB) | TensorStore + source read cache + label readback buffers |
+
+Downres uses a minimum tier of 8 GiB. The overhead includes memory for the
+label readback step, which reads back all chunks from tmpfs and computes
+unique label sets for next-scale prediction.
+
+When per-shard label counts are available (from `aggregate-labels`), the
+**label-aware model** replaces the chunk-count estimate with a tighter
+linear prediction based on total unique labels per shard.
 
 ## Configuration
 
@@ -215,7 +250,8 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 | `DEST_PATH` | GCS URI for neuroglancer precomputed output | `gs://mybucket/v1.0/precomputed` |
 | `NG_SPEC_PATH` | Neuroglancer volume spec JSON (same as DVID export-shards) | `mcns-v0.11-export-specs.json` |
 | `BASE_JOB_NAME` | Cloud Run job name prefix (tier jobs: `{name}-tier-4gi`, ...) | `tensorstore-dvid-export` |
-| `SCALES` | Scales to process (comma-separated) | `0,1,2,3,4,5,6,7,8,9` |
+| `SCALES` | Source scales with DVID Arrow shards | `0` |
+| `DOWNRES_SCALES` | Scales to generate by downsampling (optional) | `1,2,3,4,5,6,7,8,9` |
 
 ## GCS Bucket Setup
 
@@ -269,7 +305,9 @@ DVID export-shards           Cloud Run Workers              Neuroglancer Volume
   per-scale: s0/, s1/...       google-cloud-storage           compressed_segmentation
 ```
 
-Each worker processes one shard at a time: download Arrow+CSV from GCS, decompress chunks via the DVID block decompressor, transpose ZYX→XYZ, and write to the neuroglancer precomputed volume via TensorStore.
+**s0 workers** process one shard at a time: download Arrow+CSV from GCS, decompress chunks via the DVID block decompressor, transpose ZYX→XYZ, and write to the neuroglancer precomputed volume via TensorStore.
+
+**Downres workers** generate scales s1-s9 by reading the previous scale from the destination volume on GCS, downsampling 2x in each dimension (majority vote), writing the output shard to local tmpfs staging, then uploading to GCS. Each worker also reads back the output chunks to compute unique label counts for next-scale memory prediction.
 
 **Transaction batching**: All chunk writes for a shard are accumulated in a
 single explicit TensorStore transaction and committed as one shard write to
@@ -295,8 +333,9 @@ tensorstore-export/
 ├── Dockerfile                       # Cloud Run container
 ├── scripts/
 │   ├── deploy.py                   # Interactive deployment (image, info file)
-│   ├── export.py                   # Scan, manifest, launch (single command)
+│   ├── export.py                   # Scan, manifest, launch (s0 and downres)
 │   ├── precompute_manifest.py      # Tier assignment, manifest + summary generation
+│   ├── aggregate_predicted_labels.py # Merge label predictions for tier assignment
 │   ├── export_status.py            # Job status, memory, progress tracking
 │   ├── export_errors.py            # Query error logs
 │   ├── find_failed_shards.py       # Identify failed shards for retry

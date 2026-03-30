@@ -726,12 +726,15 @@ class ShardProcessor:
             with open(os.path.join(staging_dir, "info"), "w") as f:
                 f.write(self._info_json)
 
-            # Open local staging volume
+            # Open local staging volume (write-only — no read cache needed)
             local_dest = ts.open({
                 "driver": "neuroglancer_precomputed",
                 "kvstore": {"driver": "file", "path": staging_dir},
                 "scale_index": scale,
                 "open": True,
+                "context": {
+                    "cache_pool": {"total_bytes_limit": 0},
+                },
             }).result()
 
             # Copy the downsampled region into local staging

@@ -365,9 +365,11 @@ def shard_bbox(shard_number: int, scale_params: dict) -> dict:
     # Voxel origin
     voxel_origin = [origin_chunks[d] * chunk_size[d] for d in range(3)]
 
-    # Voxel extent: shard shape in voxels, clipped to volume bounds
+    # Voxel extent: shard shape in voxels, clipped to volume bounds.
+    # Clamp to 0 for shards whose origin is beyond the volume boundary
+    # (can happen when the shard grid extends past the volume).
     voxel_extent = [
-        min(shard_shape[d] * chunk_size[d], vol_size[d] - voxel_origin[d])
+        max(0, min(shard_shape[d] * chunk_size[d], vol_size[d] - voxel_origin[d]))
         for d in range(3)
     ]
 
