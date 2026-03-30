@@ -588,7 +588,7 @@ class ShardProcessor:
                          source_domain=str(source.domain),
                          dest_domain=str(dest.domain))
 
-            ts.copy(downsampled, dest).result()
+            dest.write(downsampled).result()
 
             logger.info("Downres complete", scale=scale)
             return True
@@ -662,7 +662,7 @@ class ShardProcessor:
         1. Open source scale (N-1) from the dest bucket on GCS (read-only)
         2. Create tmpfs staging dir with info file
         3. Open local staging TensorStore (file driver)
-        4. ts.copy(downsampled[bbox], local_dest[bbox]).result()
+        4. local_dest[bbox].write(downsampled[bbox]).result()
         5. Upload shard file(s) to GCS
         6. Delete staging dir
 
@@ -726,9 +726,8 @@ class ShardProcessor:
                         source_domain=str(source.domain),
                         dest_domain=str(local_dest.domain))
 
-            ts.copy(
+            local_dest[x0:x0+sx, y0:y0+sy, z0:z0+sz, :].write(
                 downsampled[x0:x0+sx, y0:y0+sy, z0:z0+sz, :],
-                local_dest[x0:x0+sx, y0:y0+sy, z0:z0+sz, :],
             ).result()
 
             mem_current, _, _ = _read_cgroup_memory()

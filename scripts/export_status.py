@@ -173,6 +173,22 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
     }
 
 
+def _is_downres_job(label: str) -> bool:
+    """Check if a job label indicates a downres job."""
+    return "downres" in label
+
+
+def _normalize_downres_payload(payload: dict) -> dict:
+    """Map downres log fields to match regular export field names."""
+    if "shard_number" in payload and "shard" not in payload:
+        payload["shard"] = payload["shard_number"]
+    if "num_chunks" in payload and "chunks_written" not in payload:
+        payload["chunks_written"] = payload["num_chunks"]
+    payload.setdefault("chunks_failed", 0)
+    payload.setdefault("batches", 1)
+    return payload
+
+
 def _query_log_events(job_name: str, project: str, region: str,
                       event_name: str, execution: str = "",
                       limit: int = 50000) -> list:
@@ -339,10 +355,17 @@ def main():
             continue
 
         # Query in-flight progress and completed shard events
-        progress = _query_log_events(
-            job_name, project, region, "Shard progress", execution)
-        completed = _query_log_events(
-            job_name, project, region, "Shard complete", execution)
+        is_downres = _is_downres_job(label)
+        if is_downres:
+            progress = []  # downres worker doesn't emit progress events
+            completed = _query_log_events(
+                job_name, project, region, "Downres shard complete", execution)
+            completed = [_normalize_downres_payload(c) for c in completed]
+        else:
+            progress = _query_log_events(
+                job_name, project, region, "Shard progress", execution)
+            completed = _query_log_events(
+                job_name, project, region, "Shard complete", execution)
 
         # Deduplicate progress: keep latest per (scale, shard)
         latest = {}

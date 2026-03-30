@@ -65,6 +65,21 @@ def parse_structured_payload(entry: dict) -> dict:
         return {"raw": text}
 
 
+def _is_downres_job(job_name: str) -> bool:
+    """Check if a job name indicates a downres job."""
+    return "downres" in job_name
+
+
+def _normalize_downres_payload(payload: dict) -> dict:
+    """Map downres log fields to match regular export field names."""
+    if "shard_number" in payload and "shard" not in payload:
+        payload["shard"] = payload["shard_number"]
+    if "num_chunks" in payload and "chunks_written" not in payload:
+        payload["chunks_written"] = payload["num_chunks"]
+    payload.setdefault("chunks_failed", 0)
+    return payload
+
+
 def classify_error(error_str: str) -> str:
     """Classify an error string into a short category."""
     if "zstd" in error_str.lower():
@@ -122,14 +137,23 @@ def query_scale_logs(job_name: str, project: str, region: str,
     if not exec_filter and not use_all:
         exec_filter = get_latest_execution(job_name, project, region)
 
-    chunk_entries = query_logs(job_name, project, region,
-                               "Chunk failed", limit, exec_filter)
-    shard_entries = query_logs(job_name, project, region,
-                               "Failed to process shard", limit, exec_filter)
-    success_entries = query_logs(job_name, project, region,
-                                 "Shard complete", limit, exec_filter)
-    progress_entries = query_logs(job_name, project, region,
-                                  "Shard progress", limit, exec_filter)
+    is_downres = _is_downres_job(job_name)
+    if is_downres:
+        chunk_entries = []  # downres doesn't emit per-chunk errors
+        shard_entries = query_logs(job_name, project, region,
+                                   "Failed to downres shard", limit, exec_filter)
+        success_entries = query_logs(job_name, project, region,
+                                     "Downres shard complete", limit, exec_filter)
+        progress_entries = []  # downres doesn't emit progress events
+    else:
+        chunk_entries = query_logs(job_name, project, region,
+                                   "Chunk failed", limit, exec_filter)
+        shard_entries = query_logs(job_name, project, region,
+                                   "Failed to process shard", limit, exec_filter)
+        success_entries = query_logs(job_name, project, region,
+                                     "Shard complete", limit, exec_filter)
+        progress_entries = query_logs(job_name, project, region,
+                                      "Shard progress", limit, exec_filter)
     memory_entries = query_logs(job_name, project, region,
                                 "Memory critical\\|Memory pressure", limit, exec_filter)
     return (chunk_entries, shard_entries, success_entries,
@@ -262,7 +286,7 @@ def main():
     # Parse shard-level failures
     shard_load_failures = []
     for entry in all_shard_entries:
-        payload = parse_structured_payload(entry)
+        payload = _normalize_downres_payload(parse_structured_payload(entry))
         if "chunk_x" not in payload:
             shard_load_failures.append({
                 "shard": payload.get("shard", "unknown"),
@@ -275,7 +299,7 @@ def main():
     success_shards = 0
     failed_chunks_in_success = 0
     for entry in all_success_entries:
-        payload = parse_structured_payload(entry)
+        payload = _normalize_downres_payload(parse_structured_payload(entry))
         success_shards += 1
         success_chunks += payload.get("chunks_written", 0)
         failed_chunks_in_success += payload.get("chunks_failed", 0)
@@ -342,15 +366,15 @@ def main():
     # or "Failed to process shard".  These are likely OOM-killed tasks.
     completed_shards = set()
     for entry in all_success_entries:
-        payload = parse_structured_payload(entry)
+        payload = _normalize_downres_payload(parse_structured_payload(entry))
         completed_shards.add((payload.get("scale"), payload.get("shard")))
     for entry in all_shard_entries:
-        payload = parse_structured_payload(entry)
+        payload = _normalize_downres_payload(parse_structured_payload(entry))
         completed_shards.add((payload.get("scale"), payload.get("shard")))
 
     in_progress_shards = {}
     for entry in all_progress_entries:
-        payload = parse_structured_payload(entry)
+        payload = _normalize_downres_payload(parse_structured_payload(entry))
         key = (payload.get("scale"), payload.get("shard"))
         if key not in in_progress_shards:
             in_progress_shards[key] = payload
