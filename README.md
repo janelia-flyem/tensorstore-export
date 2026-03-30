@@ -224,20 +224,23 @@ memory = arrow_in_ram + 2 * shard_on_tmpfs + 2.0 GiB overhead
 **Downres** (from previous scale):
 
 ```
-memory = shard_on_tmpfs + 3.5 GiB overhead
+memory = raw_batch + 2 * shard_on_tmpfs + 1.0 GiB overhead
 ```
 
 | Component | Notes |
 |-----------|-------|
-| Output shard on tmpfs | Written to local staging, then uploaded |
-| Fixed overhead (3.5 GiB) | TensorStore + source read cache + label readback buffers |
+| Raw batch arrays | One Z-plane of raw uint64 arrays: N^(2/3) chunks × 2 MiB (e.g., 1024 × 2 MiB = 2 GiB for 32³ shards) |
+| Output shard on tmpfs (2×) | RMW during batched transaction commits. Coexists with raw arrays in cgroup memory. |
+| Fixed overhead (1.0 GiB) | Python + TensorStore + source/staging caches (256 MiB each) + label readback |
 
-Downres uses a minimum tier of 8 GiB. The overhead includes memory for the
-label readback step, which reads back all chunks from tmpfs and computes
-unique label sets for next-scale prediction.
+Writes are batched one Z-plane at a time with explicit transaction commits.
+Between `write()` and `commit()`, TensorStore holds raw uint64 arrays in
+its ChunkCache — cache_pool eviction does NOT apply to explicit
+transactions. All three terms are additive in cgroup memory (raw arrays +
+tmpfs shard file + overhead coexist simultaneously).
 
 When per-shard label counts are available (from `aggregate-labels`), the
-**label-aware model** replaces the chunk-count estimate with a tighter
+**label-aware model** replaces the chunk-count tmpfs estimate with a tighter
 linear prediction based on total unique labels per shard.
 
 ## Configuration

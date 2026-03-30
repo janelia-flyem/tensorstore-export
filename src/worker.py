@@ -742,10 +742,9 @@ class ShardProcessor:
             # Write in batched transactions.  Between write() and commit(),
             # TensorStore holds raw uint64 arrays (2 MiB per 64^3 chunk) in
             # ChunkCache — cache_pool eviction does NOT apply to explicit
-            # transactions.  One Z-plane = 32×32 = 1024 chunks × 2 MiB =
-            # 2 GiB raw arrays.  After commit, arrays are encoded
-            # (compressed_segmentation + gzip) and flushed to the shard file
-            # on tmpfs via read-modify-write.
+            # transactions.  One Z-plane per batch.  After commit, arrays
+            # are encoded (compressed_segmentation + gzip) and flushed to
+            # the shard file on tmpfs via read-modify-write.
             chunk_z = 64  # chunk size in Z voxels
             batch_z_voxels = chunk_z  # one Z-plane per batch
             num_batches = max(1, (sz + batch_z_voxels - 1) // batch_z_voxels)
@@ -771,11 +770,16 @@ class ShardProcessor:
                 shard_peak_mem = max(shard_peak_mem, mem_current)
                 write_peak_mem = max(write_peak_mem, mem_current)
                 # Log every batch so memory data survives OOM.
-                # Includes tmpfs size to track shard growth vs RSS.
+                # Walk staging dir recursively — shard files are in
+                # subdirectories like <scale_key>/<hex>.shard.
                 batch_tmpfs = 0
-                for f_entry in os.scandir(staging_dir):
-                    if f_entry.is_file():
-                        batch_tmpfs += f_entry.stat().st_size
+                for dirpath, _, filenames in os.walk(staging_dir):
+                    for fname in filenames:
+                        fpath = os.path.join(dirpath, fname)
+                        try:
+                            batch_tmpfs += os.path.getsize(fpath)
+                        except OSError:
+                            pass
                 logger.info("Downres write batch",
                             scale=scale, shard_number=shard_number,
                             batch=f"{batches_committed}/{num_batches}",
@@ -785,11 +789,15 @@ class ShardProcessor:
                             tmpfs_mib=round(batch_tmpfs / (1 << 20), 1),
                             num_chunks=shard_bbox["num_chunks"])
 
-            # Get tmpfs usage for the staging dir
+            # Get tmpfs usage for the staging dir (recursive)
             tmpfs_bytes = 0
-            for f_entry in os.scandir(staging_dir):
-                if f_entry.is_file():
-                    tmpfs_bytes += f_entry.stat().st_size
+            for dirpath, _, filenames in os.walk(staging_dir):
+                for fname in filenames:
+                    try:
+                        tmpfs_bytes += os.path.getsize(
+                            os.path.join(dirpath, fname))
+                    except OSError:
+                        pass
 
             logger.info("Downres memory: after write",
                         scale=scale, shard_number=shard_number,

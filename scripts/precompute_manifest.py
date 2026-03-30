@@ -125,9 +125,9 @@ SHARD_PROC_OVERHEAD_GIB = 2.0
 # read cache (256 MB) + local staging cache (256 MB).
 # Measured baseline from Cloud Run logs: 0.17 GiB at shard start.
 # The main memory consumers are the per-batch transaction buffer
-# (compressed chunks, ~800 MiB per batch of 4 Z-planes) and the
-# growing shard file on tmpfs.  Set to 1.0 GiB to cover runtime +
-# caches + label readback headroom.
+# (one Z-plane of raw uint64 arrays) and the growing shard file on
+# tmpfs — both additive in cgroup memory.  Set to 1.0 GiB to cover
+# runtime + caches + label readback headroom.
 DOWNRES_OVERHEAD_GIB = 1.0
 
 # Bytes per unique label in the output shard file, by scale.
@@ -232,25 +232,23 @@ def distribute_tasks(shards: list, max_tasks: int) -> dict:
 def estimate_downres_memory_gib(chunk_count: int, scale: int) -> float:
     """Estimate memory for a downres shard.
 
-    Memory = shard on tmpfs (×2 for RMW) + raw batch arrays + overhead.
+    Memory = raw batch arrays + shard on tmpfs (×2 for RMW) + overhead.
 
-    Writes are batched by Z-planes with explicit transaction commits.
-    Between write() and commit(), TensorStore holds raw uint64 arrays
-    (2 MiB per 64^3 chunk) — cache_pool eviction does NOT apply to
-    explicit transactions.  One Z-plane = up to 1024 chunks = 2 GiB.
+    These are additive, not max(), because they coexist in memory:
+    the raw uint64 arrays are held in TensorStore's transaction buffer
+    while the shard file occupies tmpfs (which counts against cgroup).
+    During RMW commit, briefly 2× tmpfs (old + new shard).
 
-    Peak during commit: old shard on tmpfs + new shard on tmpfs + raw
-    arrays being encoded.  The raw arrays dominate for early batches
-    (small shard on tmpfs); the shard RMW dominates for later batches.
+    Writes are batched one Z-plane at a time with explicit transaction
+    commits.
     """
     tmpfs_gib = estimate_tmpfs_gib(chunk_count, scale)
     # Raw batch arrays: one Z-plane of chunks × 2 MiB each.
-    # For a shard with N chunks across Z planes, each plane has
-    # N / num_z_planes chunks.  Shard side in chunks ≈ N^(1/3).
+    # For a shard with N chunks, shard side ≈ N^(1/3).
     # One Z-plane = N^(2/3) chunks × 2 MiB.
     chunks_per_z_plane = max(1, int(chunk_count ** (2/3)))
     raw_batch_gib = chunks_per_z_plane * 2 * (1 << 20) / (1 << 30)
-    return max(2 * tmpfs_gib, raw_batch_gib) + DOWNRES_OVERHEAD_GIB
+    return raw_batch_gib + 2 * tmpfs_gib + DOWNRES_OVERHEAD_GIB
 
 
 def estimate_downres_memory_label_aware(total_unique_labels: int,
@@ -276,7 +274,7 @@ def estimate_downres_memory_label_aware(total_unique_labels: int,
     # Raw batch: one Z-plane of raw uint64 arrays held during write()
     chunks_per_z_plane = max(1, int(chunk_count ** (2/3))) if chunk_count else 0
     raw_batch_gib = chunks_per_z_plane * 2 * (1 << 20) / (1 << 30)
-    return max(2 * output_gib, raw_batch_gib) + DOWNRES_OVERHEAD_GIB
+    return raw_batch_gib + 2 * output_gib + DOWNRES_OVERHEAD_GIB
 
 
 def _read_shard_labels(source_path: str, scale: int) -> dict:
