@@ -121,14 +121,27 @@ BYTES_PER_CHUNK = {
 # memory.current at worker startup before any shard processing begins.
 SHARD_PROC_OVERHEAD_GIB = 2.0
 
-# Fixed overhead for downres: Python + TensorStore + GCS client + source
-# read cache (256 MB) + local staging cache (256 MB).
-# Measured baseline from Cloud Run logs: 0.17 GiB at shard start.
-# The main memory consumers are the per-batch transaction buffer
-# (one Z-plane of raw uint64 arrays) and the growing shard file on
-# tmpfs — both additive in cgroup memory.  Set to 1.0 GiB to cover
-# runtime + caches + label readback headroom.
-DOWNRES_OVERHEAD_GIB = 1.0
+# Downres memory model constants.
+#
+# This path writes one output shard at a time from a lazy downsampled source.
+# The dominant modeled terms are:
+#   - raw uint64 output arrays held in the explicit transaction
+#   - 2x output shard bytes during local read-modify-write commit
+#   - fixed process/caches/readback headroom
+# A safety factor is applied to cover additional source-side working set and
+# encode/merge scratch space that are not cleanly observable from static shard
+# metadata alone.
+DOWNRES_SOURCE_CACHE_GIB = 0.25
+DOWNRES_DEST_CACHE_GIB = 0.25
+DOWNRES_RUNTIME_GIB = 0.5
+DOWNRES_LABEL_READBACK_GIB = 0.5
+DOWNRES_OVERHEAD_GIB = (
+    DOWNRES_SOURCE_CACHE_GIB +
+    DOWNRES_DEST_CACHE_GIB +
+    DOWNRES_RUNTIME_GIB +
+    DOWNRES_LABEL_READBACK_GIB
+)
+DOWNRES_SAFETY_FACTOR = 1.2
 
 # Bytes per unique label in the output shard file, by scale.
 # Derived from linear regression of (total_unique_labels, ng_output_bytes)
@@ -229,52 +242,64 @@ def distribute_tasks(shards: list, max_tasks: int) -> dict:
     return tasks
 
 
-def estimate_downres_memory_gib(chunk_count: int, scale: int) -> float:
-    """Estimate memory for a downres shard.
-
-    Memory = raw batch arrays + shard on tmpfs (×2 for RMW) + overhead.
-
-    These are additive, not max(), because they coexist in memory:
-    the raw uint64 arrays are held in TensorStore's transaction buffer
-    while the shard file occupies tmpfs (which counts against cgroup).
-    During RMW commit, briefly 2× tmpfs (old + new shard).
-
-    Writes are batched one Z-plane at a time with explicit transaction
-    commits.
-    """
-    tmpfs_gib = estimate_tmpfs_gib(chunk_count, scale)
-    # Raw batch arrays: one Z-plane of chunks × 2 MiB each.
-    # For a shard with N chunks, shard side ≈ N^(1/3).
-    # One Z-plane = N^(2/3) chunks × 2 MiB.
+def estimate_downres_raw_batch_gib(chunk_count: int) -> float:
+    """Estimate raw uint64 batch memory for one output Z-plane write."""
     chunks_per_z_plane = max(1, int(chunk_count ** (2/3)))
-    raw_batch_gib = chunks_per_z_plane * 2 * (1 << 20) / (1 << 30)
-    return raw_batch_gib + 2 * tmpfs_gib + DOWNRES_OVERHEAD_GIB
+    return chunks_per_z_plane * 2 * (1 << 20) / (1 << 30)
+
+
+def estimate_downres_components(scale: int, chunk_count: int,
+                                total_unique_labels: int | None = None) -> dict:
+    """Return a structured downres memory estimate.
+
+    The estimate intentionally separates the modeled subtotal from the applied
+    safety factor so Cloud Run logs can later be fit against observed peaks.
+    """
+    if total_unique_labels is not None:
+        bpul = BYTES_PER_UNIQUE_LABEL.get(scale, 13)
+        output_gib = total_unique_labels * bpul / (1 << 30)
+        model = "label_aware"
+    else:
+        output_gib = estimate_tmpfs_gib(chunk_count, scale)
+        model = "chunk_count"
+
+    raw_batch_gib = estimate_downres_raw_batch_gib(chunk_count)
+    subtotal_gib = (
+        raw_batch_gib +
+        2 * output_gib +
+        DOWNRES_OVERHEAD_GIB
+    )
+    total_gib = subtotal_gib * DOWNRES_SAFETY_FACTOR
+    return {
+        "estimate_model": model,
+        "chunk_count": chunk_count,
+        "scale": scale,
+        "total_unique_labels": total_unique_labels,
+        "output_gib": output_gib,
+        "tmpfs_gib": output_gib,
+        "raw_batch_gib": raw_batch_gib,
+        "source_cache_gib": DOWNRES_SOURCE_CACHE_GIB,
+        "dest_cache_gib": DOWNRES_DEST_CACHE_GIB,
+        "runtime_gib": DOWNRES_RUNTIME_GIB,
+        "label_readback_gib": DOWNRES_LABEL_READBACK_GIB,
+        "overhead_gib": DOWNRES_OVERHEAD_GIB,
+        "subtotal_gib": subtotal_gib,
+        "safety_factor": DOWNRES_SAFETY_FACTOR,
+        "total_gib": total_gib,
+    }
+
+
+def estimate_downres_memory_gib(chunk_count: int, scale: int) -> float:
+    """Estimate memory for a downres shard using the chunk-count model."""
+    return estimate_downres_components(scale, chunk_count)["total_gib"]
 
 
 def estimate_downres_memory_label_aware(total_unique_labels: int,
                                        scale: int,
                                        chunk_count: int = 0) -> float:
-    """Estimate memory for a downres shard using the label-aware model.
-
-    Uses the linear relationship between total unique labels and output
-    shard size (R² > 0.95).  Much tighter than the chunk-count model
-    for the tmpfs/RMW term, but the raw batch term still depends on
-    chunk geometry.
-
-    Args:
-        total_unique_labels: Sum of unique_labels across all chunks in shard.
-        scale: Target scale index.
-        chunk_count: Total chunks in shard (for raw batch estimate).
-
-    Returns:
-        Estimated memory in GiB.
-    """
-    bpul = BYTES_PER_UNIQUE_LABEL.get(scale, 13)
-    output_gib = total_unique_labels * bpul / (1 << 30)
-    # Raw batch: one Z-plane of raw uint64 arrays held during write()
-    chunks_per_z_plane = max(1, int(chunk_count ** (2/3))) if chunk_count else 0
-    raw_batch_gib = chunks_per_z_plane * 2 * (1 << 20) / (1 << 30)
-    return raw_batch_gib + 2 * output_gib + DOWNRES_OVERHEAD_GIB
+    """Estimate memory for a downres shard using the label-aware model."""
+    return estimate_downres_components(
+        scale, chunk_count, total_unique_labels)["total_gib"]
 
 
 def _read_shard_labels(source_path: str, scale: int) -> dict:
@@ -469,21 +494,22 @@ def generate_downres_manifests(
             print(f"  No label files for s{target_scale},"
                   f" using chunk-count model for tier assignment")
 
-        shard_entries = []  # (scale, shard_number, estimated_mem, bbox_dict)
+        shard_entries = []  # (scale, shard_number, estimate_dict, bbox_dict)
         for sn in child_shards:
             bbox = shard_bbox(sn, child_params)
             shard_hex = f"{sn:0{hex_digits}x}" if shard_labels else ""
             if shard_hex in shard_labels:
-                mem = estimate_downres_memory_label_aware(
-                    shard_labels[shard_hex], target_scale, bbox["num_chunks"])
+                estimate = estimate_downres_components(
+                    target_scale, bbox["num_chunks"], shard_labels[shard_hex])
             else:
-                mem = estimate_downres_memory_gib(bbox["num_chunks"], target_scale)
-            shard_entries.append((target_scale, sn, mem, bbox))
+                estimate = estimate_downres_components(
+                    target_scale, bbox["num_chunks"])
+            shard_entries.append((target_scale, sn, estimate, bbox))
 
         # Step 4: Assign to tiers.
         tier_map = {}  # tier_gib -> list of (scale, shard_number, mem, bbox)
         for entry in shard_entries:
-            mem = entry[2]
+            mem = entry[2]["total_gib"]
             gib = pick_tier(mem)
             tier_map.setdefault(gib, []).append(entry)
 
@@ -575,7 +601,7 @@ def _distribute_downres_tasks(entries: list, num_tasks: int) -> dict:
     tasks = {str(i): [] for i in range(num_tasks)}
 
     # Process largest shards first for better balance
-    for scale, sn, mem, bbox in sorted(entries, key=lambda e: -e[3]["num_chunks"]):
+    for scale, sn, estimate, bbox in sorted(entries, key=lambda e: -e[3]["num_chunks"]):
         cum_chunks, task_idx = heapq.heappop(heap)
         tasks[str(task_idx)].append({
             "scale": scale,
@@ -583,6 +609,20 @@ def _distribute_downres_tasks(entries: list, num_tasks: int) -> dict:
             "shard_origin": bbox["shard_origin"],
             "shard_extent": bbox["shard_extent"],
             "num_chunks": bbox["num_chunks"],
+            "estimate_model": estimate["estimate_model"],
+            "estimated_memory_gib": round(estimate["total_gib"], 3),
+            "estimated_subtotal_gib": round(estimate["subtotal_gib"], 3),
+            "estimated_output_gib": round(estimate["output_gib"], 3),
+            "estimated_tmpfs_gib": round(estimate["tmpfs_gib"], 3),
+            "estimated_raw_batch_gib": round(estimate["raw_batch_gib"], 3),
+            "estimated_overhead_gib": round(estimate["overhead_gib"], 3),
+            "estimated_source_cache_gib": round(estimate["source_cache_gib"], 3),
+            "estimated_dest_cache_gib": round(estimate["dest_cache_gib"], 3),
+            "estimated_runtime_gib": round(estimate["runtime_gib"], 3),
+            "estimated_label_readback_gib": round(
+                estimate["label_readback_gib"], 3),
+            "estimated_safety_factor": estimate["safety_factor"],
+            "estimated_total_unique_labels": estimate["total_unique_labels"],
         })
         heapq.heappush(heap, (cum_chunks + bbox["num_chunks"], task_idx))
 

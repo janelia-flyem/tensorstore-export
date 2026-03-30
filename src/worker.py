@@ -684,10 +684,28 @@ class ShardProcessor:
         )
 
         try:
+            estimated_memory_gib = shard_bbox.get("estimated_memory_gib")
+            estimated_subtotal_gib = shard_bbox.get("estimated_subtotal_gib")
+            estimated_output_gib = shard_bbox.get("estimated_output_gib")
+            estimated_tmpfs_gib = shard_bbox.get("estimated_tmpfs_gib")
+            estimated_raw_batch_gib = shard_bbox.get("estimated_raw_batch_gib")
+            estimated_overhead_gib = shard_bbox.get("estimated_overhead_gib")
+            estimate_model = shard_bbox.get("estimate_model", "")
+            estimated_total_unique_labels = shard_bbox.get(
+                "estimated_total_unique_labels")
+
             logger.info("Downres shard start",
                         scale=scale, shard_number=shard_number,
                         origin=(x0, y0, z0), extent=(sx, sy, sz),
-                        num_chunks=shard_bbox["num_chunks"])
+                        num_chunks=shard_bbox["num_chunks"],
+                        estimate_model=estimate_model,
+                        estimated_memory_gib=estimated_memory_gib,
+                        estimated_subtotal_gib=estimated_subtotal_gib,
+                        estimated_output_gib=estimated_output_gib,
+                        estimated_tmpfs_gib=estimated_tmpfs_gib,
+                        estimated_raw_batch_gib=estimated_raw_batch_gib,
+                        estimated_overhead_gib=estimated_overhead_gib,
+                        estimated_total_unique_labels=estimated_total_unique_labels)
 
             # Reset cgroup peak for per-shard memory tracking
             peak_reset_ok = _reset_cgroup_peak()
@@ -804,7 +822,10 @@ class ShardProcessor:
                         memory_gib=round(_mem_gib(), 2),
                         write_peak_gib=round(write_peak_mem / (1 << 30), 2),
                         tmpfs_mib=round(tmpfs_bytes / (1 << 20), 1),
-                        batches=batches_committed)
+                        batches=batches_committed,
+                        estimated_memory_gib=estimated_memory_gib,
+                        estimated_output_gib=estimated_output_gib,
+                        estimated_raw_batch_gib=estimated_raw_batch_gib)
 
             # Read back chunks from tmpfs to count actual unique labels
             # and compute next-scale predictions.
@@ -886,7 +907,23 @@ class ShardProcessor:
                         upload_s=round(upload_elapsed, 1),
                         uploaded_gib=round(uploaded_bytes / (1 << 30), 3),
                         peak_memory_gib=round(peak_gib, 2),
-                        num_chunks=shard_bbox["num_chunks"])
+                        num_chunks=shard_bbox["num_chunks"],
+                        tmpfs_mib=round(tmpfs_bytes / (1 << 20), 1),
+                        batches=batches_committed,
+                        estimate_model=estimate_model,
+                        estimated_memory_gib=estimated_memory_gib,
+                        estimated_subtotal_gib=estimated_subtotal_gib,
+                        estimated_output_gib=estimated_output_gib,
+                        estimated_tmpfs_gib=estimated_tmpfs_gib,
+                        estimated_raw_batch_gib=estimated_raw_batch_gib,
+                        estimated_overhead_gib=estimated_overhead_gib,
+                        estimated_total_unique_labels=estimated_total_unique_labels,
+                        prediction_error_gib=(
+                            round(peak_gib - estimated_memory_gib, 2)
+                            if estimated_memory_gib is not None else None),
+                        prediction_ratio=(
+                            round(peak_gib / estimated_memory_gib, 3)
+                            if estimated_memory_gib else None))
 
             return True, uploaded_bytes
 
@@ -1089,6 +1126,15 @@ class CloudRunWorker:
                 "shard_origin": entry["shard_origin"],
                 "shard_extent": entry["shard_extent"],
                 "num_chunks": entry["num_chunks"],
+                "estimate_model": entry.get("estimate_model"),
+                "estimated_memory_gib": entry.get("estimated_memory_gib"),
+                "estimated_subtotal_gib": entry.get("estimated_subtotal_gib"),
+                "estimated_output_gib": entry.get("estimated_output_gib"),
+                "estimated_tmpfs_gib": entry.get("estimated_tmpfs_gib"),
+                "estimated_raw_batch_gib": entry.get("estimated_raw_batch_gib"),
+                "estimated_overhead_gib": entry.get("estimated_overhead_gib"),
+                "estimated_total_unique_labels": entry.get(
+                    "estimated_total_unique_labels"),
             }
 
             success, uploaded_bytes = self.processor.downres_shard(
