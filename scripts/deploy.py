@@ -46,7 +46,8 @@ SECTIONS = [
     (
         "Deployment",
         [
-            ("SCALES", "0,1", "scales to export (comma-separated)"),
+            ("SCALES", "0", "source scales with DVID Arrow shards (comma-separated)"),
+            ("DOWNRES_SCALES", "", "scales to generate by downsampling (e.g. 1,2,3,...,9)"),
             ("BASE_JOB_NAME", "tensorstore-dvid-export", "Cloud Run job name prefix"),
             ("MAX_RETRIES", "3", "max retries per failed worker"),
             ("TASK_TIMEOUT", "86400s", "timeout per worker (max 24h)"),
@@ -396,10 +397,15 @@ def main():
     for section_name, fields in SECTIONS:
         print(f"\n--- {section_name} ---")
 
-        # Default SCALES to all scales defined in the ng spec.
+        # Default SCALES/DOWNRES_SCALES from the ng spec.
         if section_name == "Deployment" and ng_spec:
-            all_scales = ",".join(str(i) for i in range(len(ng_spec["scales"])))
-            fields = [(k, all_scales if k == "SCALES" else d, desc)
+            num_scales = len(ng_spec["scales"])
+            downres_default = ",".join(str(i) for i in range(1, num_scales))
+            defaults_override = {
+                "SCALES": "0",
+                "DOWNRES_SCALES": downres_default,
+            }
+            fields = [(k, defaults_override.get(k, d), desc)
                       for k, d, desc in fields]
 
         for key, builtin_default, description in fields:

@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -471,10 +472,13 @@ def main():
             spec_path_resolved = Path(__file__).resolve().parent.parent / spec_path_resolved
 
         print(f"Generating downres manifests for scales {downres_scales}...")
+        t0 = time.monotonic()
         all_scale_results = generate_downres_manifests(
             str(spec_path_resolved), source_path, scales, downres_scales,
             max_tasks, dry_run=args.dry_run,
         )
+        elapsed = time.monotonic() - t0
+        print(f"\nManifest generation took {elapsed:.1f}s")
 
         if args.dry_run:
             print("\n(dry run — no manifests written, no jobs launched)")
@@ -532,10 +536,12 @@ def main():
                 # Re-generate manifests for the next scale using label data
                 print(f"Re-generating manifests for s{next_scale} "
                       f"with label-aware model...")
+                t0 = time.monotonic()
                 next_results = generate_downres_manifests(
                     str(spec_path_resolved), source_path, scales,
                     [next_scale], max_tasks, dry_run=False,
                 )
+                print(f"  Manifest re-generation took {time.monotonic() - t0:.1f}s")
                 if next_scale in next_results:
                     all_scale_results[next_scale] = next_results[next_scale]
 
@@ -553,6 +559,7 @@ def main():
         return
 
     # --- Step 1: Scan Arrow files ---
+    t0 = time.monotonic()
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
@@ -643,9 +650,11 @@ def main():
             if uploaded % 500 == 0 or uploaded == len(all_uploads):
                 print(f"  {uploaded}/{len(all_uploads)} manifests written")
 
+    elapsed = time.monotonic() - t0
     for gib in sorted(tier_info.keys()):
         tier_uri, num_tasks = tier_info[gib]
         print(f"  {gib}Gi: {num_tasks} tasks → {tier_uri}/")
+    print(f"\nManifest generation took {elapsed:.1f}s")
 
     # --- Step 4: Get Docker image ---
     image = _get_image(env)

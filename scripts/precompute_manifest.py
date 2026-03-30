@@ -271,6 +271,7 @@ def _read_shard_labels(source_path: str, scale: int) -> dict:
     """
     import csv as csv_mod
     import io
+    import time as _time
 
     prefix = f"{source_path}/s{scale}/"
     shard_labels = {}
@@ -282,6 +283,9 @@ def _read_shard_labels(source_path: str, scale: int) -> dict:
         client = gcs_storage.Client()
         bucket = client.bucket(bucket_name)
 
+        print(f"  Reading label files from {prefix} ...")
+        t0 = _time.monotonic()
+        read_count = 0
         for blob in bucket.list_blobs(prefix=blob_prefix):
             if not blob.name.endswith("-labels.csv"):
                 continue
@@ -291,6 +295,11 @@ def _read_shard_labels(source_path: str, scale: int) -> dict:
             for row in csv_mod.DictReader(io.StringIO(text)):
                 total += int(row["unique_labels"])
             shard_labels[shard_hex] = total
+            read_count += 1
+            if read_count % 500 == 0:
+                print(f"    {read_count} label files read ({_time.monotonic() - t0:.0f}s)")
+        if read_count > 0:
+            print(f"    {read_count} label files read ({_time.monotonic() - t0:.1f}s)")
     else:
         from pathlib import Path as P
         p = P(prefix)
@@ -394,9 +403,11 @@ def generate_downres_manifests(
         shard_labels = _read_shard_labels(source_path, target_scale)
         if shard_labels:
             hex_digits = -(-child_params["shard_bits"] // 4)
-            print(f"  Using label-aware model ({len(shard_labels)} shard label files)")
+            print(f"  Using label-aware model ({len(shard_labels)} shard label files"
+                  f" for tier assignment)")
         else:
-            print(f"  No label files for s{target_scale}, using chunk-count model")
+            print(f"  No label files for s{target_scale},"
+                  f" using chunk-count model for tier assignment")
 
         shard_entries = []  # (scale, shard_number, estimated_mem, bbox_dict)
         for sn in child_shards:
@@ -418,6 +429,7 @@ def generate_downres_manifests(
 
         print("  Tier assignments:")
         tier_info = {}
+        stale_deleted = False
         for gib in sorted(tier_map.keys()):
             entries = tier_map[gib]
             tier_max = max_tasks.get(gib, 1000)
@@ -430,11 +442,23 @@ def generate_downres_manifests(
             if dry_run:
                 continue
 
+            # Delete stale manifests for this scale (once per scale)
+            if not stale_deleted:
+                scale_uri = f"{source_path}/manifests-downres/s{target_scale}/"
+                result = subprocess.run(
+                    ["gsutil", "-m", "-q", "rm", "-r", scale_uri],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    print(f"    Deleted stale manifests under {scale_uri}")
+                stale_deleted = True
+
             # Distribute shards across tasks using greedy load balancing
             # (balance by num_chunks as a proxy for work)
             tasks_data = _distribute_downres_tasks(entries, num_tasks)
 
             # Write per-task manifests to GCS
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             from google.cloud import storage as gcs_storage
             bucket_name, source_prefix = source_path.replace("gs://", "").split("/", 1)
             client = gcs_storage.Client()
@@ -443,12 +467,25 @@ def generate_downres_manifests(
             tier_prefix = f"{source_prefix}/manifests-downres/s{target_scale}/tier-{gib}gi"
             tier_uri = f"{source_path}/manifests-downres/s{target_scale}/tier-{gib}gi"
 
-            for task_idx, shard_list in tasks_data.items():
+            def _upload_manifest(item):
+                task_idx, shard_list = item
                 blob = bucket.blob(f"{tier_prefix}/task-{task_idx}.json")
                 blob.upload_from_string(
                     json.dumps(shard_list, separators=(",", ":")),
                     content_type="application/json",
                 )
+
+            uploaded = 0
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                futures = {
+                    pool.submit(_upload_manifest, item): item
+                    for item in tasks_data.items()
+                }
+                for future in as_completed(futures):
+                    future.result()
+                    uploaded += 1
+                    if uploaded % 500 == 0 or uploaded == len(tasks_data):
+                        print(f"    Writing manifests: {uploaded}/{len(tasks_data)}")
 
             print(f"    Written {len(tasks_data)} task manifests: {tier_uri}/")
             tier_info[gib] = (tier_uri, len(tasks_data))
