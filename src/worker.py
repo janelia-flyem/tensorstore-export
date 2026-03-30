@@ -726,28 +726,65 @@ class ShardProcessor:
             with open(os.path.join(staging_dir, "info"), "w") as f:
                 f.write(self._info_json)
 
-            # Open local staging volume (write-only — no read cache needed)
+            # Open local staging volume.  Small cache helps RMW performance:
+            # each batch commit re-reads the shard file to merge new chunks,
+            # and the cache avoids redundant decode of the growing shard.
             local_dest = ts.open({
                 "driver": "neuroglancer_precomputed",
                 "kvstore": {"driver": "file", "path": staging_dir},
                 "scale_index": scale,
                 "open": True,
                 "context": {
-                    "cache_pool": {"total_bytes_limit": 0},
+                    "cache_pool": {"total_bytes_limit": 256 * (1 << 20)},
                 },
             }).result()
 
-            # Copy the downsampled region into local staging
+            # Write in batched transactions.  TensorStore buffers all chunks
+            # in compressed_segmentation+gzip form (~200 KB each) until commit.
+            # A full shard of 32K chunks × ~200 KB = ~6.4 GiB — exceeds the
+            # container limit.  Batching by Z-planes (4 planes × 32×32 = 4096
+            # chunks per batch, ~800 MiB compressed) keeps memory bounded.
+            # After each commit, the buffer is freed and chunks are flushed to
+            # the shard file on tmpfs via read-modify-write.
+            chunk_z = 64  # chunk size in Z voxels
+            batch_z_planes = 4  # Z-planes per batch
+            batch_z_voxels = chunk_z * batch_z_planes
+            num_batches = max(1, (sz + batch_z_voxels - 1) // batch_z_voxels)
+            batches_committed = 0
+
             logger.info("Downres memory: before write",
                         scale=scale, shard_number=shard_number,
-                        memory_gib=round(_mem_gib(), 2))
+                        memory_gib=round(_mem_gib(), 2),
+                        num_batches=num_batches)
 
-            local_dest[x0:x0+sx, y0:y0+sy, z0:z0+sz, :].write(
-                downsampled[x0:x0+sx, y0:y0+sy, z0:z0+sz, :],
-            ).result()
-
-            mem_current, _, _ = _read_cgroup_memory()
-            shard_peak_mem = max(shard_peak_mem, mem_current)
+            write_peak_mem = 0
+            for z_off in range(z0, z0 + sz, batch_z_voxels):
+                z_end = min(z_off + batch_z_voxels, z0 + sz)
+                txn = ts.Transaction()
+                local_dest.with_transaction(txn)[
+                    x0:x0+sx, y0:y0+sy, z_off:z_end, :
+                ].write(
+                    downsampled[x0:x0+sx, y0:y0+sy, z_off:z_end, :]
+                ).result()
+                txn.commit_async().result()
+                batches_committed += 1
+                mem_current, _, _ = _read_cgroup_memory()
+                shard_peak_mem = max(shard_peak_mem, mem_current)
+                write_peak_mem = max(write_peak_mem, mem_current)
+                # Log every batch so memory data survives OOM.
+                # Includes tmpfs size to track shard growth vs RSS.
+                batch_tmpfs = 0
+                for f_entry in os.scandir(staging_dir):
+                    if f_entry.is_file():
+                        batch_tmpfs += f_entry.stat().st_size
+                logger.info("Downres write batch",
+                            scale=scale, shard_number=shard_number,
+                            batch=f"{batches_committed}/{num_batches}",
+                            z_range=f"{z_off}-{z_end}",
+                            memory_gib=round(mem_current / (1 << 30), 2),
+                            memory_limit_gib=round(mem_limit_gib, 2),
+                            tmpfs_mib=round(batch_tmpfs / (1 << 20), 1),
+                            num_chunks=shard_bbox["num_chunks"])
 
             # Get tmpfs usage for the staging dir
             tmpfs_bytes = 0
@@ -758,7 +795,9 @@ class ShardProcessor:
             logger.info("Downres memory: after write",
                         scale=scale, shard_number=shard_number,
                         memory_gib=round(_mem_gib(), 2),
-                        tmpfs_mib=round(tmpfs_bytes / (1 << 20), 1))
+                        write_peak_gib=round(write_peak_mem / (1 << 30), 2),
+                        tmpfs_mib=round(tmpfs_bytes / (1 << 20), 1),
+                        batches=batches_committed)
 
             # Read back chunks from tmpfs to count actual unique labels
             # and compute next-scale predictions.

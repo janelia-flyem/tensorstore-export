@@ -122,11 +122,13 @@ BYTES_PER_CHUNK = {
 SHARD_PROC_OVERHEAD_GIB = 2.0
 
 # Fixed overhead for downres: Python + TensorStore + GCS client + source
-# read cache (bounded by cache_pool at 256 MB) + label readback buffers
-# (numpy arrays + Python sets for unique labels across all chunks).
-# Initial estimate of 1.5 caused universal OOM at 4Gi — every shard
-# failed.  Set to 3.5 pending calibration from successful runs.
-DOWNRES_OVERHEAD_GIB = 3.5
+# read cache (256 MB) + local staging cache (256 MB).
+# Measured baseline from Cloud Run logs: 0.17 GiB at shard start.
+# The main memory consumers are the per-batch transaction buffer
+# (compressed chunks, ~800 MiB per batch of 4 Z-planes) and the
+# growing shard file on tmpfs.  Set to 1.0 GiB to cover runtime +
+# caches + label readback headroom.
+DOWNRES_OVERHEAD_GIB = 1.0
 
 # Bytes per unique label in the output shard file, by scale.
 # Derived from linear regression of (total_unique_labels, ng_output_bytes)
@@ -230,15 +232,19 @@ def distribute_tasks(shards: list, max_tasks: int) -> dict:
 def estimate_downres_memory_gib(chunk_count: int, scale: int) -> float:
     """Estimate memory for a downres shard.
 
-    Memory = output .shard on tmpfs + fixed overhead.
+    Memory = shard on tmpfs (×2 for RMW) + batch buffer + overhead.
 
-    No RMW factor: downres writes to a fresh staging dir (no pre-existing
-    shard), so there's only one copy on tmpfs.  No Arrow/pyarrow/BRAID
-    overhead — the source is read from GCS via byte-range requests with a
-    bounded cache.
+    Writes are batched by Z-planes with explicit transaction commits.
+    During each commit, three things coexist in memory:
+      - Old shard file on tmpfs (read for merge)
+      - New shard file on tmpfs (written atomically)
+      - Transaction buffer (compressed chunks for the batch)
+    The buffer is freed after commit completes, but overlaps with the
+    RMW peak.  The batch buffer is ~1/8 of the final shard size (4 of
+    32 Z-planes), so we approximate as 2.25× tmpfs.
     """
     tmpfs_gib = estimate_tmpfs_gib(chunk_count, scale)
-    return tmpfs_gib + DOWNRES_OVERHEAD_GIB
+    return 2.25 * tmpfs_gib + DOWNRES_OVERHEAD_GIB
 
 
 def estimate_downres_memory_label_aware(total_unique_labels: int,
@@ -257,7 +263,8 @@ def estimate_downres_memory_label_aware(total_unique_labels: int,
     """
     bpul = BYTES_PER_UNIQUE_LABEL.get(scale, 13)
     output_gib = total_unique_labels * bpul / (1 << 30)
-    return output_gib + DOWNRES_OVERHEAD_GIB
+    # Same RMW + batch buffer factor as chunk-count model
+    return 2.25 * output_gib + DOWNRES_OVERHEAD_GIB
 
 
 def _read_shard_labels(source_path: str, scale: int) -> dict:
@@ -464,12 +471,10 @@ def generate_downres_manifests(
             shard_entries.append((target_scale, sn, mem, bbox))
 
         # Step 4: Assign to tiers.
-        # min_tier=8: downres at 4Gi universally OOMed due to label readback
-        # + TensorStore buffers exceeding the 4Gi cgroup limit.
         tier_map = {}  # tier_gib -> list of (scale, shard_number, mem, bbox)
         for entry in shard_entries:
             mem = entry[2]
-            gib = pick_tier(mem, min_tier=8)
+            gib = pick_tier(mem)
             tier_map.setdefault(gib, []).append(entry)
 
         print("  Tier assignments:")
