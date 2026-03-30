@@ -13,8 +13,6 @@ Usage:
 
 import argparse
 import csv
-import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -99,6 +97,7 @@ def main():
         "estimated_tmpfs_gib",
         "estimated_raw_batch_gib",
         "estimated_overhead_gib",
+        "estimated_commit_spike_gib",
         "tmpfs_mib",
         "peak_memory_gib",
         "prediction_error_gib",

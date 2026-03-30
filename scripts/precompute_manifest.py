@@ -128,6 +128,7 @@ SHARD_PROC_OVERHEAD_GIB = 2.0
 #   - raw uint64 output arrays held in the explicit transaction
 #   - 2x output shard bytes during local read-modify-write commit
 #   - fixed process/caches/readback headroom
+#   - transient write/commit spike during TensorStore encode + RMW
 # A safety factor is applied to cover additional source-side working set and
 # encode/merge scratch space that are not cleanly observable from static shard
 # metadata alone.
@@ -135,6 +136,7 @@ DOWNRES_SOURCE_CACHE_GIB = 0.25
 DOWNRES_DEST_CACHE_GIB = 0.25
 DOWNRES_RUNTIME_GIB = 0.5
 DOWNRES_LABEL_READBACK_GIB = 0.5
+DOWNRES_COMMIT_SPIKE_GIB = 0.5
 DOWNRES_OVERHEAD_GIB = (
     DOWNRES_SOURCE_CACHE_GIB +
     DOWNRES_DEST_CACHE_GIB +
@@ -267,7 +269,8 @@ def estimate_downres_components(scale: int, chunk_count: int,
     subtotal_gib = (
         raw_batch_gib +
         2 * output_gib +
-        DOWNRES_OVERHEAD_GIB
+        DOWNRES_OVERHEAD_GIB +
+        DOWNRES_COMMIT_SPIKE_GIB
     )
     total_gib = subtotal_gib * DOWNRES_SAFETY_FACTOR
     return {
@@ -282,6 +285,7 @@ def estimate_downres_components(scale: int, chunk_count: int,
         "dest_cache_gib": DOWNRES_DEST_CACHE_GIB,
         "runtime_gib": DOWNRES_RUNTIME_GIB,
         "label_readback_gib": DOWNRES_LABEL_READBACK_GIB,
+        "commit_spike_gib": DOWNRES_COMMIT_SPIKE_GIB,
         "overhead_gib": DOWNRES_OVERHEAD_GIB,
         "subtotal_gib": subtotal_gib,
         "safety_factor": DOWNRES_SAFETY_FACTOR,
@@ -437,7 +441,7 @@ def generate_downres_manifests(
 
     # Step 1: Build the initial shard set from DVID Arrow source files.
     # Scan the source bucket for .arrow files at the base scales.
-    print(f"\nScanning s0 source shards for derivation chain...")
+    print("\nScanning s0 source shards for derivation chain...")
     s0_shard_numbers = set()
     for scale in scales:
         params = spec[scale]
@@ -621,6 +625,8 @@ def _distribute_downres_tasks(entries: list, num_tasks: int) -> dict:
             "estimated_runtime_gib": round(estimate["runtime_gib"], 3),
             "estimated_label_readback_gib": round(
                 estimate["label_readback_gib"], 3),
+            "estimated_commit_spike_gib": round(
+                estimate["commit_spike_gib"], 3),
             "estimated_safety_factor": estimate["safety_factor"],
             "estimated_total_unique_labels": estimate["total_unique_labels"],
         })
@@ -703,7 +709,7 @@ def main():
         if args.dry_run:
             print("\n(dry run — no manifests written)")
         else:
-            print(f"\nDownres manifest summary:")
+            print("\nDownres manifest summary:")
             for target_scale in sorted(results.keys()):
                 tier_info = results[target_scale]
                 for gib in sorted(tier_info.keys()):
@@ -715,7 +721,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB")
+    print("  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")
@@ -741,7 +747,7 @@ def main():
     print(f"  Total chunks across all shards: {total_chunks_all:,}")
 
     # Print summary and write per-task manifests
-    print(f"\nTier assignments:")
+    print("\nTier assignments:")
     manifest_prefixes = {}
     tier_summary = {}  # for summary.json
     storage_client = None

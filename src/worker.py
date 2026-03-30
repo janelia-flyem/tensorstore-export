@@ -690,6 +690,8 @@ class ShardProcessor:
             estimated_tmpfs_gib = shard_bbox.get("estimated_tmpfs_gib")
             estimated_raw_batch_gib = shard_bbox.get("estimated_raw_batch_gib")
             estimated_overhead_gib = shard_bbox.get("estimated_overhead_gib")
+            estimated_commit_spike_gib = shard_bbox.get(
+                "estimated_commit_spike_gib")
             estimate_model = shard_bbox.get("estimate_model", "")
             estimated_total_unique_labels = shard_bbox.get(
                 "estimated_total_unique_labels")
@@ -705,6 +707,7 @@ class ShardProcessor:
                         estimated_tmpfs_gib=estimated_tmpfs_gib,
                         estimated_raw_batch_gib=estimated_raw_batch_gib,
                         estimated_overhead_gib=estimated_overhead_gib,
+                        estimated_commit_spike_gib=estimated_commit_spike_gib,
                         estimated_total_unique_labels=estimated_total_unique_labels)
 
             # Reset cgroup peak for per-shard memory tracking
@@ -825,7 +828,8 @@ class ShardProcessor:
                         batches=batches_committed,
                         estimated_memory_gib=estimated_memory_gib,
                         estimated_output_gib=estimated_output_gib,
-                        estimated_raw_batch_gib=estimated_raw_batch_gib)
+                        estimated_raw_batch_gib=estimated_raw_batch_gib,
+                        estimated_commit_spike_gib=estimated_commit_spike_gib)
 
             # Read back chunks from tmpfs to count actual unique labels
             # and compute next-scale predictions.
@@ -917,6 +921,7 @@ class ShardProcessor:
                         estimated_tmpfs_gib=estimated_tmpfs_gib,
                         estimated_raw_batch_gib=estimated_raw_batch_gib,
                         estimated_overhead_gib=estimated_overhead_gib,
+                        estimated_commit_spike_gib=estimated_commit_spike_gib,
                         estimated_total_unique_labels=estimated_total_unique_labels,
                         prediction_error_gib=(
                             round(peak_gib - estimated_memory_gib, 2)
