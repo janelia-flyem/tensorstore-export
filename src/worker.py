@@ -691,8 +691,18 @@ class ShardProcessor:
 
             # Reset cgroup peak for per-shard memory tracking
             peak_reset_ok = _reset_cgroup_peak()
-            mem_at_start, _, _ = _read_cgroup_memory()
+            mem_at_start, mem_limit, _ = _read_cgroup_memory()
             shard_peak_mem = mem_at_start
+            mem_limit_gib = mem_limit / (1 << 30) if mem_limit else 0
+
+            def _mem_gib():
+                m, _, _ = _read_cgroup_memory()
+                return m / (1 << 30) if m else 0
+
+            logger.info("Downres memory: baseline",
+                        scale=scale, shard_number=shard_number,
+                        memory_gib=round(_mem_gib(), 2),
+                        memory_limit_gib=round(mem_limit_gib, 2))
 
             # Open source scale (N-1) from GCS with bounded cache
             source_spec = {
@@ -706,6 +716,10 @@ class ShardProcessor:
             }
             source = ts.open(source_spec).result()
             downsampled = ts.downsample(source, [2, 2, 2, 1], "mode")
+
+            logger.info("Downres memory: after open source",
+                        scale=scale, shard_number=shard_number,
+                        memory_gib=round(_mem_gib(), 2))
 
             # Create staging dir and write info file
             os.makedirs(staging_dir, exist_ok=True)
@@ -721,10 +735,9 @@ class ShardProcessor:
             }).result()
 
             # Copy the downsampled region into local staging
-            logger.info("Downres shard copy start",
+            logger.info("Downres memory: before write",
                         scale=scale, shard_number=shard_number,
-                        source_domain=str(source.domain),
-                        dest_domain=str(local_dest.domain))
+                        memory_gib=round(_mem_gib(), 2))
 
             local_dest[x0:x0+sx, y0:y0+sy, z0:z0+sz, :].write(
                 downsampled[x0:x0+sx, y0:y0+sy, z0:z0+sz, :],
@@ -732,6 +745,17 @@ class ShardProcessor:
 
             mem_current, _, _ = _read_cgroup_memory()
             shard_peak_mem = max(shard_peak_mem, mem_current)
+
+            # Get tmpfs usage for the staging dir
+            tmpfs_bytes = 0
+            for f_entry in os.scandir(staging_dir):
+                if f_entry.is_file():
+                    tmpfs_bytes += f_entry.stat().st_size
+
+            logger.info("Downres memory: after write",
+                        scale=scale, shard_number=shard_number,
+                        memory_gib=round(_mem_gib(), 2),
+                        tmpfs_mib=round(tmpfs_bytes / (1 << 20), 1))
 
             # Read back chunks from tmpfs to count actual unique labels
             # and compute next-scale predictions.
@@ -753,6 +777,7 @@ class ShardProcessor:
                         "open": True,
                     }).result()
 
+                    total_labels_stored = 0
                     for cx, cy, cz in chunk_coords:
                         vx0 = cx * chunk_size[0]
                         vy0 = cy * chunk_size[1]
@@ -768,13 +793,16 @@ class ShardProcessor:
                             # Skip all-zero chunks (background only)
                             if labels != {0}:
                                 actual_labels[(cx, cy, cz)] = labels
+                                total_labels_stored += len(labels)
                         except Exception:
                             pass  # skip chunks that fail to read
 
                     label_readback_elapsed = time.time() - label_readback_start
-                    logger.info("Label readback complete",
+                    logger.info("Downres memory: after label readback",
                                 scale=scale, shard_number=shard_number,
+                                memory_gib=round(_mem_gib(), 2),
                                 chunks_read=len(actual_labels),
+                                total_labels_stored=total_labels_stored,
                                 elapsed_s=round(label_readback_elapsed, 2))
 
             # Upload shard file(s) to GCS
@@ -791,6 +819,9 @@ class ShardProcessor:
                     logger.warning("Failed to upload label CSVs",
                                    scale=scale, shard_number=shard_number,
                                    error=str(e)[:200])
+
+            # Free label data before final memory measurement
+            del actual_labels
 
             elapsed = time.time() - shard_start
 

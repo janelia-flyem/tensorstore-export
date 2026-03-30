@@ -122,9 +122,11 @@ BYTES_PER_CHUNK = {
 SHARD_PROC_OVERHEAD_GIB = 2.0
 
 # Fixed overhead for downres: Python + TensorStore + GCS client + source
-# read cache (bounded by cache_pool at 256 MB).  Lighter than shard
-# processing — no pyarrow/BRAID/Arrow overhead.
-DOWNRES_OVERHEAD_GIB = 1.5
+# read cache (bounded by cache_pool at 256 MB) + label readback buffers
+# (numpy arrays + Python sets for unique labels across all chunks).
+# Initial estimate of 1.5 caused universal OOM at 4Gi — every shard
+# failed.  Set to 3.5 pending calibration from successful runs.
+DOWNRES_OVERHEAD_GIB = 3.5
 
 # Bytes per unique label in the output shard file, by scale.
 # Derived from linear regression of (total_unique_labels, ng_output_bytes)
@@ -259,47 +261,88 @@ def estimate_downres_memory_label_aware(total_unique_labels: int,
 
 
 def _read_shard_labels(source_path: str, scale: int) -> dict:
-    """Read all -labels.csv files for a scale and return per-shard label totals.
+    """Read per-shard label totals for a scale.
 
-    Args:
-        source_path: GCS or local path to the export root.
-        scale: Scale index to read labels for.
+    Tries labels-summary.json first (single file, written by
+    aggregate_predicted_labels.py). Falls back to reading individual
+    -labels.csv files if no summary exists.
 
     Returns:
         Dict mapping shard_hex (str) -> total_unique_labels (int).
-        Empty dict if no label files found.
+        Empty dict if no label data found.
     """
+    prefix = f"{source_path}/s{scale}/"
+    summary_path = f"{prefix}labels-summary.json"
+
+    # --- Try summary JSON first (fast path) ---
+    if prefix.startswith("gs://"):
+        result = subprocess.run(
+            ["gsutil", "-q", "cat", summary_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            shard_labels = json.loads(result.stdout)
+            # Convert values to int (JSON may decode as int already)
+            shard_labels = {k: int(v) for k, v in shard_labels.items()}
+            print(f"  Read label summary: {summary_path}"
+                  f" ({len(shard_labels)} shards)")
+            return shard_labels
+    else:
+        from pathlib import Path as P
+        local_summary = P(summary_path)
+        if local_summary.exists():
+            shard_labels = json.loads(local_summary.read_text())
+            shard_labels = {k: int(v) for k, v in shard_labels.items()}
+            print(f"  Read label summary: {summary_path}"
+                  f" ({len(shard_labels)} shards)")
+            return shard_labels
+
+    # --- Fallback: read individual CSV files ---
     import csv as csv_mod
     import io
     import time as _time
 
-    prefix = f"{source_path}/s{scale}/"
     shard_labels = {}
 
     if prefix.startswith("gs://"):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from google.cloud import storage as gcs_storage
         rest = prefix[len("gs://"):]
         bucket_name, _, blob_prefix = rest.partition("/")
         client = gcs_storage.Client()
         bucket = client.bucket(bucket_name)
 
-        print(f"  Reading label files from {prefix} ...")
-        t0 = _time.monotonic()
-        read_count = 0
+        label_blobs = []
         for blob in bucket.list_blobs(prefix=blob_prefix):
-            if not blob.name.endswith("-labels.csv"):
-                continue
-            shard_hex = blob.name.split("/")[-1].replace("-labels.csv", "")
-            text = blob.download_as_text()
+            if blob.name.endswith("-labels.csv"):
+                label_blobs.append(blob.name)
+
+        if not label_blobs:
+            return shard_labels
+
+        print(f"  Reading {len(label_blobs)} label files from {prefix} ...")
+        t0 = _time.monotonic()
+
+        def _read_one(blob_name):
+            text = bucket.blob(blob_name).download_as_text()
+            shard_hex = blob_name.split("/")[-1].replace("-labels.csv", "")
             total = 0
             for row in csv_mod.DictReader(io.StringIO(text)):
                 total += int(row["unique_labels"])
-            shard_labels[shard_hex] = total
-            read_count += 1
-            if read_count % 500 == 0:
-                print(f"    {read_count} label files read ({_time.monotonic() - t0:.0f}s)")
-        if read_count > 0:
-            print(f"    {read_count} label files read ({_time.monotonic() - t0:.1f}s)")
+            return shard_hex, total
+
+        read_count = 0
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            futures = {pool.submit(_read_one, name): name
+                       for name in label_blobs}
+            for future in as_completed(futures):
+                shard_hex, total = future.result()
+                shard_labels[shard_hex] = total
+                read_count += 1
+                if read_count % 500 == 0:
+                    print(f"    {read_count}/{len(label_blobs)} label files"
+                          f" ({_time.monotonic() - t0:.0f}s)")
+        print(f"    {read_count} label files read ({_time.monotonic() - t0:.1f}s)")
     else:
         from pathlib import Path as P
         p = P(prefix)
@@ -421,10 +464,12 @@ def generate_downres_manifests(
             shard_entries.append((target_scale, sn, mem, bbox))
 
         # Step 4: Assign to tiers.
+        # min_tier=8: downres at 4Gi universally OOMed due to label readback
+        # + TensorStore buffers exceeding the 4Gi cgroup limit.
         tier_map = {}  # tier_gib -> list of (scale, shard_number, mem, bbox)
         for entry in shard_entries:
             mem = entry[2]
-            gib = pick_tier(mem)
+            gib = pick_tier(mem, min_tier=8)
             tier_map.setdefault(gib, []).append(entry)
 
         print("  Tier assignments:")

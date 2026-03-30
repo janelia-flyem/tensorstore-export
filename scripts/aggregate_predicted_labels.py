@@ -21,6 +21,7 @@ Usage:
 import argparse
 import csv
 import io
+import json
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -177,6 +178,16 @@ def aggregate_labels(source_path: str, target_scale: int,
                 print(f"  Writing label CSVs: {written}/{total_to_write}")
 
     print(f"  Written {written} label files to {source_path}/s{target_scale}/")
+
+    # Write a summary JSON so downstream tools can read one file instead of thousands
+    summary = {
+        f"{sn:0{hex_digits}x}": sum(ul for _, _, _, ul in chunks)
+        for sn, chunks in shard_chunks.items()
+    }
+    summary_path = f"{source_path}/s{target_scale}/labels-summary.json"
+    _write_string(summary_path, json.dumps(summary, separators=(",", ":")))
+    print(f"  Written label summary: {summary_path}")
+
     return written
 
 
