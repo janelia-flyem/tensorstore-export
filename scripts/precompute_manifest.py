@@ -232,39 +232,51 @@ def distribute_tasks(shards: list, max_tasks: int) -> dict:
 def estimate_downres_memory_gib(chunk_count: int, scale: int) -> float:
     """Estimate memory for a downres shard.
 
-    Memory = shard on tmpfs (×2 for RMW) + batch buffer + overhead.
+    Memory = shard on tmpfs (×2 for RMW) + raw batch arrays + overhead.
 
     Writes are batched by Z-planes with explicit transaction commits.
-    During each commit, three things coexist in memory:
-      - Old shard file on tmpfs (read for merge)
-      - New shard file on tmpfs (written atomically)
-      - Transaction buffer (compressed chunks for the batch)
-    The buffer is freed after commit completes, but overlaps with the
-    RMW peak.  The batch buffer is ~1/8 of the final shard size (4 of
-    32 Z-planes), so we approximate as 2.25× tmpfs.
+    Between write() and commit(), TensorStore holds raw uint64 arrays
+    (2 MiB per 64^3 chunk) — cache_pool eviction does NOT apply to
+    explicit transactions.  One Z-plane = up to 1024 chunks = 2 GiB.
+
+    Peak during commit: old shard on tmpfs + new shard on tmpfs + raw
+    arrays being encoded.  The raw arrays dominate for early batches
+    (small shard on tmpfs); the shard RMW dominates for later batches.
     """
     tmpfs_gib = estimate_tmpfs_gib(chunk_count, scale)
-    return 2.25 * tmpfs_gib + DOWNRES_OVERHEAD_GIB
+    # Raw batch arrays: one Z-plane of chunks × 2 MiB each.
+    # For a shard with N chunks across Z planes, each plane has
+    # N / num_z_planes chunks.  Shard side in chunks ≈ N^(1/3).
+    # One Z-plane = N^(2/3) chunks × 2 MiB.
+    chunks_per_z_plane = max(1, int(chunk_count ** (2/3)))
+    raw_batch_gib = chunks_per_z_plane * 2 * (1 << 20) / (1 << 30)
+    return max(2 * tmpfs_gib, raw_batch_gib) + DOWNRES_OVERHEAD_GIB
 
 
 def estimate_downres_memory_label_aware(total_unique_labels: int,
-                                       scale: int) -> float:
+                                       scale: int,
+                                       chunk_count: int = 0) -> float:
     """Estimate memory for a downres shard using the label-aware model.
 
     Uses the linear relationship between total unique labels and output
-    shard size (R² > 0.95).  Much tighter than the chunk-count model.
+    shard size (R² > 0.95).  Much tighter than the chunk-count model
+    for the tmpfs/RMW term, but the raw batch term still depends on
+    chunk geometry.
 
     Args:
         total_unique_labels: Sum of unique_labels across all chunks in shard.
         scale: Target scale index.
+        chunk_count: Total chunks in shard (for raw batch estimate).
 
     Returns:
         Estimated memory in GiB.
     """
     bpul = BYTES_PER_UNIQUE_LABEL.get(scale, 13)
     output_gib = total_unique_labels * bpul / (1 << 30)
-    # Same RMW + batch buffer factor as chunk-count model
-    return 2.25 * output_gib + DOWNRES_OVERHEAD_GIB
+    # Raw batch: one Z-plane of raw uint64 arrays held during write()
+    chunks_per_z_plane = max(1, int(chunk_count ** (2/3))) if chunk_count else 0
+    raw_batch_gib = chunks_per_z_plane * 2 * (1 << 20) / (1 << 30)
+    return max(2 * output_gib, raw_batch_gib) + DOWNRES_OVERHEAD_GIB
 
 
 def _read_shard_labels(source_path: str, scale: int) -> dict:
@@ -465,7 +477,7 @@ def generate_downres_manifests(
             shard_hex = f"{sn:0{hex_digits}x}" if shard_labels else ""
             if shard_hex in shard_labels:
                 mem = estimate_downres_memory_label_aware(
-                    shard_labels[shard_hex], target_scale)
+                    shard_labels[shard_hex], target_scale, bbox["num_chunks"])
             else:
                 mem = estimate_downres_memory_gib(bbox["num_chunks"], target_scale)
             shard_entries.append((target_scale, sn, mem, bbox))

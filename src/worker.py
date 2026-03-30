@@ -739,16 +739,15 @@ class ShardProcessor:
                 },
             }).result()
 
-            # Write in batched transactions.  TensorStore buffers all chunks
-            # in compressed_segmentation+gzip form (~200 KB each) until commit.
-            # A full shard of 32K chunks × ~200 KB = ~6.4 GiB — exceeds the
-            # container limit.  Batching by Z-planes (4 planes × 32×32 = 4096
-            # chunks per batch, ~800 MiB compressed) keeps memory bounded.
-            # After each commit, the buffer is freed and chunks are flushed to
-            # the shard file on tmpfs via read-modify-write.
+            # Write in batched transactions.  Between write() and commit(),
+            # TensorStore holds raw uint64 arrays (2 MiB per 64^3 chunk) in
+            # ChunkCache — cache_pool eviction does NOT apply to explicit
+            # transactions.  One Z-plane = 32×32 = 1024 chunks × 2 MiB =
+            # 2 GiB raw arrays.  After commit, arrays are encoded
+            # (compressed_segmentation + gzip) and flushed to the shard file
+            # on tmpfs via read-modify-write.
             chunk_z = 64  # chunk size in Z voxels
-            batch_z_planes = 4  # Z-planes per batch
-            batch_z_voxels = chunk_z * batch_z_planes
+            batch_z_voxels = chunk_z  # one Z-plane per batch
             num_batches = max(1, (sz + batch_z_voxels - 1) // batch_z_voxels)
             batches_committed = 0
 
