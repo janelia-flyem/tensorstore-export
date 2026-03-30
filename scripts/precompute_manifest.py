@@ -404,9 +404,35 @@ def _read_shard_labels(source_path: str, scale: int) -> dict:
     return shard_labels
 
 
+def _list_existing_ng_shards(dest_path: str, scale_key: str) -> list[int]:
+    """List existing NG shard numbers for a scale from the destination path."""
+    prefix = f"{dest_path}/{scale_key}/"
+    shard_numbers = set()
+
+    result = subprocess.run(
+        ["gsutil", "ls", prefix],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.endswith(".shard"):
+            continue
+        name = line.split("/")[-1].replace(".shard", "")
+        try:
+            shard_numbers.add(int(name, 16))
+        except ValueError:
+            continue
+
+    return sorted(shard_numbers)
+
+
 def generate_downres_manifests(
     ng_spec_path: str,
     source_path: str,
+    dest_path: str,
     scales: list,
     downres_scales: list,
     max_tasks: dict,
@@ -421,7 +447,7 @@ def generate_downres_manifests(
     Args:
         ng_spec_path: Path to NG spec JSON file.
         source_path: GCS URI to DVID Arrow shard export root.
-        scales: List of s0 source scales (for deriving the initial shard set).
+        scales: List of DVID source scales available under SOURCE_PATH.
         downres_scales: List of target scales to generate (e.g., [1, 2, 3]).
         max_tasks: Dict mapping tier_gib -> max tasks.
         dry_run: If True, don't write to GCS.
@@ -464,16 +490,26 @@ def generate_downres_manifests(
 
     # Step 2: Build the derivation chain.
     # For each downres scale, derive child shards from parent shards.
-    # parent_shard_numbers[scale] = set of shard numbers that exist at that scale
-    shard_numbers_by_scale = {scales[0]: sorted(s0_shard_numbers)}
+    # shard_numbers_by_scale[scale] = sorted shard numbers known to exist.
+    shard_numbers_by_scale = {}
+    if scales:
+        shard_numbers_by_scale[scales[0]] = sorted(s0_shard_numbers)
 
     all_scale_results = {}  # scale -> {tier_gib -> (uri, num_tasks)}
 
     for target_scale in downres_scales:
         parent_scale = target_scale - 1
         if parent_scale not in shard_numbers_by_scale:
-            print(f"  Warning: no parent shards for scale {target_scale}, skipping")
-            continue
+            parent_params = spec[parent_scale]
+            existing_parent_shards = _list_existing_ng_shards(
+                dest_path, parent_params["key"])
+            if existing_parent_shards:
+                shard_numbers_by_scale[parent_scale] = existing_parent_shards
+                print(f"  Seeded s{parent_scale} from destination: "
+                      f"{len(existing_parent_shards)} existing NG shards")
+            else:
+                print(f"  Warning: no parent shards for scale {target_scale}, skipping")
+                continue
 
         parent_params = spec[parent_scale]
         child_params = spec[target_scale]

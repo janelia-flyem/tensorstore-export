@@ -474,7 +474,8 @@ def main():
         print(f"Generating downres manifests for scales {downres_scales}...")
         t0 = time.monotonic()
         all_scale_results = generate_downres_manifests(
-            str(spec_path_resolved), source_path, scales, downres_scales,
+            str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
+            scales, downres_scales,
             max_tasks, dry_run=args.dry_run,
         )
         elapsed = time.monotonic() - t0
@@ -538,7 +539,8 @@ def main():
                       f"with label-aware model...")
                 t0 = time.monotonic()
                 next_results = generate_downres_manifests(
-                    str(spec_path_resolved), source_path, scales,
+                    str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
+                    scales,
                     [next_scale], max_tasks, dry_run=False,
                 )
                 print(f"  Manifest re-generation took {time.monotonic() - t0:.1f}s")
@@ -563,7 +565,7 @@ def main():
     print(f"Scanning Arrow files across {len(scales)} scales...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
-    print(f"  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB")
+    print("  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB")
 
     if not all_files:
         print("No Arrow files found. Check SOURCE_PATH and SCALES in .env.")
@@ -576,7 +578,7 @@ def main():
     # --- Step 2: Assign to tiers ---
     tier_map = assign_tiers(all_files, max_tasks)
 
-    print(f"\nTier assignments:")
+    print("\nTier assignments:")
     for gib in sorted(tier_map.keys()):
         shards = tier_map[gib]
         tier_max = max_tasks.get(gib, 1000)
@@ -606,12 +608,11 @@ def main():
         capture_output=True, text=True,
     )
     if result.returncode == 0:
-        print(f"  Deleted.")
+        print("  Deleted.")
     elif "No URLs matched" in result.stderr or "CommandException" in result.stderr:
-        print(f"  No stale manifests found.")
+        print("  No stale manifests found.")
 
     tier_info = {}  # gib -> (manifest_uri, num_tasks)
-    total_manifests = 0
 
     # Prepare all manifest uploads across tiers
     all_uploads = []  # (gib, task_idx, blob_path, json_bytes)
