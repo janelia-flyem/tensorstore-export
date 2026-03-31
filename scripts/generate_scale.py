@@ -11,7 +11,7 @@ Usage:
     pixi run generate-scale --scales 0 --tasks 800
     pixi run generate-scale --scales 0,1,2 --tasks 200
     pixi run generate-scale --scales 3 --tasks 50 --memory 16Gi
-    pixi run generate-scale --label-type supervoxels
+    pixi run generate-scale --supervoxels
     pixi run generate-scale --downres 10
 """
 
@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE
+from scripts.export import resolve_label_type
 
 
 def _parse_memory_gib(memory_str: str) -> float:
@@ -47,9 +48,8 @@ def main():
         help="Comma-separated scales to generate by downsampling previous scale",
     )
     parser.add_argument(
-        "--label-type",
-        choices=["labels", "supervoxels"],
-        help='Label type: "labels" for agglomerated (default), "supervoxels" for raw IDs',
+        "--supervoxels", action="store_true",
+        help="Output raw supervoxel IDs instead of agglomerated labels",
     )
     parser.add_argument(
         "--tasks", type=int,
@@ -91,7 +91,7 @@ def main():
     tasks = args.tasks or int(env.get("TASKS", "200"))
     cpu = args.cpu or int(env.get("CPU", "2"))
     memory = args.memory or env.get("MEMORY", "4Gi")
-    label_type = args.label_type or env.get("LABEL_TYPE", "labels")
+    label_type = resolve_label_type(args.supervoxels, env)
 
     downres = args.downres or env.get("DOWNRES_SCALES", "")
 

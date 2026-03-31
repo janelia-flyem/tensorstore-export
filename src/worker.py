@@ -220,6 +220,7 @@ class ShardProcessor:
                      dest=config.dest_path,
                      staging=self._staging_base,
                      scales=config.scales,
+                     label_type=config.label_type,
                      task_index=self._task_index,
                      task_count=self._task_count)
 

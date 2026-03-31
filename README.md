@@ -88,6 +88,13 @@ leave `DOWNRES_SCALES` blank, then run:
 pixi run export
 ```
 
+To export supervoxel IDs instead of agglomerated labels, either pass
+`--supervoxels` or set `LABEL_TYPE=supervoxels` in `.env`:
+
+```bash
+pixi run export --supervoxels
+```
+
 ```
 Scanning Arrow files across 1 scales...
   Found 21690 Arrow files
@@ -165,7 +172,7 @@ Without it, the chunk-count model is used, which is more conservative.
 | `--downres-mode` | Deprecated compatibility flag; `--downres` already implies downres mode | |
 | `--downres` | Target scales for downres (e.g., `1` or `1,2,3,...,9`) | from `.env` |
 | `--only-missing` | For downres, generate manifests only for missing output shards | off |
-| `--label-type` | `labels` (agglomerated) or `supervoxels` (raw IDs) | `labels` |
+| `--supervoxels` | Output raw supervoxel IDs instead of agglomerated labels | off |
 | `--tiers` | Override max tasks per tier (e.g., `4:3000,8:50`) | auto |
 | `--dry-run` | Show tier assignments without writing manifests or launching | |
 | `--wait` | For non-downres export, block until jobs complete | async |
@@ -292,6 +299,7 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 | `BASE_JOB_NAME` | Cloud Run job name prefix (tier jobs: `{name}-tier-4gi`, ...) | `tensorstore-dvid-export` |
 | `SCALES` | Source scales with DVID Arrow shards | `0` |
 | `DOWNRES_SCALES` | Scales to generate by downsampling (optional) | `1,2,3,4,5,6,7,8,9` |
+| `LABEL_TYPE` | `labels` (agglomerated, default) or `supervoxels` (raw IDs) | `labels` |
 
 ## GCS Bucket Setup
 

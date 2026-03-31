@@ -10,7 +10,7 @@ Usage:
     pixi run export
     pixi run export --dry-run
     pixi run export --async
-    pixi run export --label-type supervoxels
+    pixi run export --supervoxels
     pixi run export --downres 10
     pixi run export --downres 2 --only-missing
 """
@@ -39,6 +39,13 @@ from scripts.aggregate_predicted_labels import aggregate_labels
 
 
 SHARDS_PER_CHECK_TASK = 100  # shards per Cloud Run task for zero-check
+
+
+def resolve_label_type(supervoxels_flag: bool, env: dict) -> str:
+    """Return 'supervoxels' if the flag is set, else fall back to env/default."""
+    if supervoxels_flag:
+        return "supervoxels"
+    return env.get("LABEL_TYPE", "labels")
 ANSI_RED = "\033[31m"
 ANSI_GREEN = "\033[32m"
 ANSI_RESET = "\033[0m"
@@ -466,9 +473,8 @@ def main():
         help="Comma-separated scales to include (default: from .env SCALES)",
     )
     parser.add_argument(
-        "--label-type",
-        choices=["labels", "supervoxels"],
-        help='Label type: "labels" for agglomerated (default), "supervoxels" for raw IDs',
+        "--supervoxels", action="store_true",
+        help="Output raw supervoxel IDs instead of agglomerated labels",
     )
     parser.add_argument(
         "--downres",
@@ -536,7 +542,9 @@ def main():
 
     scales_str = args.scales or env.get("SCALES", "0")
     scales = [int(s.strip()) for s in scales_str.split(",")]
-    label_type = args.label_type or env.get("LABEL_TYPE", "labels")
+    label_type = resolve_label_type(args.supervoxels, env)
+    if label_type == "supervoxels":
+        print("Label type: supervoxels (raw IDs, no agglomeration mapping)")
     downres = args.downres or env.get("DOWNRES_SCALES", "")
 
     # Parse tier overrides
