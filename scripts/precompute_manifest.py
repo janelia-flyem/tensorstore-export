@@ -477,35 +477,38 @@ def generate_downres_manifests(
     spec = load_ng_spec(ng_spec_path)
     downres_scales = sorted(downres_scales)
 
-    # Step 1: Build the initial shard set from DVID Arrow source files.
-    # Scan the source bucket for .arrow files at the base scales.
-    print("\nScanning s0 source shards for derivation chain...")
-    s0_shard_numbers = set()
-    for scale in scales:
-        params = spec[scale]
-        prefix = f"{source_path}/s{scale}/"
-        result = subprocess.run(
-            ["gsutil", "ls", prefix],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(f"  Warning: could not list {prefix}: {result.stderr.strip()}")
-            continue
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.endswith(".arrow"):
-                name = line.split("/")[-1].replace(".arrow", "")
-                ng_shard = dvid_to_ng_shard_number(name, params)
-                s0_shard_numbers.add(ng_shard)
-
-    print(f"  Found {len(s0_shard_numbers)} unique NG shard numbers at source scale(s)")
-
-    # Step 2: Build the derivation chain.
+    # Step 1: Seed the derivation chain.
+    # Only scan DVID source shards when s1 is being generated in this run.
     # For each downres scale, derive child shards from parent shards.
     # shard_numbers_by_scale[scale] = sorted shard numbers known to exist.
     shard_numbers_by_scale = {}
-    if scales:
-        shard_numbers_by_scale[scales[0]] = sorted(s0_shard_numbers)
+    if downres_scales and min(downres_scales) <= 1 and scales:
+        print("\nScanning source shards for derivation chain...")
+        source_shard_numbers = set()
+        for scale in scales:
+            params = spec[scale]
+            prefix = f"{source_path}/s{scale}/"
+            result = subprocess.run(
+                ["gsutil", "ls", prefix],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(f"  Warning: could not list {prefix}: {result.stderr.strip()}")
+                continue
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.endswith(".arrow"):
+                    name = line.split("/")[-1].replace(".arrow", "")
+                    ng_shard = dvid_to_ng_shard_number(name, params)
+                    source_shard_numbers.add(ng_shard)
+
+        shard_numbers_by_scale[scales[0]] = sorted(source_shard_numbers)
+        print(f"  Found {len(source_shard_numbers)} unique NG shard numbers "
+              f"at source scale(s)")
+    elif downres_scales:
+        start_scale = min(downres_scales)
+        print(f"\nSkipping source shard scan; s{start_scale} will seed from "
+              f"existing destination s{start_scale - 1} output")
 
     all_scale_results = {}  # scale -> {tier_gib -> (uri, num_tasks)}
 
