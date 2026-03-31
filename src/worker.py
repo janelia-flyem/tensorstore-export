@@ -1138,6 +1138,15 @@ class CloudRunWorker:
                 "estimated_tmpfs_gib": entry.get("estimated_tmpfs_gib"),
                 "estimated_raw_batch_gib": entry.get("estimated_raw_batch_gib"),
                 "estimated_overhead_gib": entry.get("estimated_overhead_gib"),
+                "estimated_source_cache_gib": entry.get(
+                    "estimated_source_cache_gib"),
+                "estimated_dest_cache_gib": entry.get(
+                    "estimated_dest_cache_gib"),
+                "estimated_runtime_gib": entry.get("estimated_runtime_gib"),
+                "estimated_label_readback_gib": entry.get(
+                    "estimated_label_readback_gib"),
+                "estimated_commit_spike_gib": entry.get(
+                    "estimated_commit_spike_gib"),
                 "estimated_total_unique_labels": entry.get(
                     "estimated_total_unique_labels"),
             }
