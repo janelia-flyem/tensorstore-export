@@ -12,6 +12,7 @@ Usage:
     pixi run export --wait
     pixi run export --label-type supervoxels
     pixi run export --downres 10
+    pixi run export --downres 2 --only-missing
 """
 
 import argparse
@@ -385,6 +386,11 @@ def main():
         help="Comma-separated scales to generate by downsampling previous scale",
     )
     parser.add_argument(
+        "--only-missing", action="store_true",
+        help="For downres exports, generate manifests only for output shards "
+             "missing from DEST_PATH at the target scale.",
+    )
+    parser.add_argument(
         "--tiers",
         help="Override max tasks per tier as GiB:maxTasks pairs. "
              "E.g., 4:3000,8:50.  Default tier limits are used for unspecified tiers.",
@@ -417,7 +423,7 @@ def main():
     parser.add_argument(
         "--downres-mode", action="store_true",
         help="Generate downres manifests and launch Cloud Run jobs with "
-             "DOWNRES_MODE=1.  Requires --downres to specify target scales. "
+             "DOWNRES_MODE=1. Deprecated: --downres now implies this path. "
              "Uses the manifest chain approach: s0 shards -> s1 -> s2 -> ...",
     )
     args = parser.parse_args()
@@ -457,13 +463,19 @@ def main():
     else:
         ng_spec_b64 = ""
 
+    downres_mode = args.downres_mode or bool(downres)
+
+    if args.only_missing and not downres_mode:
+        print("Error: --only-missing is only supported with --downres.")
+        sys.exit(1)
+
     # --- Downres mode: generate manifests + launch with DOWNRES_MODE=1 ---
-    if args.downres_mode:
+    if downres_mode:
         if not downres:
-            print("Error: --downres-mode requires --downres to specify target scales.")
+            print("Error: --downres must specify target scales.")
             sys.exit(1)
         if not ng_spec_path:
-            print("Error: NG_SPEC_PATH must be configured in .env for --downres-mode.")
+            print("Error: NG_SPEC_PATH must be configured in .env for downres.")
             sys.exit(1)
 
         downres_scales = [int(s.strip()) for s in downres.split(",")]
@@ -476,7 +488,7 @@ def main():
         all_scale_results = generate_downres_manifests(
             str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
             scales, downres_scales,
-            max_tasks, dry_run=args.dry_run,
+            max_tasks, only_missing=args.only_missing, dry_run=args.dry_run,
         )
         elapsed = time.monotonic() - t0
         print(f"\nManifest generation took {elapsed:.1f}s")
@@ -541,7 +553,8 @@ def main():
                 next_results = generate_downres_manifests(
                     str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
                     scales,
-                    [next_scale], max_tasks, dry_run=False,
+                    [next_scale], max_tasks,
+                    only_missing=args.only_missing, dry_run=False,
                 )
                 print(f"  Manifest re-generation took {time.monotonic() - t0:.1f}s")
                 if next_scale in next_results:

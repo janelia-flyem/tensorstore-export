@@ -136,7 +136,15 @@ DOWNRES_SOURCE_CACHE_GIB = 0.25
 DOWNRES_DEST_CACHE_GIB = 0.25
 DOWNRES_RUNTIME_GIB = 0.5
 DOWNRES_LABEL_READBACK_GIB = 0.5
-DOWNRES_COMMIT_SPIKE_GIB = 0.5
+# The failed s2 4Gi tasks were killed after logging only ~3.0-3.3 GiB RSS,
+# which implies a short-lived write/commit spike that is not captured by the
+# post-commit memory samples. Keep this scale-aware so s1 and s2+ can be
+# calibrated independently from production logs.
+DOWNRES_COMMIT_SPIKE_GIB_BY_SCALE = {
+    1: 0.5,
+    2: 1.0,
+}
+DOWNRES_DEFAULT_COMMIT_SPIKE_GIB = 1.0
 DOWNRES_OVERHEAD_GIB = (
     DOWNRES_SOURCE_CACHE_GIB +
     DOWNRES_DEST_CACHE_GIB +
@@ -266,11 +274,13 @@ def estimate_downres_components(scale: int, chunk_count: int,
         model = "chunk_count"
 
     raw_batch_gib = estimate_downres_raw_batch_gib(chunk_count)
+    commit_spike_gib = DOWNRES_COMMIT_SPIKE_GIB_BY_SCALE.get(
+        scale, DOWNRES_DEFAULT_COMMIT_SPIKE_GIB)
     subtotal_gib = (
         raw_batch_gib +
         2 * output_gib +
         DOWNRES_OVERHEAD_GIB +
-        DOWNRES_COMMIT_SPIKE_GIB
+        commit_spike_gib
     )
     total_gib = subtotal_gib * DOWNRES_SAFETY_FACTOR
     return {
@@ -285,7 +295,7 @@ def estimate_downres_components(scale: int, chunk_count: int,
         "dest_cache_gib": DOWNRES_DEST_CACHE_GIB,
         "runtime_gib": DOWNRES_RUNTIME_GIB,
         "label_readback_gib": DOWNRES_LABEL_READBACK_GIB,
-        "commit_spike_gib": DOWNRES_COMMIT_SPIKE_GIB,
+        "commit_spike_gib": commit_spike_gib,
         "overhead_gib": DOWNRES_OVERHEAD_GIB,
         "subtotal_gib": subtotal_gib,
         "safety_factor": DOWNRES_SAFETY_FACTOR,
@@ -436,6 +446,7 @@ def generate_downres_manifests(
     scales: list,
     downres_scales: list,
     max_tasks: dict,
+    only_missing: bool = False,
     dry_run: bool = False,
 ) -> dict:
     """Generate manifest chain for downres scales.
@@ -523,6 +534,16 @@ def generate_downres_manifests(
         print(f"\n  Scale {target_scale}: {len(child_shards)} output shards "
               f"(from {len(parent_shards)} parent shards at s{parent_scale})")
 
+        if only_missing:
+            existing_target_shards = set(
+                _list_existing_ng_shards(dest_path, child_params["key"]))
+            missing_child_shards = [
+                sn for sn in child_shards if sn not in existing_target_shards
+            ]
+            print(f"  Filtering to missing output shards at s{target_scale}: "
+                  f"{len(missing_child_shards)} missing / {len(child_shards)} total")
+            child_shards = missing_child_shards
+
         # Step 3: Compute shard bboxes and estimate memory.
         # Try label-aware model first (much tighter); fall back to chunk-count.
         shard_labels = _read_shard_labels(source_path, target_scale)
@@ -552,6 +573,11 @@ def generate_downres_manifests(
             mem = entry[2]["total_gib"]
             gib = pick_tier(mem)
             tier_map.setdefault(gib, []).append(entry)
+
+        if not child_shards:
+            print("  No output shards selected after filtering; skipping")
+            all_scale_results[target_scale] = {}
+            continue
 
         print("  Tier assignments:")
         tier_info = {}
@@ -696,6 +722,11 @@ def main():
              "shards using the manifest chain approach.",
     )
     parser.add_argument(
+        "--only-missing", action="store_true",
+        help="For downres manifests, include only output shards missing from "
+             "DEST_PATH at the target scale.",
+    )
+    parser.add_argument(
         "--exclude-empty", type=str, default=None,
         help="Path to JSON file listing empty shards to exclude. "
              "Format: [{\"scale\": 0, \"shard\": \"name\"}, ...]. "
@@ -738,8 +769,8 @@ def main():
         print(f"  NG spec: {spec_path}")
 
         results = generate_downres_manifests(
-            str(spec_path), source_path, scales, downres_scales,
-            max_tasks, dry_run=args.dry_run,
+            str(spec_path), source_path, dest_path, scales, downres_scales,
+            max_tasks, only_missing=args.only_missing, dry_run=args.dry_run,
         )
 
         if args.dry_run:
