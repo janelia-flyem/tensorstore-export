@@ -71,12 +71,18 @@ All values are saved to `.env` for future runs. You can also edit `.env` directl
 
 ### Export
 
-Export runs in two phases: **s0 from DVID Arrow shards**, then **s1-s9 via downsampling**.
+There are two supported export approaches:
 
-#### Phase 1: Export s0
+1. **Direct from DVID at every scale**
+   Export the scales listed in `SCALES` directly from DVID Arrow shards.
+2. **s0 from DVID, then s1+ by TensorStore downres**
+   Export `s0` from DVID, then generate later scales from the previous
+   neuroglancer scale using TensorStore downsampling.
 
-Scans Arrow source files at scale 0, assigns shards to memory tiers, writes
-per-task manifests to GCS, and launches a Cloud Run job per tier:
+#### Approach 1: Direct from DVID
+
+Set `SCALES` in `.env` to the DVID-materialized scales you want to export and
+leave `DOWNRES_SCALES` blank, then run:
 
 ```bash
 pixi run export
@@ -101,49 +107,69 @@ Each task reads its own small manifest file (`task-0.json`, `task-1.json`, ...)
 listing the shards it should process. Tasks within a tier are load-balanced by
 Arrow file size.
 
-#### Phase 2: Downres s1-s9
+#### Approach 2: s0 from DVID, then downres later scales
 
-After s0 completes, generate each subsequent scale by reading the previous
-scale from the destination volume and downsampling 2x in each dimension
-(majority vote). Run one scale at a time — scale N-1 must be fully written
-before scale N starts:
+Set `.env` so that:
+
+```bash
+SCALES=0
+DOWNRES_SCALES=1,2,3,4,5,6,7,8,9
+```
+
+Then run:
+
+```bash
+pixi run export
+```
+
+This now runs the downres pipeline sequentially by default:
+
+- for each target scale, aggregate predicted labels first
+- generate manifests for that scale
+- launch the downres jobs for that scale
+- verify the completed scale before moving on
+- stop immediately if any scale fails verification or launch
+
+At the end, the command prints a per-scale timing summary and total elapsed
+time.
+
+For one-off or partial runs, you can still target specific scales directly:
 
 ```bash
 # Generate s1 from s0
-pixi run export --downres-mode --downres 1
+pixi run export --downres 1
 
-# After s1 completes, aggregate label predictions for s2 tier assignment
-pixi run aggregate-labels --target-scale 2
+# Generate s3 from existing s2 output
+pixi run export --downres 3
 
-# Generate s2 from s1
-pixi run export --downres-mode --downres 2
-
-# Repeat for s3-s9...
+# Retry only missing output shards for s2
+pixi run export --downres 2 --only-missing
 ```
 
-The `aggregate-labels` step is optional but recommended — it produces
-per-shard label counts that the manifest generator uses for tighter memory
-tier assignment (label-aware model). Without it, the chunk-count model is
-used, which is more conservative.
-
-To automate the full chain (launch scale, wait for completion, aggregate
-labels, launch next scale):
+For standalone later-scale runs, `aggregate-labels` is still available as a
+manual step if you want the label summary written ahead of time:
 
 ```bash
-pixi run export --downres-mode --downres 1,2,3,4,5,6,7,8,9 --wait
+pixi run aggregate-labels --target-scale 3
 ```
+
+`aggregate-labels` produces per-shard label counts that the manifest
+generator uses for tighter memory tier assignment (label-aware model).
+Without it, the chunk-count model is used, which is more conservative.
 
 #### Export options
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--scales` | Source scales with DVID Arrow shards | from `.env` |
-| `--downres-mode` | Generate scales by downsampling instead of from DVID shards | |
+| `--downres-mode` | Deprecated compatibility flag; `--downres` already implies downres mode | |
 | `--downres` | Target scales for downres (e.g., `1` or `1,2,3,...,9`) | from `.env` |
+| `--only-missing` | For downres, generate manifests only for missing output shards | off |
 | `--label-type` | `labels` (agglomerated) or `supervoxels` (raw IDs) | `labels` |
 | `--tiers` | Override max tasks per tier (e.g., `4:3000,8:50`) | auto |
 | `--dry-run` | Show tier assignments without writing manifests or launching | |
-| `--wait` | Block until jobs complete (for downres: run aggregation between scales) | async |
+| `--wait` | For non-downres export, block until jobs complete | async |
+| `--async` | For downres export, disable sequential orchestration and launch jobs immediately | off |
 
 Use `pixi run precompute-manifest --dry-run` to preview tier assignments
 without launching any jobs.
@@ -203,6 +229,15 @@ pixi run find-failed -- --retry-tier 16
 pixi run export --manifest-dir manifests-retry --job-suffix retry
 ```
 
+For downres retries, the normal path is:
+
+```bash
+pixi run export --downres 2 --only-missing
+```
+
+That regenerates manifests only for missing destination shards at the target
+scale and launches the manifest-driven downres worker path.
+
 ### Memory Sizing
 
 Cloud Run Gen 2 uses in-memory filesystem (tmpfs), so the output shard file
@@ -224,14 +259,16 @@ memory = arrow_in_ram + 2 * shard_on_tmpfs + 2.0 GiB overhead
 **Downres** (from previous scale):
 
 ```
-memory = raw_batch + 2 * shard_on_tmpfs + 1.0 GiB overhead
+memory = (raw_batch + 2 * shard_on_tmpfs + fixed_overhead + commit_spike) * safety_factor
 ```
 
 | Component | Notes |
 |-----------|-------|
 | Raw batch arrays | One Z-plane of raw uint64 arrays: N^(2/3) chunks × 2 MiB (e.g., 1024 × 2 MiB = 2 GiB for 32³ shards) |
 | Output shard on tmpfs (2×) | RMW during batched transaction commits. Coexists with raw arrays in cgroup memory. |
-| Fixed overhead (1.0 GiB) | Python + TensorStore + source/staging caches (256 MiB each) + label readback |
+| Fixed overhead | Python + TensorStore + source/staging caches + label readback |
+| Commit spike | Hidden TensorStore encode/commit spike, modeled as a scale-based floor |
+| Safety factor | Multiplies the subtotal to cover additional source-side working set |
 
 Writes are batched one Z-plane at a time with explicit transaction commits.
 Between `write()` and `commit()`, TensorStore holds raw uint64 arrays in
@@ -308,7 +345,7 @@ DVID export-shards           Cloud Run Workers              Neuroglancer Volume
   per-scale: s0/, s1/...       google-cloud-storage           compressed_segmentation
 ```
 
-**s0 workers** process one shard at a time: download Arrow+CSV from GCS, decompress chunks via the DVID block decompressor, transpose ZYX→XYZ, and write to the neuroglancer precomputed volume via TensorStore.
+**Direct-export workers** process one shard at a time: download Arrow+CSV from GCS, decompress chunks via the DVID block decompressor, transpose ZYX→XYZ, and write to the neuroglancer precomputed volume via TensorStore.
 
 **Downres workers** generate scales s1-s9 by reading the previous scale from the destination volume on GCS, downsampling 2x in each dimension (majority vote), writing the output shard to local tmpfs staging, then uploading to GCS. Each worker also reads back the output chunks to compute unique label counts for next-scale memory prediction.
 

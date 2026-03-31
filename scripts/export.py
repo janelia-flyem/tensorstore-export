@@ -9,7 +9,7 @@ launches a Cloud Run job per tier.
 Usage:
     pixi run export
     pixi run export --dry-run
-    pixi run export --wait
+    pixi run export --async
     pixi run export --label-type supervoxels
     pixi run export --downres 10
     pixi run export --downres 2 --only-missing
@@ -39,6 +39,44 @@ from scripts.aggregate_predicted_labels import aggregate_labels
 
 
 SHARDS_PER_CHECK_TASK = 100  # shards per Cloud Run task for zero-check
+ANSI_RED = "\033[31m"
+ANSI_GREEN = "\033[32m"
+ANSI_RESET = "\033[0m"
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes > 0:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _print_downres_success_summary(scale_timings: list[tuple[int, float]],
+                                   total_seconds: float) -> None:
+    print(f"\n{ANSI_GREEN}Downres pipeline completed successfully.{ANSI_RESET}")
+    print("Scales:")
+    for scale, elapsed in scale_timings:
+        print(f"  s{scale}: {_format_elapsed(elapsed)}")
+    print(f"Total: {_format_elapsed(total_seconds)}")
+
+
+def _fail_downres(scale: int | None, message: str,
+                  scale_timings: list[tuple[int, float]],
+                  total_start: float) -> None:
+    print(f"\n{ANSI_RED}Downres pipeline failed.{ANSI_RESET}")
+    if scale is not None:
+        print(f"Failed at: s{scale}")
+    print(message)
+    if scale_timings:
+        print("Completed scales before failure:")
+        for done_scale, elapsed in scale_timings:
+            print(f"  s{done_scale}: {_format_elapsed(elapsed)}")
+    print(f"Elapsed before failure: {_format_elapsed(time.monotonic() - total_start)}")
+    sys.exit(1)
 
 
 def _remove_zero_shards(all_files: list, env: dict, source_path: str) -> list:
@@ -401,7 +439,13 @@ def main():
     )
     parser.add_argument(
         "--wait", action="store_true",
-        help="Block until all jobs complete (default: launch async)",
+        help="For non-downres exports, block until all jobs complete. "
+             "Downres runs sequentially by default.",
+    )
+    parser.add_argument(
+        "--async", dest="async_launch", action="store_true",
+        help="For downres exports, launch jobs without sequential orchestration "
+             "or per-scale verification.",
     )
     parser.add_argument(
         "--manifest-dir",
@@ -464,6 +508,7 @@ def main():
         ng_spec_b64 = ""
 
     downres_mode = args.downres_mode or bool(downres)
+    downres_wait = downres_mode and not args.async_launch
 
     if args.only_missing and not downres_mode:
         print("Error: --only-missing is only supported with --downres.")
@@ -482,6 +527,120 @@ def main():
         spec_path_resolved = Path(ng_spec_path)
         if not spec_path_resolved.is_absolute():
             spec_path_resolved = Path(__file__).resolve().parent.parent / spec_path_resolved
+
+        if downres_wait:
+            image = _get_image(env)
+            if not image and not args.dry_run:
+                print("Error: DOCKER_IMAGE not set in .env. Run 'pixi run deploy' first.")
+                sys.exit(1)
+            if image:
+                print(f"\nUsing image: {image}")
+
+            from scripts.verify_export import verify_all_scales, print_report
+            pipeline_start = time.monotonic()
+            scale_timings = []
+
+            for target_scale in downres_scales:
+                scale_start = time.monotonic()
+                if target_scale > 1:
+                    print(f"\nAggregating label predictions for s{target_scale}...")
+                    try:
+                        aggregate_labels(
+                            source_path, target_scale, str(spec_path_resolved))
+                    except Exception as e:
+                        _fail_downres(
+                            target_scale,
+                            f"Failed to aggregate labels for s{target_scale}: {e}",
+                            scale_timings,
+                            pipeline_start,
+                        )
+
+                print(f"\nGenerating downres manifests for scales [{target_scale}]...")
+                t0 = time.monotonic()
+                scale_results = generate_downres_manifests(
+                    str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
+                    scales, [target_scale],
+                    max_tasks, only_missing=args.only_missing, dry_run=args.dry_run,
+                )
+                print(f"\nManifest generation took {time.monotonic() - t0:.1f}s")
+
+                tier_info = scale_results.get(target_scale, {})
+                if not tier_info:
+                    print(f"\nNo manifests generated for s{target_scale}. "
+                          "Checking whether the scale is already complete...")
+                    total_missing, results = verify_all_scales(
+                        source_path, env.get("DEST_PATH", ""),
+                        str(spec_path_resolved), [target_scale])
+                    print_report(results)
+                    if total_missing > 0:
+                        _fail_downres(
+                            target_scale,
+                            f"s{target_scale} still has {total_missing} missing NG "
+                            "shard(s) but no manifests were generated.",
+                            scale_timings,
+                            pipeline_start,
+                        )
+                    scale_timings.append(
+                        (target_scale, time.monotonic() - scale_start))
+                    continue
+
+                if args.dry_run:
+                    continue
+
+                print(f"\nLaunching downres jobs for scale {target_scale}...")
+                launch_failed = False
+                for gib in sorted(tier_info.keys()):
+                    manifest_uri, num_tasks = tier_info[gib]
+                    cpu = TIER_CPU.get(gib, 2)
+                    memory = f"{gib}Gi"
+                    job_name = f"{base_name}-downres-s{target_scale}-tier-{gib}gi"
+
+                    ok = _create_or_update_job(
+                        job_name, image, env, ng_spec_b64,
+                        memory, cpu, num_tasks, manifest_uri,
+                        label_type, "", downres_mode=True,
+                    )
+                    if not ok:
+                        print(f"  {job_name}: FAILED to create/update")
+                        launch_failed = True
+                        continue
+
+                    ok = _execute_job(job_name, project, region, num_tasks, True)
+                    if ok:
+                        print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
+                    else:
+                        print(f"  {job_name}: FAILED to execute")
+                        launch_failed = True
+
+                if launch_failed:
+                    _fail_downres(
+                        target_scale,
+                        f"Downres launch or execution failed for s{target_scale}.",
+                        scale_timings,
+                        pipeline_start,
+                    )
+
+                print(f"\nVerifying s{target_scale} export completeness...")
+                total_missing, results = verify_all_scales(
+                    source_path, env.get("DEST_PATH", ""),
+                    str(spec_path_resolved), [target_scale])
+                print_report(results)
+                if total_missing > 0:
+                    _fail_downres(
+                        target_scale,
+                        f"s{target_scale} finished with {total_missing} missing NG "
+                        "shard(s). Stopping before the next scale.",
+                        scale_timings,
+                        pipeline_start,
+                    )
+                scale_timings.append((target_scale, time.monotonic() - scale_start))
+
+            if args.dry_run:
+                print("\n(dry run — no manifests written, no jobs launched)")
+            else:
+                _print_downres_success_summary(
+                    scale_timings, time.monotonic() - pipeline_start)
+            return
 
         print(f"Generating downres manifests for scales {downres_scales}...")
         t0 = time.monotonic()
@@ -504,10 +663,6 @@ def main():
             sys.exit(1)
         print(f"\nUsing image: {image}")
 
-        # Launch one Cloud Run job per tier per scale.
-        # When --wait is used, process scales sequentially: after each scale
-        # completes, run aggregation to produce label files for the next
-        # scale's manifest (label-aware tier assignment).
         for target_scale in sorted(all_scale_results.keys()):
             tier_info = all_scale_results[target_scale]
             if not tier_info:
@@ -529,36 +684,11 @@ def main():
                     print(f"  {job_name}: FAILED to create/update")
                     continue
 
-                ok = _execute_job(job_name, project, region, num_tasks, args.wait)
+                ok = _execute_job(job_name, project, region, num_tasks, False)
                 if ok:
                     print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
                 else:
                     print(f"  {job_name}: FAILED to execute")
-
-            # After scale completes (--wait), aggregate predictions for next scale
-            if args.wait and target_scale + 1 in downres_scales:
-                next_scale = target_scale + 1
-                print(f"\nAggregating label predictions for s{next_scale}...")
-                try:
-                    aggregate_labels(
-                        source_path, next_scale, str(spec_path_resolved))
-                except Exception as e:
-                    print(f"  Warning: aggregation failed: {e}")
-                    print(f"  s{next_scale} will use chunk-count model.")
-
-                # Re-generate manifests for the next scale using label data
-                print(f"Re-generating manifests for s{next_scale} "
-                      f"with label-aware model...")
-                t0 = time.monotonic()
-                next_results = generate_downres_manifests(
-                    str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
-                    scales,
-                    [next_scale], max_tasks,
-                    only_missing=args.only_missing, dry_run=False,
-                )
-                print(f"  Manifest re-generation took {time.monotonic() - t0:.1f}s")
-                if next_scale in next_results:
-                    all_scale_results[next_scale] = next_results[next_scale]
 
         print("\nMonitor progress:")
         print("  pixi run export-status")
