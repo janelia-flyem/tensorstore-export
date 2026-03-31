@@ -111,7 +111,7 @@ This runs during `pixi run export` phase 1 (after scanning Arrow files, before a
 
 ### Phase 2: Correlate with actual output sizes
 
-Implemented in `scripts/analyze_v011_memory.py` (`pixi run analyze-memory`).
+Implemented in `scripts/analyze_memory.py` (`pixi run analyze-memory`).
 
 Maps DVID shards to neuroglancer output shards using TensorStore's compressed Z-index
 (not a standard Morton code — the compressed variant only interleaves bits for dimensions

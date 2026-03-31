@@ -173,6 +173,22 @@ def get_execution_info(job_name: str, project: str, region: str) -> dict:
     }
 
 
+def _is_downres_job(label: str) -> bool:
+    """Check if a job label indicates a downres job."""
+    return "downres" in label
+
+
+def _normalize_downres_payload(payload: dict) -> dict:
+    """Map downres log fields to match regular export field names."""
+    if "shard_number" in payload and "shard" not in payload:
+        payload["shard"] = payload["shard_number"]
+    if "num_chunks" in payload and "chunks_written" not in payload:
+        payload["chunks_written"] = payload["num_chunks"]
+    payload.setdefault("chunks_failed", 0)
+    payload.setdefault("batches", 1)
+    return payload
+
+
 def _query_log_events(job_name: str, project: str, region: str,
                       event_name: str, execution: str = "",
                       limit: int = 50000) -> list:
@@ -226,7 +242,14 @@ def summarize_memory(profiles: list) -> dict:
     elapsed = [p.get("elapsed_s", 0) for p in profiles]
     total_batches = sum(batches)
 
-    return {
+    estimates = [p.get("estimated_memory_gib") for p in profiles
+                 if p.get("estimated_memory_gib") is not None]
+    prediction_errors = [p.get("prediction_error_gib") for p in profiles
+                         if p.get("prediction_error_gib") is not None]
+    prediction_ratios = [p.get("prediction_ratio") for p in profiles
+                         if p.get("prediction_ratio") is not None]
+
+    stats = {
         "shards_profiled": len(profiles),
         "peak_memory_avg": sum(peaks) / len(peaks),
         "peak_memory_max": max(peaks),
@@ -236,6 +259,16 @@ def summarize_memory(profiles: list) -> dict:
         "avg_elapsed_s": sum(elapsed) / len(elapsed) if elapsed else 0,
         "max_elapsed_s": max(elapsed) if elapsed else 0,
     }
+    if estimates:
+        stats["estimated_memory_avg"] = sum(estimates) / len(estimates)
+        stats["estimated_memory_max"] = max(estimates)
+    if prediction_errors:
+        stats["prediction_error_avg"] = sum(prediction_errors) / len(prediction_errors)
+        stats["prediction_error_max"] = max(prediction_errors)
+    if prediction_ratios:
+        stats["prediction_ratio_avg"] = sum(prediction_ratios) / len(prediction_ratios)
+        stats["prediction_ratio_max"] = max(prediction_ratios)
+    return stats
 
 
 def get_latest_execution(job_name: str, project: str, region: str) -> str:
@@ -339,10 +372,17 @@ def main():
             continue
 
         # Query in-flight progress and completed shard events
-        progress = _query_log_events(
-            job_name, project, region, "Shard progress", execution)
-        completed = _query_log_events(
-            job_name, project, region, "Shard complete", execution)
+        is_downres = _is_downres_job(label)
+        if is_downres:
+            progress = []  # downres worker doesn't emit progress events
+            completed = _query_log_events(
+                job_name, project, region, "Downres shard complete", execution)
+            completed = [_normalize_downres_payload(c) for c in completed]
+        else:
+            progress = _query_log_events(
+                job_name, project, region, "Shard progress", execution)
+            completed = _query_log_events(
+                job_name, project, region, "Shard complete", execution)
 
         # Deduplicate progress: keep latest per (scale, shard)
         latest = {}
@@ -404,6 +444,13 @@ def main():
                 mem_line += (f" / {stats['memory_limit']:.0f}G limit "
                              f"({headroom:.1f}G headroom)")
             print(mem_line)
+            if "estimated_memory_avg" in stats:
+                pred_line = (f"  Estimate: avg {stats['estimated_memory_avg']:.1f}G")
+                if "prediction_error_avg" in stats:
+                    pred_line += (f", error avg {stats['prediction_error_avg']:+.1f}G")
+                if "prediction_ratio_max" in stats:
+                    pred_line += (f", worst ratio {stats['prediction_ratio_max']:.2f}x")
+                print(pred_line)
             print(f"  Timing: avg {stats['avg_elapsed_s']:.0f}s, "
                   f"max {stats['max_elapsed_s']:.0f}s per shard")
             print(f"  Batch writes: {stats['total_batch_writes']:,} total, "

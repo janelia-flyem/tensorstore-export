@@ -20,7 +20,7 @@ plus the index metadata), regardless of chunk count.
 
 ### Block size issue discovered
 
-The v0.11 export spec (`mcns-v0.11-export-specs.json`) does not include
+The v0.11 export spec (`mcns-export-specs.json`) does not include
 `compressed_segmentation_block_size`. The worker's `setdefault` fills in
 `[64, 64, 64]`, but `deploy.py` writes `[8, 8, 8]` to the GCS info file.
 The data is encoded with 64^3 blocks while readers expect 8^3 — a silent

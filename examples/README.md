@@ -6,7 +6,7 @@ These are dataset-specific run script and neuroglancer multiscale volume spec JS
 
 | File | Dataset | Status |
 |------|---------|--------|
-| `mcns-v0.11-export-specs.json` | Male CNS (mCNS) segmentation | Correct sharding params per scale |
+| `mcns-export-specs.json` | Male CNS (mCNS) segmentation | Correct sharding params per scale |
 | `mcns-v0.9-ng-specs-INCORRECT-bits.json` | Male CNS segmentation (v0.9) | **Incorrect** — shard_bits/minishard_bits/preshift_bits are identical across all scales instead of decreasing. Do not use for export. |
 | `mcns-v0.9-grayscale-ng-specs.json` | Male CNS grayscale (v0.9) | Grayscale (uint8) volume spec |
 | `run-all-scales.sh` | Male CNS | Correct sizing of Google Cloud Run tasks to process in hours |
@@ -16,7 +16,7 @@ These are dataset-specific run script and neuroglancer multiscale volume spec JS
 Point `NG_SPEC_PATH` in your `.env` to one of these files (or your own):
 
 ```bash
-NG_SPEC_PATH=examples/mcns-v0.11-export-specs.json
+NG_SPEC_PATH=examples/mcns-export-specs.json
 ```
 
 Or provide the path during `pixi run deploy` when prompted.

@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -136,7 +137,8 @@ def profile_shard(source_path: str, scale: int, shard_name: str) -> dict:
     # Count unique agglomerated labels per chunk (list contains duplicates
     # since multiple supervoxels map to the same agglomerated label).
     labels_col = table.column("labels").combine_chunks()
-    unique_labels = [len(set(labels_col[i].as_py())) for i in range(len(labels_col))]
+    per_chunk_label_sets = [set(labels_col[i].as_py()) for i in range(len(labels_col))]
+    unique_labels = [len(s) for s in per_chunk_label_sets]
 
     rows = list(zip(xs, ys, zs, label_lengths, sv_lengths, unique_labels))
     total_labels = sum(label_lengths)
@@ -144,8 +146,23 @@ def profile_shard(source_path: str, scale: int, shard_name: str) -> dict:
     total_unique_labels = sum(unique_labels)
     n = len(rows)
 
+    # Compute s1 predicted labels: group s0 chunks by s1 chunk coordinate
+    # (cx//2, cy//2, cz//2) and union their label sets.
+    s1_predicted_groups = defaultdict(set)  # (cx//2, cy//2, cz//2) -> label union
+    for i in range(n):
+        s1_coord = (xs[i] // 2, ys[i] // 2, zs[i] // 2)
+        s1_predicted_groups[s1_coord] |= per_chunk_label_sets[i]
+
+    # Build s1 prediction rows: (x, y, z, unique_labels, unique_labels, unique_labels)
+    # For predictions, num_labels = num_supervoxels = unique_labels.
+    s1_predicted_rows = [
+        (cx, cy, cz, len(labels), len(labels), len(labels))
+        for (cx, cy, cz), labels in sorted(s1_predicted_groups.items())
+    ]
+
     return {
         "rows": rows,
+        "s1_predicted_rows": s1_predicted_rows,
         "chunk_count": n,
         "arrow_bytes": arrow_bytes,
         "total_labels": total_labels,
@@ -171,6 +188,26 @@ def write_labels_csv(output_path: str, scale: int, shard_name: str,
         writer.writerow([x, y, z, nl, nsv, ul])
 
     csv_path = f"{output_path}/s{scale}/{shard_name}-labels.csv"
+    _write_string(csv_path, out.getvalue())
+    return csv_path
+
+
+def write_predicted_csv(output_path: str, source_scale: int,
+                        shard_name: str, target_scale: int, rows: list):
+    """Write a predicted labels CSV for the next scale.
+
+    File is written to source_path/s{source_scale}/<shard>-s{target_scale}-predicted.csv
+    with the same column format as -labels.csv.
+    """
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["x", "y", "z", "num_labels", "num_supervoxels",
+                     "unique_labels"])
+    for x, y, z, nl, nsv, ul in rows:
+        writer.writerow([x, y, z, nl, nsv, ul])
+
+    csv_path = (f"{output_path}/s{source_scale}/"
+                f"{shard_name}-s{target_scale}-predicted.csv")
     _write_string(csv_path, out.getvalue())
     return csv_path
 
@@ -202,6 +239,9 @@ def process_shards(source_path: str, output_path: str,
         result = profile_shard(source_path, scale, name)
         if "error" not in result:
             write_labels_csv(output_path, scale, name, result["rows"])
+            if result.get("s1_predicted_rows"):
+                write_predicted_csv(output_path, scale, name, scale + 1,
+                                    result["s1_predicted_rows"])
             print(f"  Done s{scale}/{name}: {result['chunk_count']} chunks, "
                   f"{result['arrow_bytes'] / 1e6:.0f} MB")
         return scale, name, result

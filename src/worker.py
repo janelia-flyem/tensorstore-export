@@ -10,20 +10,25 @@ Each worker processes shards one at a time until the time limit is reached.
 """
 
 import base64
+import csv
+import io
 import json
 import os
 import shutil
 import time
 import asyncio
+from collections import defaultdict
 from pathlib import Path
 from typing import Tuple, Dict, Any, List
 
+import numpy as np
 import structlog
 import tensorstore as ts
 from google.cloud import storage
 from pydantic import BaseModel
 
 from braid import ShardReader, LabelType
+from src.ng_sharding import shard_chunk_coords, load_ng_spec_from_dict
 
 logger = structlog.get_logger()
 
@@ -583,7 +588,7 @@ class ShardProcessor:
                          source_domain=str(source.domain),
                          dest_domain=str(dest.domain))
 
-            ts.copy(downsampled, dest).result()
+            dest.write(downsampled).result()
 
             logger.info("Downres complete", scale=scale)
             return True
@@ -592,6 +597,351 @@ class ShardProcessor:
             logger.error("Failed to downres scale",
                           scale=scale, error=str(e))
             return False
+
+    def _upload_label_csvs(self, scale: int, shard_number: int,
+                           actual_labels: dict):
+        """Upload actual label counts and next-scale predictions to source bucket.
+
+        Args:
+            scale: Current scale.
+            shard_number: NG shard number.
+            actual_labels: {(cx, cy, cz): set_of_labels} from read-back.
+        """
+        spec_params = load_ng_spec_from_dict(self.config.ng_spec)
+        scale_params = spec_params[scale]
+        shard_bits = scale_params["shard_bits"]
+        hex_digits = -(-shard_bits // 4)
+        shard_hex = f"{shard_number:0{hex_digits}x}"
+
+        # Actual labels CSV for this scale
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["x", "y", "z", "num_labels", "num_supervoxels",
+                         "unique_labels"])
+        for (cx, cy, cz) in sorted(actual_labels.keys()):
+            ul = len(actual_labels[(cx, cy, cz)])
+            writer.writerow([cx, cy, cz, ul, ul, ul])
+
+        blob_path = (f"{self._source_prefix}/s{scale}/"
+                     f"{shard_hex}-labels.csv")
+        blob = self.source_bucket_obj.blob(blob_path)
+        blob.upload_from_string(out.getvalue(), content_type="text/csv")
+        logger.info("Uploaded actual labels CSV",
+                     scale=scale, shard_hex=shard_hex,
+                     chunks=len(actual_labels))
+
+        # Next-scale predicted labels (unless last scale in spec)
+        max_scale = max(spec_params.keys())
+        if scale < max_scale:
+            child_groups = defaultdict(set)
+            for (cx, cy, cz), label_set in actual_labels.items():
+                child_coord = (cx // 2, cy // 2, cz // 2)
+                child_groups[child_coord] |= label_set
+
+            out = io.StringIO()
+            writer = csv.writer(out)
+            writer.writerow(["x", "y", "z", "num_labels",
+                             "num_supervoxels", "unique_labels"])
+            for (cx, cy, cz) in sorted(child_groups.keys()):
+                ul = len(child_groups[(cx, cy, cz)])
+                writer.writerow([cx, cy, cz, ul, ul, ul])
+
+            next_scale = scale + 1
+            blob_path = (f"{self._source_prefix}/s{scale}/"
+                         f"{shard_hex}-s{next_scale}-predicted.csv")
+            blob = self.source_bucket_obj.blob(blob_path)
+            blob.upload_from_string(out.getvalue(), content_type="text/csv")
+            logger.info("Uploaded predicted labels CSV",
+                         scale=scale, shard_hex=shard_hex,
+                         target_scale=next_scale,
+                         predicted_chunks=len(child_groups))
+
+    def downres_shard(self, scale: int, shard_bbox: dict) -> Tuple[bool, int]:
+        """Generate one output shard at `scale` by downsampling scale-1 from GCS.
+
+        1. Open source scale (N-1) from the dest bucket on GCS (read-only)
+        2. Create tmpfs staging dir with info file
+        3. Open local staging TensorStore (file driver)
+        4. local_dest[bbox].write(downsampled[bbox]).result()
+        5. Upload shard file(s) to GCS
+        6. Delete staging dir
+
+        Args:
+            scale: Scale level to generate (must be >= 1)
+            shard_bbox: Dict with shard_number, shard_origin, shard_extent,
+                        num_chunks from ng_sharding.shard_bbox()
+
+        Returns:
+            (success, uploaded_bytes) tuple
+        """
+        shard_number = shard_bbox["shard_number"]
+        x0, y0, z0 = shard_bbox["shard_origin"]
+        sx, sy, sz = shard_bbox["shard_extent"]
+        shard_start = time.time()
+
+        staging_dir = os.path.join(
+            self._staging_base, f"downres-s{scale}-{shard_number}"
+        )
+
+        try:
+            estimated_memory_gib = shard_bbox.get("estimated_memory_gib")
+            estimated_subtotal_gib = shard_bbox.get("estimated_subtotal_gib")
+            estimated_output_gib = shard_bbox.get("estimated_output_gib")
+            estimated_tmpfs_gib = shard_bbox.get("estimated_tmpfs_gib")
+            estimated_raw_batch_gib = shard_bbox.get("estimated_raw_batch_gib")
+            estimated_overhead_gib = shard_bbox.get("estimated_overhead_gib")
+            estimated_commit_spike_gib = shard_bbox.get(
+                "estimated_commit_spike_gib")
+            estimate_model = shard_bbox.get("estimate_model", "")
+            estimated_total_unique_labels = shard_bbox.get(
+                "estimated_total_unique_labels")
+
+            logger.info("Downres shard start",
+                        scale=scale, shard_number=shard_number,
+                        origin=(x0, y0, z0), extent=(sx, sy, sz),
+                        num_chunks=shard_bbox["num_chunks"],
+                        estimate_model=estimate_model,
+                        estimated_memory_gib=estimated_memory_gib,
+                        estimated_subtotal_gib=estimated_subtotal_gib,
+                        estimated_output_gib=estimated_output_gib,
+                        estimated_tmpfs_gib=estimated_tmpfs_gib,
+                        estimated_raw_batch_gib=estimated_raw_batch_gib,
+                        estimated_overhead_gib=estimated_overhead_gib,
+                        estimated_commit_spike_gib=estimated_commit_spike_gib,
+                        estimated_total_unique_labels=estimated_total_unique_labels)
+
+            # Reset cgroup peak for per-shard memory tracking
+            peak_reset_ok = _reset_cgroup_peak()
+            mem_at_start, mem_limit, _ = _read_cgroup_memory()
+            shard_peak_mem = mem_at_start
+            mem_limit_gib = mem_limit / (1 << 30) if mem_limit else 0
+
+            def _mem_gib():
+                m, _, _ = _read_cgroup_memory()
+                return m / (1 << 30) if m else 0
+
+            logger.info("Downres memory: baseline",
+                        scale=scale, shard_number=shard_number,
+                        memory_gib=round(_mem_gib(), 2),
+                        memory_limit_gib=round(mem_limit_gib, 2))
+
+            # Open source scale (N-1) from GCS with bounded cache
+            source_spec = {
+                "driver": "neuroglancer_precomputed",
+                "kvstore": self.config.dest_path,
+                "scale_index": scale - 1,
+                "open": True,
+                "context": {
+                    "cache_pool": {"total_bytes_limit": 256 * (1 << 20)},
+                },
+            }
+            source = ts.open(source_spec).result()
+            downsampled = ts.downsample(source, [2, 2, 2, 1], "mode")
+
+            logger.info("Downres memory: after open source",
+                        scale=scale, shard_number=shard_number,
+                        memory_gib=round(_mem_gib(), 2))
+
+            # Create staging dir and write info file
+            os.makedirs(staging_dir, exist_ok=True)
+            with open(os.path.join(staging_dir, "info"), "w") as f:
+                f.write(self._info_json)
+
+            # Open local staging volume.  Small cache helps RMW performance:
+            # each batch commit re-reads the shard file to merge new chunks,
+            # and the cache avoids redundant decode of the growing shard.
+            local_dest = ts.open({
+                "driver": "neuroglancer_precomputed",
+                "kvstore": {"driver": "file", "path": staging_dir},
+                "scale_index": scale,
+                "open": True,
+                "context": {
+                    "cache_pool": {"total_bytes_limit": 256 * (1 << 20)},
+                },
+            }).result()
+
+            # Write in batched transactions.  Between write() and commit(),
+            # TensorStore holds raw uint64 arrays (2 MiB per 64^3 chunk) in
+            # ChunkCache — cache_pool eviction does NOT apply to explicit
+            # transactions.  One Z-plane per batch.  After commit, arrays
+            # are encoded (compressed_segmentation + gzip) and flushed to
+            # the shard file on tmpfs via read-modify-write.
+            chunk_z = 64  # chunk size in Z voxels
+            batch_z_voxels = chunk_z  # one Z-plane per batch
+            num_batches = max(1, (sz + batch_z_voxels - 1) // batch_z_voxels)
+            batches_committed = 0
+
+            logger.info("Downres memory: before write",
+                        scale=scale, shard_number=shard_number,
+                        memory_gib=round(_mem_gib(), 2),
+                        num_batches=num_batches)
+
+            write_peak_mem = 0
+            for z_off in range(z0, z0 + sz, batch_z_voxels):
+                z_end = min(z_off + batch_z_voxels, z0 + sz)
+                txn = ts.Transaction()
+                local_dest.with_transaction(txn)[
+                    x0:x0+sx, y0:y0+sy, z_off:z_end, :
+                ].write(
+                    downsampled[x0:x0+sx, y0:y0+sy, z_off:z_end, :]
+                ).result()
+                txn.commit_async().result()
+                batches_committed += 1
+                mem_current, _, _ = _read_cgroup_memory()
+                shard_peak_mem = max(shard_peak_mem, mem_current)
+                write_peak_mem = max(write_peak_mem, mem_current)
+                # Log every batch so memory data survives OOM.
+                # Walk staging dir recursively — shard files are in
+                # subdirectories like <scale_key>/<hex>.shard.
+                batch_tmpfs = 0
+                for dirpath, _, filenames in os.walk(staging_dir):
+                    for fname in filenames:
+                        fpath = os.path.join(dirpath, fname)
+                        try:
+                            batch_tmpfs += os.path.getsize(fpath)
+                        except OSError:
+                            pass
+                logger.info("Downres write batch",
+                            scale=scale, shard_number=shard_number,
+                            batch=f"{batches_committed}/{num_batches}",
+                            z_range=f"{z_off}-{z_end}",
+                            memory_gib=round(mem_current / (1 << 30), 2),
+                            memory_limit_gib=round(mem_limit_gib, 2),
+                            tmpfs_mib=round(batch_tmpfs / (1 << 20), 1),
+                            num_chunks=shard_bbox["num_chunks"])
+
+            # Get tmpfs usage for the staging dir (recursive)
+            tmpfs_bytes = 0
+            for dirpath, _, filenames in os.walk(staging_dir):
+                for fname in filenames:
+                    try:
+                        tmpfs_bytes += os.path.getsize(
+                            os.path.join(dirpath, fname))
+                    except OSError:
+                        pass
+
+            logger.info("Downres memory: after write",
+                        scale=scale, shard_number=shard_number,
+                        memory_gib=round(_mem_gib(), 2),
+                        write_peak_gib=round(write_peak_mem / (1 << 30), 2),
+                        tmpfs_mib=round(tmpfs_bytes / (1 << 20), 1),
+                        batches=batches_committed,
+                        estimated_memory_gib=estimated_memory_gib,
+                        estimated_output_gib=estimated_output_gib,
+                        estimated_raw_batch_gib=estimated_raw_batch_gib,
+                        estimated_commit_spike_gib=estimated_commit_spike_gib)
+
+            # Read back chunks from tmpfs to count actual unique labels
+            # and compute next-scale predictions.
+            label_readback_start = time.time()
+            actual_labels = {}  # (cx, cy, cz) -> set of unique label values
+
+            if self.config.ng_spec:
+                spec_params = load_ng_spec_from_dict(self.config.ng_spec)
+                scale_params = spec_params.get(scale)
+                if scale_params:
+                    chunk_coords = shard_chunk_coords(shard_number, scale_params)
+                    chunk_size = scale_params["chunk_size"]
+
+                    # Open a read-only handle to the staged shard on tmpfs
+                    local_reader = ts.open({
+                        "driver": "neuroglancer_precomputed",
+                        "kvstore": {"driver": "file", "path": staging_dir},
+                        "scale_index": scale,
+                        "open": True,
+                    }).result()
+
+                    total_labels_stored = 0
+                    for cx, cy, cz in chunk_coords:
+                        vx0 = cx * chunk_size[0]
+                        vy0 = cy * chunk_size[1]
+                        vz0 = cz * chunk_size[2]
+                        vx1 = min(vx0 + chunk_size[0], scale_params["vol_size"][0])
+                        vy1 = min(vy0 + chunk_size[1], scale_params["vol_size"][1])
+                        vz1 = min(vz0 + chunk_size[2], scale_params["vol_size"][2])
+                        try:
+                            chunk = local_reader[
+                                vx0:vx1, vy0:vy1, vz0:vz1, :
+                            ].read().result()
+                            labels = set(np.unique(chunk).tolist())
+                            # Skip all-zero chunks (background only)
+                            if labels != {0}:
+                                actual_labels[(cx, cy, cz)] = labels
+                                total_labels_stored += len(labels)
+                        except Exception:
+                            pass  # skip chunks that fail to read
+
+                    label_readback_elapsed = time.time() - label_readback_start
+                    logger.info("Downres memory: after label readback",
+                                scale=scale, shard_number=shard_number,
+                                memory_gib=round(_mem_gib(), 2),
+                                chunks_read=len(actual_labels),
+                                total_labels_stored=total_labels_stored,
+                                elapsed_s=round(label_readback_elapsed, 2))
+
+            # Upload shard file(s) to GCS
+            upload_start = time.time()
+            uploaded_bytes = self.upload_staging_dir(staging_dir)
+            upload_elapsed = time.time() - upload_start
+
+            # Upload label CSVs to source bucket after shard upload
+            if actual_labels:
+                try:
+                    self._upload_label_csvs(
+                        scale, shard_number, actual_labels)
+                except Exception as e:
+                    logger.warning("Failed to upload label CSVs",
+                                   scale=scale, shard_number=shard_number,
+                                   error=str(e)[:200])
+
+            # Free label data before final memory measurement
+            del actual_labels
+
+            elapsed = time.time() - shard_start
+
+            # Memory reporting
+            mem_current, mem_limit, cgroup_peak = _read_cgroup_memory()
+            shard_peak_mem = max(shard_peak_mem, mem_current)
+            peak_gib = (cgroup_peak / (1 << 30) if peak_reset_ok and cgroup_peak
+                        else shard_peak_mem / (1 << 30))
+
+            logger.info("Downres shard complete",
+                        scale=scale, shard_number=shard_number,
+                        elapsed_s=round(elapsed, 1),
+                        upload_s=round(upload_elapsed, 1),
+                        uploaded_gib=round(uploaded_bytes / (1 << 30), 3),
+                        peak_memory_gib=round(peak_gib, 2),
+                        num_chunks=shard_bbox["num_chunks"],
+                        tmpfs_mib=round(tmpfs_bytes / (1 << 20), 1),
+                        batches=batches_committed,
+                        estimate_model=estimate_model,
+                        estimated_memory_gib=estimated_memory_gib,
+                        estimated_subtotal_gib=estimated_subtotal_gib,
+                        estimated_output_gib=estimated_output_gib,
+                        estimated_tmpfs_gib=estimated_tmpfs_gib,
+                        estimated_raw_batch_gib=estimated_raw_batch_gib,
+                        estimated_overhead_gib=estimated_overhead_gib,
+                        estimated_commit_spike_gib=estimated_commit_spike_gib,
+                        estimated_total_unique_labels=estimated_total_unique_labels,
+                        prediction_error_gib=(
+                            round(peak_gib - estimated_memory_gib, 2)
+                            if estimated_memory_gib is not None else None),
+                        prediction_ratio=(
+                            round(peak_gib / estimated_memory_gib, 3)
+                            if estimated_memory_gib else None))
+
+            return True, uploaded_bytes
+
+        except Exception as e:
+            logger.error("Failed to downres shard",
+                         scale=scale, shard_number=shard_number,
+                         error=str(e))
+            return False, 0
+
+        finally:
+            # Always clean up staging dir to free tmpfs
+            if os.path.isdir(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 class CloudRunWorker:
@@ -707,6 +1057,8 @@ class CloudRunWorker:
             shutil.rmtree(staging_dir, ignore_errors=True)
 
         # Phase 2: Generate downres scales from previous scale data
+        # (legacy path — only used when downres_scales is set directly,
+        # not in manifest-driven DOWNRES_MODE)
         for scale in sorted(self.config.downres_scales):
             if not self._should_continue():
                 logger.warning("Time limit reached, skipping downres", scale=scale)
@@ -721,6 +1073,99 @@ class CloudRunWorker:
                      elapsed_minutes=round(elapsed, 1),
                      processed=processed_count,
                      failed=failed_count)
+
+    async def run_downres(self):
+        """Run manifest-driven per-shard downres processing.
+
+        Loads a downres manifest (list of shard bboxes), iterates over
+        assigned output shards, calls downres_shard() for each.
+        """
+        mem_current, mem_limit, _ = _read_cgroup_memory()
+        mem_limit_gib = mem_limit / (1 << 30) if mem_limit > 0 else 0
+        logger.info("Starting downres worker",
+                     memory_limit_gib=round(mem_limit_gib, 2),
+                     memory_current_gib=round(mem_current / (1 << 30), 2) if mem_current else 0,
+                     worker_memory_gib=self.config.worker_memory_gib)
+
+        # Load downres manifest (raw dicts with shard_origin, shard_extent, etc.)
+        prefix = self.config.manifest_uri.rstrip("/")
+        task_uri = f"{prefix}/task-{self.processor._task_index}.json"
+        bucket_name, blob_path = _parse_gs_uri(task_uri)
+        blob = self.processor.storage_client.bucket(bucket_name).blob(blob_path)
+        entries = json.loads(blob.download_as_text())
+
+        logger.info("Loaded downres manifest",
+                     manifest_uri=task_uri,
+                     assigned_shards=len(entries))
+
+        processed_count = 0
+        failed_count = 0
+        total_uploaded = 0
+
+        for entry in entries:
+            if not self._should_continue():
+                logger.warning("Time limit reached, stopping downres",
+                               processed=processed_count,
+                               remaining=len(entries) - processed_count - failed_count)
+                break
+
+            # Check memory headroom
+            mem_current, mem_limit, _ = _read_cgroup_memory()
+            if mem_limit > 0 and mem_current > 0:
+                usage_pct = mem_current / mem_limit
+                if usage_pct > 0.90:
+                    logger.error("Memory critical before downres shard",
+                                 scale=entry["scale"],
+                                 shard_number=entry["shard_number"],
+                                 memory_gib=round(mem_current / (1 << 30), 2),
+                                 usage_pct=round(usage_pct * 100, 1))
+                elif usage_pct > 0.75:
+                    logger.warning("Memory pressure before downres shard",
+                                   scale=entry["scale"],
+                                   shard_number=entry["shard_number"],
+                                   memory_gib=round(mem_current / (1 << 30), 2),
+                                   usage_pct=round(usage_pct * 100, 1))
+
+            shard_bbox = {
+                "shard_number": entry["shard_number"],
+                "shard_origin": entry["shard_origin"],
+                "shard_extent": entry["shard_extent"],
+                "num_chunks": entry["num_chunks"],
+                "estimate_model": entry.get("estimate_model"),
+                "estimated_memory_gib": entry.get("estimated_memory_gib"),
+                "estimated_subtotal_gib": entry.get("estimated_subtotal_gib"),
+                "estimated_output_gib": entry.get("estimated_output_gib"),
+                "estimated_tmpfs_gib": entry.get("estimated_tmpfs_gib"),
+                "estimated_raw_batch_gib": entry.get("estimated_raw_batch_gib"),
+                "estimated_overhead_gib": entry.get("estimated_overhead_gib"),
+                "estimated_source_cache_gib": entry.get(
+                    "estimated_source_cache_gib"),
+                "estimated_dest_cache_gib": entry.get(
+                    "estimated_dest_cache_gib"),
+                "estimated_runtime_gib": entry.get("estimated_runtime_gib"),
+                "estimated_label_readback_gib": entry.get(
+                    "estimated_label_readback_gib"),
+                "estimated_commit_spike_gib": entry.get(
+                    "estimated_commit_spike_gib"),
+                "estimated_total_unique_labels": entry.get(
+                    "estimated_total_unique_labels"),
+            }
+
+            success, uploaded_bytes = self.processor.downres_shard(
+                entry["scale"], shard_bbox
+            )
+            if success:
+                processed_count += 1
+                total_uploaded += uploaded_bytes
+            else:
+                failed_count += 1
+
+        elapsed = (time.time() - self.start_time) / 60
+        logger.info("Downres worker finished",
+                     elapsed_minutes=round(elapsed, 1),
+                     processed=processed_count,
+                     failed=failed_count,
+                     total_uploaded_gib=round(total_uploaded / (1 << 30), 3))
 
 
 def create_config_from_env() -> WorkerConfig:
@@ -776,7 +1221,10 @@ async def main():
     try:
         config = create_config_from_env()
         worker = CloudRunWorker(config)
-        await worker.run()
+        if os.environ.get("DOWNRES_MODE") == "1":
+            await worker.run_downres()
+        else:
+            await worker.run()
     except Exception as e:
         logger.error("Worker failed to start", error=str(e))
         raise

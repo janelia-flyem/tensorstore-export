@@ -76,7 +76,7 @@ Pure Python (with optional C extension) for reading DVID Arrow shard files:
 
 ## Configuration
 
-All configuration lives in `.env` (not committed; see `.env.example` for the template). Key variables:
+All configuration lives in `.env` (not committed; see `.env.example` for the template). **Always check `.env` first** to find the active dataset paths (SOURCE_PATH, DEST_PATH, etc.) rather than guessing or searching for them. Key variables:
 
 | Variable | Description |
 |----------|-------------|
