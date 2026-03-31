@@ -13,6 +13,8 @@ Usage:
 
 import argparse
 import csv
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -25,6 +27,78 @@ from scripts.export_status import (
     _is_downres_job,
     _normalize_downres_payload,
 )
+
+
+def _query_downres_completion_entries(base_name: str,
+                                      project: str,
+                                      limit: int) -> list:
+    """Query downres completion log entries directly from Cloud Logging.
+
+    This is used as a fallback when the Cloud Run jobs have been deleted and
+    can no longer be discovered via `gcloud run jobs list`.
+    """
+    query = (
+        'resource.type="cloud_run_job" AND '
+        f'resource.labels.job_name:"{base_name}-downres-" AND '
+        'textPayload:"Downres shard complete"'
+    )
+    result = subprocess.run(
+        [
+            "gcloud", "logging", "read", query,
+            f"--project={project}",
+            f"--limit={limit}",
+            "--format=json",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
+def _load_rows_from_completion_entries(entries: list) -> list:
+    """Convert raw Cloud Logging entries into normalized CSV rows.
+
+    Keeps only the latest execution for each downres job name, based on the
+    most recent completion-event timestamp observed in the logs.
+    """
+    latest_execution_by_job = {}
+    for entry in entries:
+        job_name = entry.get("resource", {}).get("labels", {}).get("job_name", "")
+        execution = entry.get("labels", {}).get("run.googleapis.com/execution_name", "")
+        timestamp = entry.get("timestamp", "")
+        if not job_name or not execution:
+            continue
+        prev = latest_execution_by_job.get(job_name)
+        if prev is None or timestamp > prev[0]:
+            latest_execution_by_job[job_name] = (timestamp, execution)
+
+    rows = []
+    for entry in entries:
+        job_name = entry.get("resource", {}).get("labels", {}).get("job_name", "")
+        execution = entry.get("labels", {}).get("run.googleapis.com/execution_name", "")
+        latest = latest_execution_by_job.get(job_name)
+        if not latest or execution != latest[1]:
+            continue
+        text = entry.get("textPayload", "")
+        idx = text.find("{")
+        if idx == -1:
+            continue
+        try:
+            payload = json.loads(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        payload = _normalize_downres_payload(payload)
+        payload["job_name"] = job_name
+        payload["execution"] = execution
+        label = job_name.split("-downres-", 1)[-1] if "-downres-" in job_name else job_name
+        payload["job_label"] = f"downres-{label}"
+        rows.append(payload)
+
+    return rows
 
 
 def main():
@@ -53,25 +127,28 @@ def main():
     jobs = discover_jobs(base_name, project, region)
     downres_jobs = [(label, job_name) for label, job_name in jobs
                     if _is_downres_job(label)]
-    if not downres_jobs:
-        print(f"No downres jobs found matching {base_name}-*")
-        sys.exit(1)
 
     rows = []
-    for label, job_name in downres_jobs:
-        execution = get_latest_execution(job_name, project, region)
-        if not execution:
-            continue
-        events = _query_log_events(
-            job_name, project, region,
-            "Downres shard complete", execution, limit=args.limit,
-        )
-        for payload in events:
-            payload = _normalize_downres_payload(payload)
-            payload["job_label"] = label
-            payload["job_name"] = job_name
-            payload["execution"] = execution
-            rows.append(payload)
+    if downres_jobs:
+        for label, job_name in downres_jobs:
+            execution = get_latest_execution(job_name, project, region)
+            if not execution:
+                continue
+            events = _query_log_events(
+                job_name, project, region,
+                "Downres shard complete", execution, limit=args.limit,
+            )
+            for payload in events:
+                payload = _normalize_downres_payload(payload)
+                payload["job_label"] = label
+                payload["job_name"] = job_name
+                payload["execution"] = execution
+                rows.append(payload)
+    else:
+        print(f"No live downres jobs found matching {base_name}-*; "
+              "falling back to Cloud Logging.")
+        entries = _query_downres_completion_entries(base_name, project, args.limit)
+        rows = _load_rows_from_completion_entries(entries)
 
     if not rows:
         print("No downres completion events found.")
