@@ -79,6 +79,51 @@ def _fail_downres(scale: int | None, message: str,
     sys.exit(1)
 
 
+def _wait_for_downres_scale_jobs(job_names: list[str],
+                                 project: str,
+                                 region: str,
+                                 scale: int) -> tuple[bool, str]:
+    """Wait for all tier jobs in a scale to finish.
+
+    Returns (ok, message). ok is False if any tier reports failed tasks or
+    a failed execution status.
+    """
+    from scripts.export_status import get_execution_info
+
+    while True:
+        all_done = True
+        any_failed = False
+        parts = []
+        for job_name in job_names:
+            info = get_execution_info(job_name, project, region)
+            if not info:
+                all_done = False
+                parts.append(f"{job_name}: no execution info yet")
+                continue
+
+            status = info.get("status", "Unknown")
+            succeeded = info.get("succeeded", 0)
+            failed = info.get("failed", 0)
+            running = info.get("running", 0)
+            tasks = info.get("tasks", 0)
+            label = job_name.rsplit("-", 2)[-2] + "-" + job_name.rsplit("-", 1)[-1]
+            parts.append(f"{label} {succeeded}+{failed}err+{running}run/{tasks}")
+
+            if failed > 0 or status == "Failed":
+                any_failed = True
+            if status not in ("Completed", "Failed"):
+                all_done = False
+
+        print(f"  Waiting for s{scale}: " + ", ".join(parts))
+
+        if any_failed:
+            return False, f"One or more s{scale} tier jobs reported failed tasks."
+        if all_done:
+            return True, ""
+
+        time.sleep(30)
+
+
 def _remove_zero_shards(all_files: list, env: dict, source_path: str) -> list:
     """Filter out empty shards by running a Cloud Run job to check Arrow metadata.
 
@@ -589,6 +634,7 @@ def main():
 
                 print(f"\nLaunching downres jobs for scale {target_scale}...")
                 launch_failed = False
+                launched_jobs = []
                 for gib in sorted(tier_info.keys()):
                     manifest_uri, num_tasks = tier_info[gib]
                     cpu = TIER_CPU.get(gib, 2)
@@ -605,9 +651,10 @@ def main():
                         launch_failed = True
                         continue
 
-                    ok = _execute_job(job_name, project, region, num_tasks, True)
+                    ok = _execute_job(job_name, project, region, num_tasks, False)
                     if ok:
                         print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
+                        launched_jobs.append(job_name)
                     else:
                         print(f"  {job_name}: FAILED to execute")
                         launch_failed = True
@@ -616,6 +663,17 @@ def main():
                     _fail_downres(
                         target_scale,
                         f"Downres launch or execution failed for s{target_scale}.",
+                        scale_timings,
+                        pipeline_start,
+                    )
+
+                print(f"\nWaiting for all s{target_scale} tier jobs to finish...")
+                ok, message = _wait_for_downres_scale_jobs(
+                    launched_jobs, project, region, target_scale)
+                if not ok:
+                    _fail_downres(
+                        target_scale,
+                        message,
                         scale_timings,
                         pipeline_start,
                     )
