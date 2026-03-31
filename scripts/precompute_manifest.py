@@ -136,17 +136,44 @@ DOWNRES_SOURCE_CACHE_GIB = 0.25
 DOWNRES_DEST_CACHE_GIB = 0.25
 DOWNRES_RUNTIME_GIB = 0.5
 DOWNRES_LABEL_READBACK_GIB = 0.5
+# For s4+, the dominant missing term is not a write spike; it is the large
+# in-memory actual_labels structure after readback.  The label summary stores
+# the same per-shard total later logged by the worker as total_labels_stored,
+# so use it to scale the readback estimate directly.
+DOWNRES_LABEL_READBACK_BYTES_PER_LABEL = 80
+DOWNRES_DYNAMIC_LABEL_READBACK_SCALE = 4
 # The failed downres tasks were killed after logging RSS well below the tier
 # boundary, which implies a short-lived write/commit spike not captured by the
-# post-commit memory samples. Model that spike as a slowly increasing floor by
-# scale. This preserves the observed s1/s2 calibration while giving later
-# scales additional headroom until we have direct telemetry for them.
-DOWNRES_COMMIT_SPIKE_BASE_GIB = 0.5
+# post-commit memory samples. Keep explicit scale floors so later scales can be
+# pushed into larger tiers without forcing an excessively steep linear ramp.
+DOWNRES_COMMIT_SPIKE_GIB_BY_SCALE = {
+    1: 0.5,
+    2: 1.0,
+    3: 1.5,
+    4: 2.0,
+}
+DOWNRES_DEFAULT_COMMIT_SPIKE_GIB = 2.0
 
 
 def downres_commit_spike_gib(scale: int) -> float:
     """Return the scale-aware hidden commit/write spike term in GiB."""
-    return DOWNRES_COMMIT_SPIKE_BASE_GIB * max(1, scale)
+    return DOWNRES_COMMIT_SPIKE_GIB_BY_SCALE.get(
+        scale, DOWNRES_DEFAULT_COMMIT_SPIKE_GIB)
+
+
+def downres_label_readback_gib(scale: int,
+                               total_unique_labels: int | None) -> float:
+    """Estimate the post-readback label structure footprint in GiB."""
+    if (scale < DOWNRES_DYNAMIC_LABEL_READBACK_SCALE or
+            total_unique_labels is None):
+        return DOWNRES_LABEL_READBACK_GIB
+
+    dynamic_gib = (
+        total_unique_labels * DOWNRES_LABEL_READBACK_BYTES_PER_LABEL
+    ) / (1 << 30)
+    return max(DOWNRES_LABEL_READBACK_GIB, dynamic_gib)
+
+
 DOWNRES_OVERHEAD_GIB = (
     DOWNRES_SOURCE_CACHE_GIB +
     DOWNRES_DEST_CACHE_GIB +
@@ -276,14 +303,25 @@ def estimate_downres_components(scale: int, chunk_count: int,
         model = "chunk_count"
 
     raw_batch_gib = estimate_downres_raw_batch_gib(chunk_count)
+    label_readback_gib = downres_label_readback_gib(
+        scale, total_unique_labels)
     commit_spike_gib = downres_commit_spike_gib(scale)
     subtotal_gib = (
         raw_batch_gib +
         2 * output_gib +
-        DOWNRES_OVERHEAD_GIB +
+        DOWNRES_SOURCE_CACHE_GIB +
+        DOWNRES_DEST_CACHE_GIB +
+        DOWNRES_RUNTIME_GIB +
+        label_readback_gib +
         commit_spike_gib
     )
     total_gib = subtotal_gib * DOWNRES_SAFETY_FACTOR
+    overhead_gib = (
+        DOWNRES_SOURCE_CACHE_GIB +
+        DOWNRES_DEST_CACHE_GIB +
+        DOWNRES_RUNTIME_GIB +
+        label_readback_gib
+    )
     return {
         "estimate_model": model,
         "chunk_count": chunk_count,
@@ -295,9 +333,9 @@ def estimate_downres_components(scale: int, chunk_count: int,
         "source_cache_gib": DOWNRES_SOURCE_CACHE_GIB,
         "dest_cache_gib": DOWNRES_DEST_CACHE_GIB,
         "runtime_gib": DOWNRES_RUNTIME_GIB,
-        "label_readback_gib": DOWNRES_LABEL_READBACK_GIB,
+        "label_readback_gib": label_readback_gib,
         "commit_spike_gib": commit_spike_gib,
-        "overhead_gib": DOWNRES_OVERHEAD_GIB,
+        "overhead_gib": overhead_gib,
         "subtotal_gib": subtotal_gib,
         "safety_factor": DOWNRES_SAFETY_FACTOR,
         "total_gib": total_gib,

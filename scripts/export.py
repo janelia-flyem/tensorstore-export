@@ -82,7 +82,9 @@ def _fail_downres(scale: int | None, message: str,
 def _wait_for_downres_scale_jobs(job_names: list[str],
                                  project: str,
                                  region: str,
-                                 scale: int) -> tuple[bool, str]:
+                                 scale: int,
+                                 total_start: float,
+                                 scale_start: float) -> tuple[bool, str]:
     """Wait for all tier jobs in a scale to finish.
 
     Returns (ok, message). ok is False if any tier reports failed tasks or
@@ -114,7 +116,11 @@ def _wait_for_downres_scale_jobs(job_names: list[str],
             if status not in ("Completed", "Failed"):
                 all_done = False
 
-        print(f"  Waiting for s{scale}: " + ", ".join(parts))
+        total_elapsed = _format_elapsed(time.monotonic() - total_start)
+        scale_elapsed = _format_elapsed(time.monotonic() - scale_start)
+        print(f"  Waiting for s{scale} "
+              f"(total {total_elapsed}, scale {scale_elapsed}): "
+              + ", ".join(parts))
 
         if any_failed:
             return False, f"One or more s{scale} tier jobs reported failed tasks."
@@ -669,7 +675,8 @@ def main():
 
                 print(f"\nWaiting for all s{target_scale} tier jobs to finish...")
                 ok, message = _wait_for_downres_scale_jobs(
-                    launched_jobs, project, region, target_scale)
+                    launched_jobs, project, region, target_scale,
+                    pipeline_start, scale_start)
                 if not ok:
                     _fail_downres(
                         target_scale,
