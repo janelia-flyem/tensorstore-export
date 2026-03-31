@@ -136,15 +136,17 @@ DOWNRES_SOURCE_CACHE_GIB = 0.25
 DOWNRES_DEST_CACHE_GIB = 0.25
 DOWNRES_RUNTIME_GIB = 0.5
 DOWNRES_LABEL_READBACK_GIB = 0.5
-# The failed s2 4Gi tasks were killed after logging only ~3.0-3.3 GiB RSS,
-# which implies a short-lived write/commit spike that is not captured by the
-# post-commit memory samples. Keep this scale-aware so s1 and s2+ can be
-# calibrated independently from production logs.
-DOWNRES_COMMIT_SPIKE_GIB_BY_SCALE = {
-    1: 0.5,
-    2: 1.0,
-}
-DOWNRES_DEFAULT_COMMIT_SPIKE_GIB = 1.0
+# The failed downres tasks were killed after logging RSS well below the tier
+# boundary, which implies a short-lived write/commit spike not captured by the
+# post-commit memory samples. Model that spike as a slowly increasing floor by
+# scale. This preserves the observed s1/s2 calibration while giving later
+# scales additional headroom until we have direct telemetry for them.
+DOWNRES_COMMIT_SPIKE_BASE_GIB = 0.5
+
+
+def downres_commit_spike_gib(scale: int) -> float:
+    """Return the scale-aware hidden commit/write spike term in GiB."""
+    return DOWNRES_COMMIT_SPIKE_BASE_GIB * max(1, scale)
 DOWNRES_OVERHEAD_GIB = (
     DOWNRES_SOURCE_CACHE_GIB +
     DOWNRES_DEST_CACHE_GIB +
@@ -274,8 +276,7 @@ def estimate_downres_components(scale: int, chunk_count: int,
         model = "chunk_count"
 
     raw_batch_gib = estimate_downres_raw_batch_gib(chunk_count)
-    commit_spike_gib = DOWNRES_COMMIT_SPIKE_GIB_BY_SCALE.get(
-        scale, DOWNRES_DEFAULT_COMMIT_SPIKE_GIB)
+    commit_spike_gib = downres_commit_spike_gib(scale)
     subtotal_gib = (
         raw_batch_gib +
         2 * output_gib +
