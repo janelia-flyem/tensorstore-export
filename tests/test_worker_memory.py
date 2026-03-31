@@ -362,7 +362,7 @@ class TestDvidToNgShardNumber:
     def test_mcns_scale0_known_mapping(self):
         """Verified against GCS: shard 10240_40960_43008 -> 061c5.shard."""
         spec_path = str(Path(__file__).parent.parent / "examples" /
-                        "mcns-v0.11-export-specs.json")
+                        "mcns-export-specs.json")
         scale_info = load_ng_spec(spec_path)
         s0 = scale_info[0]
 
@@ -378,7 +378,7 @@ class TestDvidToNgShardNumber:
     def test_origin_shard(self):
         """Origin (0,0,0) should map to shard 0."""
         spec_path = str(Path(__file__).parent.parent / "examples" /
-                        "mcns-v0.11-export-specs.json")
+                        "mcns-export-specs.json")
         scale_info = load_ng_spec(spec_path)
         s0 = scale_info[0]
 
@@ -392,7 +392,7 @@ class TestLoadNgSpec:
     @pytest.fixture
     def spec_path(self):
         return str(Path(__file__).parent.parent / "examples" /
-                   "mcns-v0.11-export-specs.json")
+                   "mcns-export-specs.json")
 
     def test_load_ng_spec_has_10_scales(self, spec_path):
         spec = load_ng_spec(spec_path)
@@ -517,7 +517,7 @@ class TestGetShardChunkHierarchy:
     def test_mcns_scale0_shard_shape(self):
         """mCNS v0.11 scale 0: shard shape should be [32, 32, 32] chunks."""
         spec_path = str(Path(__file__).parent.parent / "examples" /
-                        "mcns-v0.11-export-specs.json")
+                        "mcns-export-specs.json")
         spec = load_ng_spec(spec_path)
         h = get_shard_chunk_hierarchy(spec[0])
         assert h["shard_shape_in_chunks"] == [32, 32, 32]
@@ -525,7 +525,7 @@ class TestGetShardChunkHierarchy:
     def test_mcns_scale0_minishard_shape(self):
         """mCNS v0.11 scale 0: minishard shape should be [8, 8, 8] chunks."""
         spec_path = str(Path(__file__).parent.parent / "examples" /
-                        "mcns-v0.11-export-specs.json")
+                        "mcns-export-specs.json")
         spec = load_ng_spec(spec_path)
         h = get_shard_chunk_hierarchy(spec[0])
         assert h["minishard_shape_in_chunks"] == [8, 8, 8]
@@ -538,7 +538,7 @@ class TestGetShardChunkHierarchy:
         correct spatial coverage.
         """
         spec_path = str(Path(__file__).parent.parent / "examples" /
-                        "mcns-v0.11-export-specs.json")
+                        "mcns-export-specs.json")
         spec = load_ng_spec(spec_path)
         for i, params in spec.items():
             h = get_shard_chunk_hierarchy(params)
@@ -595,7 +595,7 @@ class TestShardOriginAndBbox:
     def test_mcns_shard0_bbox(self):
         """mCNS v0.11 scale 0 shard 0: origin at (0,0,0), extent = 32*64 = 2048."""
         spec_path = str(Path(__file__).parent.parent / "examples" /
-                        "mcns-v0.11-export-specs.json")
+                        "mcns-export-specs.json")
         spec = load_ng_spec(spec_path)
         bb = shard_bbox(0, spec[0])
         assert bb["shard_origin"] == [0, 0, 0]
@@ -609,7 +609,7 @@ class TestParentShardsToChildShards:
     @pytest.fixture
     def spec(self):
         spec_path = str(Path(__file__).parent.parent / "examples" /
-                        "mcns-v0.11-export-specs.json")
+                        "mcns-export-specs.json")
         return load_ng_spec(spec_path)
 
     def test_single_parent_produces_children(self, spec):

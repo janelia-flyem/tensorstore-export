@@ -288,7 +288,7 @@ All settings live in `.env` (not committed). See `.env.example` for the full lis
 |----------|-------------|---------|
 | `SOURCE_PATH` | GCS URI to DVID shard export (contains s0/, s1/, ...) | `gs://mybucket/exports/seg` |
 | `DEST_PATH` | GCS URI for neuroglancer precomputed output | `gs://mybucket/v1.0/precomputed` |
-| `NG_SPEC_PATH` | Neuroglancer volume spec JSON (same as DVID export-shards) | `mcns-v0.11-export-specs.json` |
+| `NG_SPEC_PATH` | Neuroglancer volume spec JSON (same as DVID export-shards) | `mcns-export-specs.json` |
 | `BASE_JOB_NAME` | Cloud Run job name prefix (tier jobs: `{name}-tier-4gi`, ...) | `tensorstore-dvid-export` |
 | `SCALES` | Source scales with DVID Arrow shards | `0` |
 | `DOWNRES_SCALES` | Scales to generate by downsampling (optional) | `1,2,3,4,5,6,7,8,9` |
@@ -396,7 +396,7 @@ tensorstore-export/
 │   ├── tests/                      # Tests including ground truth verification
 │   └── docs/ARCHITECTURE.md        # I/O design decisions
 ├── examples/
-│   └── mcns-v0.11-export-specs.json # mCNS neuroglancer volume spec
+│   └── mcns-export-specs.json       # mCNS neuroglancer volume spec
 └── docs/
     ├── mCNS-ExportAnalysis.md      # Export data analysis + production results
     ├── PrecomputeShardOffsets.md    # Two-phase memory separation design

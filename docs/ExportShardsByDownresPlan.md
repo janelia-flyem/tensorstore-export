@@ -209,7 +209,7 @@ position in the volume. The manifest generator computes per-shard estimates.
 ## Verification
 
 1. **Unit test — shard shape**: Test `get_shard_shape_in_chunks()` against known
-   mCNS v0.11 spec values (`examples/mcns-v0.11-export-specs.json`)
+   mCNS v0.11 spec values (`examples/mcns-export-specs.json`)
 
 2. **Unit test — shard derivation chain**: Test `parent_shards_to_child_shards()`
    with the mCNS spec. Given the list of s0 shard files (from DVID export),
