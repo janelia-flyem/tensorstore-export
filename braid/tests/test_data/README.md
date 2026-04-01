@@ -85,6 +85,19 @@ These files were copied from a real mCNS `export-shards` run and test the full c
 
 The shard origin `(30720, 24576, 28672)` is in voxel coordinates at scale 1. Each shard covers a 2048-voxel cube, so chunk coordinates fall in `[origin/64, (origin+2048)/64)` per dimension. This is a sparse edge shard from the boundary of the brain volume, containing a mix of empty (label 0) and labeled regions.
 
+### Alternate CSV index files
+
+| File | Format | Purpose |
+|------|--------|---------|
+| `30720_24576_28672-offsets.csv` | Transitional (`x,y,z,rec,offset,size` + `# schema_size=688`) | Legacy format with byte offsets added; `rec` column instead of `batch_idx` |
+| `30720_24576_28672-newformat.csv` | New format (`x,y,z,offset,size,batch_idx` + `# schema_size=688`) | New-format index required by `ShardRangeReader`; `batch_idx` replaces `rec` |
+
+These files index the same 258 chunks as `30720_24576_28672.csv` but include
+byte offsets into the Arrow IPC stream, enabling `ShardRangeReader`'s
+byte-range access. The `-offsets.csv` is a transitional format (superset of
+old columns); `-newformat.csv` is the canonical new format that `_parse_csv_index`
+auto-detects.
+
 The test `test_go_produced_shard.py` verifies:
 - Arrow schema compatibility between Go writer and Python reader
 - CSV index coordinates match Arrow record fields

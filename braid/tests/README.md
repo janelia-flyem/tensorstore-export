@@ -82,7 +82,7 @@ def test_chunk_not_found()              # Error handling
 def test_chunk_info()                   # Metadata extraction
 ```
 
-#### `test_reader.py` - ShardReader (Existing)
+#### `test_reader.py` - ShardReader
 **Purpose**: Tests the Arrow/CSV file reading and indexing functionality
 
 **Coverage**:
@@ -90,6 +90,125 @@ def test_chunk_info()                   # Metadata extraction
 - CSV index parsing and coordinate mapping
 - Schema validation and error handling
 - Chunk existence checking and metadata extraction
+- Label type selection (LABELS vs SUPERVOXELS)
+
+**Key Test Cases**:
+```python
+def test_reader_initialization()          # File loading and schema check
+def test_read_chunk_with_labels()         # Agglomerated label mapping
+def test_read_chunk_with_supervoxels()    # Raw supervoxel output
+def test_read_chunk_raw()                 # Raw data without decompression
+```
+
+#### `test_e2e_precomputed.py` - End-to-End Precomputed Roundtrip
+**Purpose**: Tests the full pipeline from DVID shard to neuroglancer precomputed volume and back
+
+**Coverage**:
+- Creates synthetic DVID shard files with known label patterns
+- Writes to neuroglancer precomputed volume via TensorStore
+- Reads back and verifies voxel-level correctness
+- Tests both supervoxel and agglomerated label modes
+- Verifies multi-chunk volume integrity
+
+**Key Test Cases**:
+```python
+def test_solid_block_supervoxels()            # Single-label block roundtrip
+def test_two_label_block_labels()             # Agglomerated mapping roundtrip
+def test_full_volume_integrity()              # All chunks correct after write
+def test_agglomerated_labels_roundtrip()      # Label mapping preserved
+```
+
+#### `test_real_data.py` - Ground Truth Verification
+**Purpose**: Verifies bit-identical output to Go's `MakeLabelVolume()` using real DVID test data
+
+**Coverage**:
+- Loads compressed blocks and raw volumes from `test_data/`
+- Voxel-exact comparison against Go decompressor output
+- Tests FIB-19 and CX datasets
+- Validates block header parsing and label extraction
+
+**Key Test Cases**:
+```python
+def test_fib19_sample1_voxel_exact()    # 262,144 voxels match Go output
+def test_fib19_sample1_label_set()      # Correct unique labels extracted
+def test_fib19_block_header()           # Block header fields parsed correctly
+def test_corner_voxels()                # Spot-check boundary voxels
+```
+
+#### `test_bench_decompressor.py` - C Extension Benchmarks
+**Purpose**: Measures C vs Python decompressor performance and verifies parity
+
+**Coverage**:
+- Single-chunk micro-benchmarks (C and Python)
+- Full-shard macro-benchmark (258 chunks)
+- Voxel-exact C vs Python comparison
+- C extension loading verification
+
+**Key Test Cases**:
+```python
+def test_c_extension_loaded()          # C library available
+def test_single_chunk_c()              # C decompression timing
+def test_single_chunk_python()         # Python reference timing
+def test_c_vs_python_match()           # Voxel-exact parity
+def test_shard_c()                     # Full shard throughput
+def test_speedup_assertion()           # C at least 100x faster
+```
+
+#### `test_cseg_encode.py` - Compressed Segmentation Encoder
+**Purpose**: Verifies BRAID's C encoder against TensorStore's reference implementation
+
+**Coverage**:
+- Byte-exact match against TensorStore C++ test vectors
+- TensorStore decode roundtrip at every encoding bit width (0–16 bits)
+- Fused DVID-to-cseg pipeline with real test data
+- Label mapping (supervoxel → agglomerated) in C
+- Gzip output compression
+- Table deduplication
+
+**Key Test Cases**:
+```python
+def test_solid_roundtrip()                 # 0-bit encoding
+def test_many_labels_roundtrip()           # Multi-label TensorStore roundtrip
+def test_all_chunks_in_real_shard()        # 258 chunks from mCNS shard
+def test_fib19_fused_roundtrip()           # Full DVID→cseg pipeline
+def test_label_mapping()                   # Supervoxel→agglomerated in C
+```
+
+#### `test_range_reader.py` - ShardRangeReader
+**Purpose**: Verifies ShardRangeReader produces identical output to ShardReader
+
+**Coverage**:
+- Chunk-by-chunk parity with full-load ShardReader
+- Byte-range read mechanics and batch caching
+- New-format CSV index parsing
+- Both label types (LABELS and SUPERVOXELS)
+
+**Key Test Cases**:
+```python
+def test_all_chunks_labels()             # Full parity, agglomerated labels
+def test_all_chunks_supervoxels()        # Full parity, supervoxel labels
+def test_read_chunk_raw_parity()         # Raw data matches
+def test_batch_size_gt1_cache_reuse()    # Batch cache reduces fetches
+```
+
+#### `test_go_produced_shard.py` - Go→Python Cross-Language Compatibility
+**Purpose**: Tests reading Arrow IPC shards written by DVID's Go `export-shards` command
+
+**Coverage**:
+- Arrow schema compatibility between Go writer and Python reader
+- CSV index coordinates match Arrow record fields
+- All 258 chunks decompress to 64×64×64 uint64 arrays
+- Supervoxel values are subsets of each chunk's supervoxel list
+- Agglomerated label mapping produces valid values
+
+**Key Test Cases**:
+```python
+def test_reader_opens()                      # Go-written Arrow file loads
+def test_schema_fields()                     # Schema matches EXPECTED_SCHEMA
+def test_labels_supervoxels_equal_length()   # Mapping arrays aligned
+def test_supervoxels_match_label_list()      # Voxel values ⊆ supervoxel list
+def test_label_mapping()                     # Agglomerated labels from mapping
+```
 
 ### Test Data and Fixtures
 
@@ -110,41 +229,36 @@ The test suite integrates with real DVID test data when available:
 
 ## Running Tests
 
-### Run All Tests
+The test suite has 112 tests across 10 test modules.
+
+### Primary: pixi tasks (from tensorstore-export root)
 ```bash
-cd braid
-python run_tests.py
+pixi run test-braid    # unit + integration tests
+pixi run test-bench    # C vs Python benchmarks
+pixi run test-e2e      # end-to-end precomputed roundtrip
+pixi run test-all      # everything (112 tests)
 ```
 
-### Run Specific Test Modules
+### Direct pytest (from braid/ directory)
 ```bash
-python run_tests.py decompressor        # Core decompression tests
-python run_tests.py compression_layers  # Two-layer compression tests
-python run_tests.py integration         # Full pipeline tests
-python run_tests.py reader              # ShardReader tests
-```
-
-### Using pytest (if available)
-```bash
-cd braid
-pytest tests/                           # Run all tests
-pytest tests/test_decompressor.py       # Run specific test file
+pytest tests/                           # All tests
+pytest tests/test_decompressor.py       # Specific module
 pytest tests/ -v                        # Verbose output
 pytest tests/ --cov=braid               # With coverage report
 ```
 
-### Using unittest directly
+### Legacy runner
 ```bash
 cd braid
-python -m unittest tests.test_decompressor        # Specific module
-python -m unittest discover tests/                # All tests
+python run_tests.py                     # unittest-based runner
+python run_tests.py decompressor        # Specific module
 ```
 
 ## Test Data Requirements
 
 ### Required Test Files
-- Real DVID test data is loaded from `../research/fib19-64x64x64-sample1-block.dat.gz`
-- If this file is not available, real data tests are skipped automatically
+- Real DVID test data is loaded from `tests/test_data/` (compressed blocks and raw volumes)
+- Go-produced Arrow shard files in `tests/test_data/` for cross-language tests
 
 ### Generated Test Data
 - Most tests use programmatically generated DVID blocks

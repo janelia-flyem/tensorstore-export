@@ -159,8 +159,8 @@ packages:
   requires_python: '>=3.9'
 - pypi: ./braid
   name: braid
-  version: 0.5.0
-  sha256: 0425491a10bf369147084387446c522ab11ca3de44b26fa583f18d38cbd89233
+  version: 1.0.0
+  sha256: 04c1496f74c88aa5d18a64b32c0bbdc9b546a6ab0327723503903166826aae51
   requires_dist:
   - numpy>=1.24.0
   - pyarrow>=18.0.0
