@@ -3,7 +3,7 @@ name = "tensorstore-export"
 version = "0.1.0"
 description = "Convert DVID export-shards Arrow IPC files to neuroglancer precomputed volumes"
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 
 [dependencies]
 python = ">=3.10,<3.13"
