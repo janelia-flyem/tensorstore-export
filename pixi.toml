@@ -7,6 +7,8 @@ platforms = ["linux-64", "osx-arm64"]
 
 [dependencies]
 python = ">=3.10,<3.13"
+zstd = ">=1.5"
+zlib = ">=1.2"
 
 [pypi-dependencies]
 # Core data libraries
