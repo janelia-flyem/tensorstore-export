@@ -340,10 +340,56 @@ def _parse_memory_gib(memory_str: str) -> float:
     return float(s)
 
 
+def _wait_for_tier_jobs(job_names: list[str], project: str, region: str,
+                        start_time: float) -> tuple[bool, str]:
+    """Poll all tier jobs until they complete or one fails.
+
+    Returns (ok, message).
+    """
+    from scripts.export_status import get_execution_info
+
+    while True:
+        all_done = True
+        any_failed = False
+        parts = []
+        for job_name in job_names:
+            info = get_execution_info(job_name, project, region)
+            if not info:
+                all_done = False
+                parts.append(f"{job_name}: no execution info yet")
+                continue
+
+            status = info.get("status", "Unknown")
+            succeeded = info.get("succeeded", 0)
+            failed = info.get("failed", 0)
+            running = info.get("running", 0)
+            tasks = info.get("tasks", 0)
+            label = job_name.rsplit("-", 2)[-2] + "-" + job_name.rsplit("-", 1)[-1]
+            parts.append(f"{label} {succeeded}+{failed}err+{running}run/{tasks}")
+
+            if failed > 0 or status == "Failed":
+                any_failed = True
+            if status not in ("Completed", "Failed"):
+                all_done = False
+
+        elapsed = _format_elapsed(time.monotonic() - start_time)
+        print(f"  Waiting ({elapsed}): " + ", ".join(parts))
+
+        if any_failed:
+            return False, "One or more tier jobs reported failed tasks."
+        if all_done:
+            return True, ""
+
+        time.sleep(30)
+
+
 def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
                       project, region, label_type, downres, wait,
                       job_suffix=""):
     """Create/update and execute Cloud Run jobs for each tier.
+
+    All tiers are launched in parallel (async).  When wait=True, the
+    function then polls all jobs until they complete.
 
     Args:
         tier_info: dict mapping gib -> (manifest_uri, num_tasks)
@@ -352,6 +398,7 @@ def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
     """
     suffix_part = f"-{job_suffix}" if job_suffix else ""
     print(f"\nLaunching {len(tier_info)} tier job(s)...")
+    launched_jobs = []
     for gib in sorted(tier_info.keys()):
         manifest_uri, num_tasks = tier_info[gib]
         cpu = TIER_CPU.get(gib, 2)
@@ -367,14 +414,24 @@ def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
             print(f"  {job_name}: FAILED to create/update")
             continue
 
-        ok = _execute_job(job_name, project, region, num_tasks, wait)
+        # Always launch async — wait is handled below by polling all jobs
+        ok = _execute_job(job_name, project, region, num_tasks, wait=False)
         if ok:
             print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
+            launched_jobs.append(job_name)
         else:
             print(f"  {job_name}: FAILED to execute")
 
-    # Post-export verification when using --wait
-    if wait:
+    # Wait for all tiers to complete (polling in parallel)
+    if wait and launched_jobs:
+        start_time = time.monotonic()
+        print(f"\nWaiting for {len(launched_jobs)} tier job(s) to complete...")
+        ok, message = _wait_for_tier_jobs(
+            launched_jobs, project, region, start_time)
+        if not ok:
+            print(f"\n{ANSI_RED}Tier jobs failed: {message}{ANSI_RESET}")
+
+        # Post-export verification
         source_path = env.get("SOURCE_PATH", "").rstrip("/")
         dest_path = env.get("DEST_PATH", "").rstrip("/")
         ng_spec_path = env.get("NG_SPEC_PATH", "")
