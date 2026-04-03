@@ -464,6 +464,139 @@ def _launch_from_manifests(args, env, source_path, project, region,
     )
 
 
+def _run_downres_wait_pipeline(
+    downres_scales, spec_path_resolved, source_path, env,
+    scales, max_tasks, only_missing, dry_run,
+    ng_spec_b64, base_name, project, region, label_type, image,
+    pipeline_start=None,
+):
+    """Sequential downres pipeline: process each scale, wait, verify.
+
+    Each scale is launched, waited on, and verified before the next begins.
+    Used by both standalone downres mode and combined (Arrow + downres) mode.
+    """
+    from scripts.verify_export import verify_all_scales, print_report
+
+    if pipeline_start is None:
+        pipeline_start = time.monotonic()
+    scale_timings = []
+
+    for target_scale in downres_scales:
+        scale_start = time.monotonic()
+        if target_scale > 1:
+            print(f"\nAggregating label predictions for s{target_scale}...")
+            try:
+                aggregate_labels(
+                    source_path, target_scale, str(spec_path_resolved))
+            except Exception as e:
+                _fail_downres(
+                    target_scale,
+                    f"Failed to aggregate labels for s{target_scale}: {e}",
+                    scale_timings,
+                    pipeline_start,
+                )
+
+        print(f"\nGenerating downres manifests for scales [{target_scale}]...")
+        t0 = time.monotonic()
+        scale_results = generate_downres_manifests(
+            str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
+            scales, [target_scale],
+            max_tasks, only_missing=only_missing, dry_run=dry_run,
+        )
+        print(f"\nManifest generation took {time.monotonic() - t0:.1f}s")
+
+        tier_info = scale_results.get(target_scale, {})
+        if not tier_info:
+            print(f"\nNo manifests generated for s{target_scale}. "
+                  "Checking whether the scale is already complete...")
+            total_missing, results = verify_all_scales(
+                source_path, env.get("DEST_PATH", ""),
+                str(spec_path_resolved), [target_scale])
+            print_report(results)
+            if total_missing > 0:
+                _fail_downres(
+                    target_scale,
+                    f"s{target_scale} still has {total_missing} missing NG "
+                    "shard(s) but no manifests were generated.",
+                    scale_timings,
+                    pipeline_start,
+                )
+            scale_timings.append(
+                (target_scale, time.monotonic() - scale_start))
+            continue
+
+        if dry_run:
+            continue
+
+        print(f"\nLaunching downres jobs for scale {target_scale}...")
+        launch_failed = False
+        launched_jobs = []
+        for gib in sorted(tier_info.keys()):
+            manifest_uri, num_tasks = tier_info[gib]
+            cpu = TIER_CPU.get(gib, 2)
+            memory = f"{gib}Gi"
+            job_name = f"{base_name}-downres-s{target_scale}-tier-{gib}gi"
+
+            ok = _create_or_update_job(
+                job_name, image, env, ng_spec_b64,
+                memory, cpu, num_tasks, manifest_uri,
+                label_type, "", downres_mode=True,
+            )
+            if not ok:
+                print(f"  {job_name}: FAILED to create/update")
+                launch_failed = True
+                continue
+
+            ok = _execute_job(job_name, project, region, num_tasks, False)
+            if ok:
+                print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
+                launched_jobs.append(job_name)
+            else:
+                print(f"  {job_name}: FAILED to execute")
+                launch_failed = True
+
+        if launch_failed:
+            _fail_downres(
+                target_scale,
+                f"Downres launch or execution failed for s{target_scale}.",
+                scale_timings,
+                pipeline_start,
+            )
+
+        print(f"\nWaiting for all s{target_scale} tier jobs to finish...")
+        ok, message = _wait_for_downres_scale_jobs(
+            launched_jobs, project, region, target_scale,
+            pipeline_start, scale_start)
+        if not ok:
+            _fail_downres(
+                target_scale,
+                message,
+                scale_timings,
+                pipeline_start,
+            )
+
+        print(f"\nVerifying s{target_scale} export completeness...")
+        total_missing, results = verify_all_scales(
+            source_path, env.get("DEST_PATH", ""),
+            str(spec_path_resolved), [target_scale])
+        print_report(results)
+        if total_missing > 0:
+            _fail_downres(
+                target_scale,
+                f"s{target_scale} finished with {total_missing} missing NG "
+                "shard(s). Stopping before the next scale.",
+                scale_timings,
+                pipeline_start,
+            )
+        scale_timings.append((target_scale, time.monotonic() - scale_start))
+
+    if dry_run:
+        print("\n(dry run — no manifests written, no jobs launched)")
+    else:
+        _print_downres_success_summary(
+            scale_timings, time.monotonic() - pipeline_start)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export DVID shards to neuroglancer precomputed via Cloud Run.",
@@ -569,12 +702,20 @@ def main():
     downres_mode = args.downres_mode or bool(downres)
     downres_wait = downres_mode and not args.async_launch
 
+    # Combined mode: DOWNRES_SCALES configured in .env (not via explicit
+    # --downres flag) means export Arrow shards first, then chain into
+    # the downres pipeline.  Use `--downres <scales>` to skip Arrow export.
+    combined_mode = (downres_mode
+                     and not args.downres
+                     and not args.downres_mode
+                     and not args.manifest_dir)
+
     if args.only_missing and not downres_mode:
         print("Error: --only-missing is only supported with --downres.")
         sys.exit(1)
 
-    # --- Downres mode: generate manifests + launch with DOWNRES_MODE=1 ---
-    if downres_mode:
+    # --- Downres-only mode: generate manifests + launch with DOWNRES_MODE=1 ---
+    if downres_mode and not combined_mode:
         if not downres:
             print("Error: --downres must specify target scales.")
             sys.exit(1)
@@ -595,124 +736,11 @@ def main():
             if image:
                 print(f"\nUsing image: {image}")
 
-            from scripts.verify_export import verify_all_scales, print_report
-            pipeline_start = time.monotonic()
-            scale_timings = []
-
-            for target_scale in downres_scales:
-                scale_start = time.monotonic()
-                if target_scale > 1:
-                    print(f"\nAggregating label predictions for s{target_scale}...")
-                    try:
-                        aggregate_labels(
-                            source_path, target_scale, str(spec_path_resolved))
-                    except Exception as e:
-                        _fail_downres(
-                            target_scale,
-                            f"Failed to aggregate labels for s{target_scale}: {e}",
-                            scale_timings,
-                            pipeline_start,
-                        )
-
-                print(f"\nGenerating downres manifests for scales [{target_scale}]...")
-                t0 = time.monotonic()
-                scale_results = generate_downres_manifests(
-                    str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
-                    scales, [target_scale],
-                    max_tasks, only_missing=args.only_missing, dry_run=args.dry_run,
-                )
-                print(f"\nManifest generation took {time.monotonic() - t0:.1f}s")
-
-                tier_info = scale_results.get(target_scale, {})
-                if not tier_info:
-                    print(f"\nNo manifests generated for s{target_scale}. "
-                          "Checking whether the scale is already complete...")
-                    total_missing, results = verify_all_scales(
-                        source_path, env.get("DEST_PATH", ""),
-                        str(spec_path_resolved), [target_scale])
-                    print_report(results)
-                    if total_missing > 0:
-                        _fail_downres(
-                            target_scale,
-                            f"s{target_scale} still has {total_missing} missing NG "
-                            "shard(s) but no manifests were generated.",
-                            scale_timings,
-                            pipeline_start,
-                        )
-                    scale_timings.append(
-                        (target_scale, time.monotonic() - scale_start))
-                    continue
-
-                if args.dry_run:
-                    continue
-
-                print(f"\nLaunching downres jobs for scale {target_scale}...")
-                launch_failed = False
-                launched_jobs = []
-                for gib in sorted(tier_info.keys()):
-                    manifest_uri, num_tasks = tier_info[gib]
-                    cpu = TIER_CPU.get(gib, 2)
-                    memory = f"{gib}Gi"
-                    job_name = f"{base_name}-downres-s{target_scale}-tier-{gib}gi"
-
-                    ok = _create_or_update_job(
-                        job_name, image, env, ng_spec_b64,
-                        memory, cpu, num_tasks, manifest_uri,
-                        label_type, "", downres_mode=True,
-                    )
-                    if not ok:
-                        print(f"  {job_name}: FAILED to create/update")
-                        launch_failed = True
-                        continue
-
-                    ok = _execute_job(job_name, project, region, num_tasks, False)
-                    if ok:
-                        print(f"  {job_name}: launched ({num_tasks} tasks, {memory}, cpu={cpu})")
-                        launched_jobs.append(job_name)
-                    else:
-                        print(f"  {job_name}: FAILED to execute")
-                        launch_failed = True
-
-                if launch_failed:
-                    _fail_downres(
-                        target_scale,
-                        f"Downres launch or execution failed for s{target_scale}.",
-                        scale_timings,
-                        pipeline_start,
-                    )
-
-                print(f"\nWaiting for all s{target_scale} tier jobs to finish...")
-                ok, message = _wait_for_downres_scale_jobs(
-                    launched_jobs, project, region, target_scale,
-                    pipeline_start, scale_start)
-                if not ok:
-                    _fail_downres(
-                        target_scale,
-                        message,
-                        scale_timings,
-                        pipeline_start,
-                    )
-
-                print(f"\nVerifying s{target_scale} export completeness...")
-                total_missing, results = verify_all_scales(
-                    source_path, env.get("DEST_PATH", ""),
-                    str(spec_path_resolved), [target_scale])
-                print_report(results)
-                if total_missing > 0:
-                    _fail_downres(
-                        target_scale,
-                        f"s{target_scale} finished with {total_missing} missing NG "
-                        "shard(s). Stopping before the next scale.",
-                        scale_timings,
-                        pipeline_start,
-                    )
-                scale_timings.append((target_scale, time.monotonic() - scale_start))
-
-            if args.dry_run:
-                print("\n(dry run — no manifests written, no jobs launched)")
-            else:
-                _print_downres_success_summary(
-                    scale_timings, time.monotonic() - pipeline_start)
+            _run_downres_wait_pipeline(
+                downres_scales, spec_path_resolved, source_path, env,
+                scales, max_tasks, args.only_missing, args.dry_run,
+                ng_spec_b64, base_name, project, region, label_type, image,
+            )
             return
 
         print(f"Generating downres manifests for scales {downres_scales}...")
@@ -807,6 +835,21 @@ def main():
 
     if args.dry_run:
         print("\n(dry run — no manifests written, no jobs launched)")
+        if combined_mode:
+            # Show the downres dry-run output too
+            downres_scales = [int(s.strip()) for s in downres.split(",")]
+            spec_path_resolved = Path(ng_spec_path)
+            if not spec_path_resolved.is_absolute():
+                spec_path_resolved = (
+                    Path(__file__).resolve().parent.parent / spec_path_resolved)
+            print(f"\n{'=' * 60}")
+            print("Downres pipeline (dry run):")
+            print(f"{'=' * 60}")
+            _run_downres_wait_pipeline(
+                downres_scales, spec_path_resolved, source_path, env,
+                scales, max_tasks, args.only_missing, True,
+                ng_spec_b64, base_name, project, region, label_type, None,
+            )
         return
 
     # --- Step 3: Write per-task manifests to GCS ---
@@ -881,10 +924,36 @@ def main():
     print(f"\nUsing image: {image}")
 
     # --- Step 5: Create/update and execute per-tier jobs ---
+    # In combined mode, wait for Arrow export to complete (downres depends
+    # on s0 output) and don't pass DOWNRES_SCALES to workers (the
+    # orchestrated pipeline handles downres, not the per-worker legacy path).
+    arrow_wait = True if combined_mode else args.wait
+    arrow_downres = "" if combined_mode else downres
     _launch_tier_jobs(
         tier_info, env, image, ng_spec_b64, base_name, project, region,
-        label_type, downres, args.wait,
+        label_type, arrow_downres, arrow_wait,
     )
+
+    # --- Chain into downres pipeline after Arrow export ---
+    if combined_mode:
+        print(f"\n{'=' * 60}")
+        print("Arrow shard export complete. Starting downres pipeline...")
+        print(f"{'=' * 60}")
+
+        if not ng_spec_path:
+            print("Error: NG_SPEC_PATH must be configured in .env for downres.")
+            sys.exit(1)
+        spec_path_resolved = Path(ng_spec_path)
+        if not spec_path_resolved.is_absolute():
+            spec_path_resolved = (
+                Path(__file__).resolve().parent.parent / spec_path_resolved)
+
+        downres_scales = [int(s.strip()) for s in downres.split(",")]
+        _run_downres_wait_pipeline(
+            downres_scales, spec_path_resolved, source_path, env,
+            scales, max_tasks, args.only_missing, args.dry_run,
+            ng_spec_b64, base_name, project, region, label_type, image,
+        )
 
 
 if __name__ == "__main__":
