@@ -148,7 +148,7 @@ DOWNRES_DYNAMIC_LABEL_READBACK_SCALE = 4
 # pushed into larger tiers without forcing an excessively steep linear ramp.
 DOWNRES_COMMIT_SPIKE_GIB_BY_SCALE = {
     1: 0.5,
-    2: 1.0,
+    2: 1.5,  # bumped from 1.0: shards with 7M+ labels OOM at 8Gi
     3: 1.5,
     4: 2.0,
 }
