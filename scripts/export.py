@@ -810,7 +810,13 @@ def main():
 
     # --- Step 1: Scan Arrow files ---
     t0 = time.monotonic()
-    print(f"Scanning Arrow files across {len(scales)} scales...")
+    scales_label = ", ".join(f"s{s}" for s in scales)
+    downres_label = ""
+    if combined_mode:
+        downres_scales_list = [int(s.strip()) for s in downres.split(",")]
+        downres_label = (
+            f" (then downres {', '.join(f's{s}' for s in downres_scales_list)})")
+    print(f"Scanning Arrow source files for {scales_label}{downres_label}...")
     all_files = list_arrow_files(source_path, scales)
     print(f"  Found {len(all_files)} Arrow files")
     print("  Memory formula: arrow + 2 * shard_on_tmpfs + 2 GiB")
