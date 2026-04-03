@@ -1,4 +1,5 @@
-"""Tests for export.py pipeline mode selection and combined mode flow.
+"""Tests for export.py pipeline mode selection, combined mode flow,
+and skip-if-exists / --overwrite behavior.
 
 Verifies that:
 - DOWNRES_SCALES in .env + no --downres flag → combined mode (Arrow then downres)
@@ -6,6 +7,9 @@ Verifies that:
 - No DOWNRES_SCALES → Arrow-only export
 - Combined mode forces wait on Arrow jobs and omits DOWNRES_SCALES from workers
 - Combined mode chains _run_downres_wait_pipeline after Arrow export
+- By default, already-exported shards are skipped (only_missing=True)
+- --overwrite forces re-export of all shards
+- Downres pipeline receives only_missing=True by default
 """
 
 import json
@@ -49,8 +53,8 @@ def ng_spec_file(tmp_path):
 def _fake_arrow_files():
     """Minimal list_arrow_files return value: (scale, name, size, chunks)."""
     return [
-        (0, "shard-0000.arrow", 100_000_000, 64),
-        (0, "shard-0001.arrow", 80_000_000, 48),
+        (0, "0_0_0", 100_000_000, 64),
+        (0, "64_0_0", 80_000_000, 48),
     ]
 
 
@@ -58,16 +62,10 @@ def _fake_tier_map():
     """assign_tiers return value: tier_gib → list of (scale, name, size)."""
     return {
         4: [
-            (0, "shard-0000.arrow", 100_000_000),
-            (0, "shard-0001.arrow", 80_000_000),
+            (0, "0_0_0", 100_000_000),
+            (0, "64_0_0", 80_000_000),
         ],
     }
-
-
-# Shared patches applied to every test.  Individual tests layer on extras.
-_COMMON_PATCHES = {
-    "scripts.export.ENV_FILE": mock.PropertyMock(return_value=Path("/dev/null")),
-}
 
 
 def _patch_stack(monkeypatch, env, ng_spec_file):
@@ -98,6 +96,45 @@ def _patch_stack(monkeypatch, env, ng_spec_file):
     m = mock.patch("scripts.export.assign_tiers",
                    return_value=_fake_tier_map())
     mocks["assign_tiers"] = m.start()
+
+    # --- Shard mapping mocks (for only_missing filtering) ---
+    # load_ng_spec → fake scale params
+    fake_scale_params = {
+        0: {
+            "key": "l0",
+            "shard_bits": 16,
+            "minishard_bits": 6,
+            "preshift_bits": 9,
+            "chunk_size": [64, 64, 64],
+            "vol_size": [1024, 1024, 1024],
+            "grid_shape": [16, 16, 16],
+            "coord_bits": [4, 4, 4],
+        }
+    }
+    m = mock.patch("scripts.export.load_ng_spec",
+                   return_value=fake_scale_params)
+    mocks["load_ng_spec"] = m.start()
+
+    # list_ng_shard_files → empty set by default (no existing output)
+    m = mock.patch("scripts.export.list_ng_shard_files",
+                   return_value=set())
+    mocks["list_ng_shard_files"] = m.start()
+
+    # dvid_to_ng_shard_number → deterministic mapping
+    def _fake_dvid_to_ng(shard_name, params):
+        # Simple hash: "0_0_0" → 0, "64_0_0" → 1
+        return hash(shard_name) % 65536
+    m = mock.patch("scripts.export.dvid_to_ng_shard_number",
+                   side_effect=_fake_dvid_to_ng)
+    mocks["dvid_to_ng_shard_number"] = m.start()
+
+    # ng_shard_filename → deterministic filename
+    def _fake_ng_filename(shard_num, shard_bits):
+        hex_digits = -(-shard_bits // 4)
+        return f"{shard_num:0{hex_digits}x}.shard"
+    m = mock.patch("scripts.export.ng_shard_filename",
+                   side_effect=_fake_ng_filename)
+    mocks["ng_shard_filename"] = m.start()
 
     # generate_downres_manifests → one tier per requested scale
     def _fake_gen_downres(spec, src, dest, scales, downres_scales,
@@ -139,8 +176,8 @@ def _patch_stack(monkeypatch, env, ng_spec_file):
 
     # distribute_tasks → one task with both shards
     m = mock.patch("scripts.export.distribute_tasks",
-                   return_value={"0": [{"scale": 0, "shard": "shard-0000.arrow"},
-                                       {"scale": 0, "shard": "shard-0001.arrow"}]})
+                   return_value={"0": [{"scale": 0, "shard": "0_0_0"},
+                                       {"scale": 0, "shard": "64_0_0"}]})
     mocks["distribute_tasks"] = m.start()
 
     # aggregate_labels → no-op
@@ -303,3 +340,143 @@ class TestCombinedModeFlow:
             main()
         call_args = mocks["launch_tier_jobs"].call_args
         assert call_args[0][9] is True
+
+
+# ---------------------------------------------------------------------------
+# Skip-if-exists / --overwrite tests
+# ---------------------------------------------------------------------------
+
+class TestSkipIfExists:
+    """Test that already-exported shards are skipped by default."""
+
+    def test_default_skips_existing_arrow_shards(self, monkeypatch, ng_spec_file):
+        """By default, DVID shards whose NG output exists are filtered out."""
+        env = _base_env()
+        mocks = _patch_stack(monkeypatch, env, ng_spec_file)
+
+        # Compute the NG filenames that the mock mapping would produce
+        fake_names = []
+        for _, shard_name, _, _ in _fake_arrow_files():
+            shard_num = hash(shard_name) % 65536
+            fake_names.append(f"{shard_num:04x}.shard")
+
+        # Simulate: first shard already exported, second not
+        mocks["list_ng_shard_files"].return_value = {fake_names[0]}
+
+        with mock.patch.object(sys, "argv", ["export.py"]):
+            from scripts.export import main
+            main()
+
+        # assign_tiers should receive only the missing shard
+        call_args = mocks["assign_tiers"].call_args[0][0]
+        shard_names = [name for _, name, _, _ in call_args]
+        assert len(shard_names) == 1
+        assert shard_names[0] == "64_0_0"  # second shard
+
+    def test_all_shards_present_skips_arrow_export(self, monkeypatch, ng_spec_file):
+        """When all NG output exists, Arrow export is skipped entirely."""
+        env = _base_env()
+        mocks = _patch_stack(monkeypatch, env, ng_spec_file)
+
+        # Simulate: both shards already exported
+        fake_names = set()
+        for _, shard_name, _, _ in _fake_arrow_files():
+            shard_num = hash(shard_name) % 65536
+            fake_names.add(f"{shard_num:04x}.shard")
+        mocks["list_ng_shard_files"].return_value = fake_names
+
+        with mock.patch.object(sys, "argv", ["export.py"]):
+            from scripts.export import main
+            main()
+
+        # No jobs should be launched
+        mocks["launch_tier_jobs"].assert_not_called()
+        mocks["assign_tiers"].assert_not_called()
+
+    def test_all_shards_present_combined_still_runs_downres(
+            self, monkeypatch, ng_spec_file):
+        """When s0 is complete in combined mode, downres still runs."""
+        env = _base_env(DOWNRES_SCALES="1,2")
+        mocks = _patch_stack(monkeypatch, env, ng_spec_file)
+
+        # Simulate: all s0 shards already exported
+        fake_names = set()
+        for _, shard_name, _, _ in _fake_arrow_files():
+            shard_num = hash(shard_name) % 65536
+            fake_names.add(f"{shard_num:04x}.shard")
+        mocks["list_ng_shard_files"].return_value = fake_names
+
+        with mock.patch.object(sys, "argv", ["export.py"]):
+            from scripts.export import main
+            main()
+
+        # Arrow export skipped, but downres still runs
+        mocks["launch_tier_jobs"].assert_not_called()
+        mocks["run_downres_wait_pipeline"].assert_called_once()
+
+    def test_overwrite_exports_all_shards(self, monkeypatch, ng_spec_file):
+        """--overwrite forces re-export even if NG output exists."""
+        env = _base_env()
+        mocks = _patch_stack(monkeypatch, env, ng_spec_file)
+
+        # Simulate: both shards already exported
+        fake_names = set()
+        for _, shard_name, _, _ in _fake_arrow_files():
+            shard_num = hash(shard_name) % 65536
+            fake_names.add(f"{shard_num:04x}.shard")
+        mocks["list_ng_shard_files"].return_value = fake_names
+
+        with mock.patch.object(sys, "argv", ["export.py", "--overwrite"]):
+            from scripts.export import main
+            main()
+
+        # All shards should be exported despite existing output
+        mocks["assign_tiers"].assert_called_once()
+        call_args = mocks["assign_tiers"].call_args[0][0]
+        assert len(call_args) == 2  # both shards
+
+    def test_downres_gets_only_missing_by_default(self, monkeypatch, ng_spec_file):
+        """Downres pipeline receives only_missing=True by default."""
+        env = _base_env(DOWNRES_SCALES="1,2")
+        mocks = _patch_stack(monkeypatch, env, ng_spec_file)
+
+        with mock.patch.object(sys, "argv", ["export.py"]):
+            from scripts.export import main
+            main()
+
+        # _run_downres_wait_pipeline(..., only_missing, ...) — 7th positional arg
+        call_args = mocks["run_downres_wait_pipeline"].call_args
+        only_missing_arg = call_args[0][6]
+        assert only_missing_arg is True
+
+    def test_overwrite_passes_only_missing_false_to_downres(
+            self, monkeypatch, ng_spec_file):
+        """--overwrite passes only_missing=False to downres pipeline."""
+        env = _base_env(DOWNRES_SCALES="1,2")
+        mocks = _patch_stack(monkeypatch, env, ng_spec_file)
+
+        with mock.patch.object(sys, "argv", ["export.py", "--overwrite"]):
+            from scripts.export import main
+            main()
+
+        call_args = mocks["run_downres_wait_pipeline"].call_args
+        only_missing_arg = call_args[0][6]
+        assert only_missing_arg is False
+
+    def test_no_ng_spec_skips_filtering(self, monkeypatch, ng_spec_file):
+        """When NG_SPEC_PATH is not set, filtering is skipped (all shards exported)."""
+        env = _base_env()
+        env["NG_SPEC_PATH"] = ""  # override what _patch_stack sets
+        mocks = _patch_stack(monkeypatch, env, ng_spec_file)
+        env["NG_SPEC_PATH"] = ""  # re-override after _patch_stack
+
+        with mock.patch.object(sys, "argv", ["export.py"]):
+            from scripts.export import main
+            main()
+
+        # No filtering attempted
+        mocks["load_ng_spec"].assert_not_called()
+        # All shards exported
+        mocks["assign_tiers"].assert_called_once()
+        call_args = mocks["assign_tiers"].call_args[0][0]
+        assert len(call_args) == 2

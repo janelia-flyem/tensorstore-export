@@ -25,8 +25,9 @@ pixi run lint                 # Ruff linter on src/, braid/, scripts/
 pixi run build-braid-c        # Build braid C extension (decompressor)
 
 pixi run deploy               # Build Docker image and push to GCR
-pixi run export               # Full export: manifest + Cloud Run jobs
+pixi run export               # Full pipeline: Arrow export + downres (skips existing)
 pixi run export --dry-run     # Show what would be launched
+pixi run export --overwrite   # Re-export all shards even if output exists
 pixi run export-status        # Monitor running Cloud Run jobs
 pixi run export-errors        # Scan logs for export errors
 pixi run precompute-manifest  # Generate per-task shard manifests
@@ -58,12 +59,18 @@ Each Cloud Run task:
 
 ```
 pixi run deploy    →  builds Docker image, pushes to GCR, stores URI in .env
-pixi run export    →  scans source shards → groups into memory tiers →
-                      writes per-task manifests to GCS → launches one
-                      Cloud Run job per tier
+pixi run export    →  unified pipeline:
+                      1. Scans Arrow source shards for SCALES
+                      2. Checks DEST_PATH — skips already-exported shards
+                      3. Groups remaining shards into memory tiers
+                      4. Writes per-task manifests to GCS, launches Cloud Run jobs
+                      5. If DOWNRES_SCALES is set: waits for Arrow export,
+                         then runs downres for each scale sequentially
 ```
 
 Tier-based manifests group shards by estimated memory so that small-shard tasks use less memory (and cost less) than large-shard tasks.
+
+By default, only missing shards are exported (both Arrow and downres phases check the destination for existing output). Use `--overwrite` to force re-export. Use `--downres <scales>` to run downres-only without re-scanning Arrow source files.
 
 ### BRAID Library (`braid/`)
 

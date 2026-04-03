@@ -2,17 +2,21 @@
 """
 Export DVID shards to neuroglancer precomputed via Cloud Run.
 
-Single command that scans Arrow source files, assigns shards to
-memory-appropriate tiers, writes per-task manifests to GCS, and
-launches a Cloud Run job per tier.
+When .env has both SCALES (Arrow source data) and DOWNRES_SCALES, a single
+``pixi run export`` runs the full pipeline: Arrow shard export → wait →
+sequential downres for each scale.  Use ``--downres <scales>`` to run
+downres-only (skipping the Arrow export phase).
+
+By default, shards whose neuroglancer output already exists at DEST_PATH
+are skipped.  Use ``--overwrite`` to force re-export of everything.
 
 Usage:
-    pixi run export
-    pixi run export --dry-run
-    pixi run export --async
+    pixi run export                        # full pipeline (Arrow + downres)
+    pixi run export --dry-run              # show what would be launched
+    pixi run export --overwrite            # re-export all shards
+    pixi run export --downres 1,2,3        # downres-only for specific scales
+    pixi run export --downres 5 --overwrite
     pixi run export --supervoxels
-    pixi run export --downres 10
-    pixi run export --downres 2 --only-missing
 """
 
 import argparse
@@ -36,6 +40,8 @@ from scripts.precompute_manifest import (
     generate_downres_manifests,
 )
 from scripts.aggregate_predicted_labels import aggregate_labels
+from scripts.verify_export import list_ng_shard_files
+from src.ng_sharding import dvid_to_ng_shard_number, load_ng_spec, ng_shard_filename
 
 
 SHARDS_PER_CHECK_TASK = 100  # shards per Cloud Run task for zero-check
@@ -614,9 +620,9 @@ def main():
         help="Comma-separated scales to generate by downsampling previous scale",
     )
     parser.add_argument(
-        "--only-missing", action="store_true",
-        help="For downres exports, generate manifests only for output shards "
-             "missing from DEST_PATH at the target scale.",
+        "--overwrite", action="store_true",
+        help="Re-export all shards even if their neuroglancer output already "
+             "exists at DEST_PATH. By default, only missing shards are exported.",
     )
     parser.add_argument(
         "--tiers",
@@ -710,9 +716,7 @@ def main():
                      and not args.downres_mode
                      and not args.manifest_dir)
 
-    if args.only_missing and not downres_mode:
-        print("Error: --only-missing is only supported with --downres.")
-        sys.exit(1)
+    only_missing = not args.overwrite
 
     # --- Downres-only mode: generate manifests + launch with DOWNRES_MODE=1 ---
     if downres_mode and not combined_mode:
@@ -738,7 +742,7 @@ def main():
 
             _run_downres_wait_pipeline(
                 downres_scales, spec_path_resolved, source_path, env,
-                scales, max_tasks, args.only_missing, args.dry_run,
+                scales, max_tasks, only_missing, args.dry_run,
                 ng_spec_b64, base_name, project, region, label_type, image,
             )
             return
@@ -748,7 +752,7 @@ def main():
         all_scale_results = generate_downres_manifests(
             str(spec_path_resolved), source_path, env.get("DEST_PATH", ""),
             scales, downres_scales,
-            max_tasks, only_missing=args.only_missing, dry_run=args.dry_run,
+            max_tasks, only_missing=only_missing, dry_run=args.dry_run,
         )
         elapsed = time.monotonic() - t0
         print(f"\nManifest generation took {elapsed:.1f}s")
@@ -819,19 +823,64 @@ def main():
     if args.remove_zeros:
         all_files = _remove_zero_shards(all_files, env, source_path)
 
-    # --- Step 2: Assign to tiers ---
-    tier_map = assign_tiers(all_files, max_tasks)
+    # --- Filter to missing output shards (default) ---
+    dest_path = env.get("DEST_PATH", "").rstrip("/")
+    if only_missing and ng_spec_path and dest_path:
+        scale_info = load_ng_spec(
+            str(Path(ng_spec_path)
+                if Path(ng_spec_path).is_absolute()
+                else Path(__file__).resolve().parent.parent / ng_spec_path))
+        total_before = len(all_files)
+        filtered = []
+        for scale_idx in sorted(set(s for s, *_ in all_files)):
+            scale_files = [(s, n, sz, c) for s, n, sz, c in all_files
+                           if s == scale_idx]
+            params = scale_info.get(scale_idx)
+            if not params:
+                # No NG spec for this scale — include all shards
+                filtered.extend(scale_files)
+                continue
+            existing_ng = list_ng_shard_files(dest_path, params["key"])
+            if not existing_ng:
+                print(f"  s{scale_idx}: no existing NG shards — "
+                      f"exporting all {len(scale_files)}")
+                filtered.extend(scale_files)
+                continue
+            missing = []
+            for entry in scale_files:
+                _, shard_name, _, _ = entry
+                shard_num = dvid_to_ng_shard_number(shard_name, params)
+                ng_file = ng_shard_filename(shard_num, params["shard_bits"])
+                if ng_file not in existing_ng:
+                    missing.append(entry)
+            print(f"  s{scale_idx}: {len(existing_ng)} NG shards exist, "
+                  f"{len(missing)} DVID shards still need export "
+                  f"(of {len(scale_files)} total)")
+            filtered.extend(missing)
+        all_files = filtered
+        skipped = total_before - len(all_files)
+        if skipped:
+            print(f"  Skipping {skipped} already-exported shards "
+                  f"(use --overwrite to re-export)")
 
-    print("\nTier assignments:")
-    for gib in sorted(tier_map.keys()):
-        shards = tier_map[gib]
-        tier_max = max_tasks.get(gib, 1000)
-        num_tasks = min(tier_max, len(shards))
-        total_bytes = sum(s for _, _, s in shards)
-        max_arrow = max(s for _, _, s in shards)
-        cpu = TIER_CPU.get(gib, 2)
-        print(f"  {gib}Gi (cpu={cpu}): {len(shards)} shards, {num_tasks} tasks, "
-              f"total={total_bytes/1e9:.1f}GB, max_arrow={max_arrow/1e6:.0f}MB")
+    arrow_skipped = not all_files
+    if arrow_skipped:
+        print("\nAll Arrow shards already exported.")
+
+    # --- Step 2: Assign to tiers ---
+    if not arrow_skipped:
+        tier_map = assign_tiers(all_files, max_tasks)
+
+        print("\nTier assignments:")
+        for gib in sorted(tier_map.keys()):
+            shards = tier_map[gib]
+            tier_max = max_tasks.get(gib, 1000)
+            num_tasks = min(tier_max, len(shards))
+            total_bytes = sum(s for _, _, s in shards)
+            max_arrow = max(s for _, _, s in shards)
+            cpu = TIER_CPU.get(gib, 2)
+            print(f"  {gib}Gi (cpu={cpu}): {len(shards)} shards, {num_tasks} tasks, "
+                  f"total={total_bytes/1e9:.1f}GB, max_arrow={max_arrow/1e6:.0f}MB")
 
     if args.dry_run:
         print("\n(dry run — no manifests written, no jobs launched)")
@@ -847,98 +896,113 @@ def main():
             print(f"{'=' * 60}")
             _run_downres_wait_pipeline(
                 downres_scales, spec_path_resolved, source_path, env,
-                scales, max_tasks, args.only_missing, True,
+                scales, max_tasks, only_missing, True,
                 ng_spec_b64, base_name, project, region, label_type, None,
             )
         return
 
-    # --- Step 3: Write per-task manifests to GCS ---
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from google.cloud import storage
-    storage_client = storage.Client()
-    bucket_name, source_prefix = source_path.replace("gs://", "").split("/", 1)
-    gcs_bucket = storage_client.bucket(bucket_name)
+    if arrow_skipped and not combined_mode:
+        return
 
-    # Delete stale manifests from previous runs
-    manifest_uri = f"{source_path}/manifests/"
-    print(f"\nDeleting stale manifests under {manifest_uri} ...")
-    result = subprocess.run(
-        ["gsutil", "-m", "-q", "rm", "-r", f"{manifest_uri}"],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        print("  Deleted.")
-    elif "No URLs matched" in result.stderr or "CommandException" in result.stderr:
-        print("  No stale manifests found.")
+    if not arrow_skipped:
+        # --- Step 3: Write per-task manifests to GCS ---
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from google.cloud import storage
+        storage_client = storage.Client()
+        bucket_name, source_prefix = source_path.replace("gs://", "").split("/", 1)
+        gcs_bucket = storage_client.bucket(bucket_name)
 
-    tier_info = {}  # gib -> (manifest_uri, num_tasks)
-
-    # Prepare all manifest uploads across tiers
-    all_uploads = []  # (gib, task_idx, blob_path, json_bytes)
-    for gib in sorted(tier_map.keys()):
-        shards = tier_map[gib]
-        tier_max = max_tasks.get(gib, 1000)
-        tasks = distribute_tasks(shards, tier_max)
-        num_tasks = len(tasks)
-
-        tier_prefix = f"{source_prefix}/manifests/tier-{gib}gi"
-        tier_uri = f"{source_path}/manifests/tier-{gib}gi"
-        tier_info[gib] = (tier_uri, num_tasks)
-
-        for task_idx, shard_list in tasks.items():
-            blob_path = f"{tier_prefix}/task-{task_idx}.json"
-            json_bytes = json.dumps(shard_list, separators=(",", ":"))
-            all_uploads.append((gib, blob_path, json_bytes))
-
-    print(f"\nWriting {len(all_uploads)} task manifests to GCS...")
-
-    def _upload_one(blob_path_and_data):
-        blob_path, data = blob_path_and_data
-        gcs_bucket.blob(blob_path).upload_from_string(
-            data, content_type="application/json",
+        # Delete stale manifests from previous runs
+        manifest_uri = f"{source_path}/manifests/"
+        print(f"\nDeleting stale manifests under {manifest_uri} ...")
+        result = subprocess.run(
+            ["gsutil", "-m", "-q", "rm", "-r", f"{manifest_uri}"],
+            capture_output=True, text=True,
         )
+        if result.returncode == 0:
+            print("  Deleted.")
+        elif "No URLs matched" in result.stderr or "CommandException" in result.stderr:
+            print("  No stale manifests found.")
 
-    uploaded = 0
-    with ThreadPoolExecutor(max_workers=32) as pool:
-        futures = {
-            pool.submit(_upload_one, (blob_path, data)): gib
-            for gib, blob_path, data in all_uploads
-        }
-        for future in as_completed(futures):
-            future.result()  # propagate exceptions
-            uploaded += 1
-            if uploaded % 500 == 0 or uploaded == len(all_uploads):
-                print(f"  {uploaded}/{len(all_uploads)} manifests written")
+        tier_info = {}  # gib -> (manifest_uri, num_tasks)
 
-    elapsed = time.monotonic() - t0
-    for gib in sorted(tier_info.keys()):
-        tier_uri, num_tasks = tier_info[gib]
-        print(f"  {gib}Gi: {num_tasks} tasks → {tier_uri}/")
-    print(f"\nManifest generation took {elapsed:.1f}s")
+        # Prepare all manifest uploads across tiers
+        all_uploads = []  # (gib, task_idx, blob_path, json_bytes)
+        for gib in sorted(tier_map.keys()):
+            shards = tier_map[gib]
+            tier_max = max_tasks.get(gib, 1000)
+            tasks = distribute_tasks(shards, tier_max)
+            num_tasks = len(tasks)
 
-    # --- Step 4: Get Docker image ---
-    image = _get_image(env)
-    if not image:
-        print("Error: DOCKER_IMAGE not set in .env. Run 'pixi run deploy' first.")
-        sys.exit(1)
-    print(f"\nUsing image: {image}")
+            tier_prefix = f"{source_prefix}/manifests/tier-{gib}gi"
+            tier_uri = f"{source_path}/manifests/tier-{gib}gi"
+            tier_info[gib] = (tier_uri, num_tasks)
 
-    # --- Step 5: Create/update and execute per-tier jobs ---
-    # In combined mode, wait for Arrow export to complete (downres depends
-    # on s0 output) and don't pass DOWNRES_SCALES to workers (the
-    # orchestrated pipeline handles downres, not the per-worker legacy path).
-    arrow_wait = True if combined_mode else args.wait
-    arrow_downres = "" if combined_mode else downres
-    _launch_tier_jobs(
-        tier_info, env, image, ng_spec_b64, base_name, project, region,
-        label_type, arrow_downres, arrow_wait,
-    )
+            for task_idx, shard_list in tasks.items():
+                blob_path = f"{tier_prefix}/task-{task_idx}.json"
+                json_bytes = json.dumps(shard_list, separators=(",", ":"))
+                all_uploads.append((gib, blob_path, json_bytes))
+
+        print(f"\nWriting {len(all_uploads)} task manifests to GCS...")
+
+        def _upload_one(blob_path_and_data):
+            blob_path, data = blob_path_and_data
+            gcs_bucket.blob(blob_path).upload_from_string(
+                data, content_type="application/json",
+            )
+
+        uploaded = 0
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            futures = {
+                pool.submit(_upload_one, (blob_path, data)): gib
+                for gib, blob_path, data in all_uploads
+            }
+            for future in as_completed(futures):
+                future.result()  # propagate exceptions
+                uploaded += 1
+                if uploaded % 500 == 0 or uploaded == len(all_uploads):
+                    print(f"  {uploaded}/{len(all_uploads)} manifests written")
+
+        elapsed = time.monotonic() - t0
+        for gib in sorted(tier_info.keys()):
+            tier_uri, num_tasks = tier_info[gib]
+            print(f"  {gib}Gi: {num_tasks} tasks → {tier_uri}/")
+        print(f"\nManifest generation took {elapsed:.1f}s")
+
+        # --- Step 4: Get Docker image ---
+        image = _get_image(env)
+        if not image:
+            print("Error: DOCKER_IMAGE not set in .env. Run 'pixi run deploy' first.")
+            sys.exit(1)
+        print(f"\nUsing image: {image}")
+
+        # --- Step 5: Create/update and execute per-tier jobs ---
+        # In combined mode, wait for Arrow export to complete (downres depends
+        # on s0 output) and don't pass DOWNRES_SCALES to workers (the
+        # orchestrated pipeline handles downres, not the per-worker legacy path).
+        arrow_wait = True if combined_mode else args.wait
+        arrow_downres = "" if combined_mode else downres
+        _launch_tier_jobs(
+            tier_info, env, image, ng_spec_b64, base_name, project, region,
+            label_type, arrow_downres, arrow_wait,
+        )
 
     # --- Chain into downres pipeline after Arrow export ---
     if combined_mode:
-        print(f"\n{'=' * 60}")
-        print("Arrow shard export complete. Starting downres pipeline...")
-        print(f"{'=' * 60}")
+        if not arrow_skipped:
+            print(f"\n{'=' * 60}")
+            print("Arrow shard export complete. Starting downres pipeline...")
+            print(f"{'=' * 60}")
+        else:
+            print(f"\n{'=' * 60}")
+            print("Starting downres pipeline...")
+            print(f"{'=' * 60}")
+            image = _get_image(env)
+            if not image:
+                print("Error: DOCKER_IMAGE not set in .env. "
+                      "Run 'pixi run deploy' first.")
+                sys.exit(1)
+            print(f"\nUsing image: {image}")
 
         if not ng_spec_path:
             print("Error: NG_SPEC_PATH must be configured in .env for downres.")
@@ -951,7 +1015,7 @@ def main():
         downres_scales = [int(s.strip()) for s in downres.split(",")]
         _run_downres_wait_pipeline(
             downres_scales, spec_path_resolved, source_path, env,
-            scales, max_tasks, args.only_missing, args.dry_run,
+            scales, max_tasks, only_missing, args.dry_run,
             ng_spec_b64, base_name, project, region, label_type, image,
         )
 
