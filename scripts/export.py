@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE
+from scripts.deploy import load_env, ENV_FILE, ENV_EXAMPLE, setup_destination_info
 from scripts.precompute_manifest import (
     TIER_CPU,
     DEFAULT_TIER_MAX_TASKS,
@@ -761,6 +761,16 @@ def main():
         ).decode()
     else:
         ng_spec_b64 = ""
+
+    # Ensure the neuroglancer info file exists at the destination
+    dest_path = env.get("DEST_PATH", "").rstrip("/")
+    if dest_path and ng_spec_path and not args.dry_run:
+        spec_for_info = json.loads(
+            (Path(ng_spec_path) if Path(ng_spec_path).is_absolute()
+             else Path(__file__).resolve().parent.parent / ng_spec_path
+            ).read_text()
+        )
+        setup_destination_info(dest_path, spec_for_info)
 
     downres_mode = args.downres_mode or bool(downres)
     downres_wait = downres_mode and not args.async_launch
