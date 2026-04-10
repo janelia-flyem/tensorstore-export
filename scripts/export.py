@@ -255,6 +255,33 @@ def _get_image(env: dict) -> str:
     return env.get("DOCKER_IMAGE", "")
 
 
+def _check_cloud_run_api(project: str) -> None:
+    """Verify that the Cloud Run API is enabled on the target project.
+
+    gcloud prompts interactively when the API is disabled, but our
+    subprocess calls use capture_output=True so the prompt is never
+    shown — the process just hangs.  Catch this early with a clear error.
+    """
+    result = subprocess.run(
+        ["gcloud", "services", "list",
+         f"--project={project}",
+         "--filter=config.name:run.googleapis.com",
+         "--format=value(config.name)"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        print(f"Error: unable to check API status for project {project}:")
+        print(f"  {result.stderr.strip()}")
+        sys.exit(1)
+    if "run.googleapis.com" not in result.stdout:
+        print(f"Error: Cloud Run API (run.googleapis.com) is not enabled "
+              f"on project '{project}'.")
+        print(f"  Enable it with:")
+        print(f"    gcloud services enable run.googleapis.com "
+              f"--project={project}")
+        sys.exit(1)
+
+
 def _create_or_update_job(job_name: str, image: str, env: dict,
                           ng_spec_b64: str, memory: str, cpu: int,
                           tasks: int, manifest_uri: str,
@@ -735,6 +762,9 @@ def main():
     if not source_path or not project or project == "your-gcp-project":
         print("Error: Run 'pixi run deploy' first to configure .env.")
         sys.exit(1)
+
+    if not args.dry_run:
+        _check_cloud_run_api(project)
 
     scales_str = args.scales or env.get("SCALES", "0")
     scales = [int(s.strip()) for s in scales_str.split(",")]
