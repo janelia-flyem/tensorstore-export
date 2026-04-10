@@ -286,7 +286,8 @@ def _create_or_update_job(job_name: str, image: str, env: dict,
                           ng_spec_b64: str, memory: str, cpu: int,
                           tasks: int, manifest_uri: str,
                           label_type: str, downres: str,
-                          downres_mode: bool = False) -> bool:
+                          downres_mode: bool = False,
+                          z_compress: int = 0) -> bool:
     """Create or update a Cloud Run job for a tier."""
     env_vars = {
         "SOURCE_PATH": env["SOURCE_PATH"],
@@ -302,6 +303,8 @@ def _create_or_update_job(job_name: str, image: str, env: dict,
         env_vars["DOWNRES_SCALES"] = downres
     if downres_mode:
         env_vars["DOWNRES_MODE"] = "1"
+    if z_compress > 0:
+        env_vars["Z_COMPRESS"] = str(z_compress)
 
     # Write env vars to temp YAML (NG_SPEC contains chars that break
     # gcloud's --set-env-vars comma-separated format).
@@ -412,7 +415,7 @@ def _wait_for_tier_jobs(job_names: list[str], project: str, region: str,
 
 def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
                       project, region, label_type, downres, wait,
-                      job_suffix=""):
+                      job_suffix="", z_compress=0):
     """Create/update and execute Cloud Run jobs for each tier.
 
     All tiers are launched in parallel (async).  When wait=True, the
@@ -435,7 +438,7 @@ def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
         ok = _create_or_update_job(
             job_name, image, env, ng_spec_b64,
             memory, cpu, num_tasks, manifest_uri,
-            label_type, downres,
+            label_type, downres, z_compress=z_compress,
         )
         if not ok:
             print(f"  {job_name}: FAILED to create/update")
@@ -486,7 +489,8 @@ def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
 
 
 def _launch_from_manifests(args, env, source_path, project, region,
-                           base_name, label_type, downres, ng_spec_b64):
+                           base_name, label_type, downres, ng_spec_b64,
+                           z_compress=0):
     """Launch jobs from pre-built manifests (retry flow).
 
     Reads manifest files from {SOURCE_PATH}/{manifest_dir}/tier-{N}gi/
@@ -551,6 +555,7 @@ def _launch_from_manifests(args, env, source_path, project, region,
     _launch_tier_jobs(
         tier_info, env, image, ng_spec_b64, base_name, project, region,
         label_type, downres, args.wait, job_suffix=suffix,
+        z_compress=z_compress,
     )
 
 
@@ -745,6 +750,14 @@ def main():
              "avoids assigning empty shards to export tasks.",
     )
     parser.add_argument(
+        "--z-compress", type=int, default=0, metavar="N",
+        help="Remove N out of every N+1 consecutive Z slices from source "
+             "data before writing to output.  E.g., --z-compress 1 keeps "
+             "every other Z slice (stride=2).  The destination NG spec must "
+             "already have the correct Z dimensions for the compressed output. "
+             "Default: 0 (disabled).",
+    )
+    parser.add_argument(
         "--downres-mode", action="store_true",
         help="Generate downres manifests and launch Cloud Run jobs with "
              "DOWNRES_MODE=1. Deprecated: --downres now implies this path. "
@@ -765,6 +778,21 @@ def main():
 
     if not args.dry_run:
         _check_cloud_run_api(project)
+
+    z_compress = args.z_compress
+    if z_compress < 0:
+        print("Error: --z-compress must be non-negative.")
+        sys.exit(1)
+    if z_compress > 0:
+        z_stride = z_compress + 1
+        if 64 % z_stride != 0:
+            print(f"Error: --z-compress {z_compress} → stride {z_stride} "
+                  f"does not evenly divide chunk size 64. "
+                  f"Valid values: 0, 1, 3, 7, 15, 31, 63.")
+            sys.exit(1)
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(z_stride, "th")
+        print(f"Z compression: keeping every {z_stride}{suffix} Z slice "
+              f"(output Z per source block: {64 // z_stride})")
 
     scales_str = args.scales or env.get("SCALES", "0")
     scales = [int(s.strip()) for s in scales_str.split(",")]
@@ -901,7 +929,7 @@ def main():
     if args.manifest_dir:
         _launch_from_manifests(
             args, env, source_path, project, region, base_name,
-            label_type, downres, ng_spec_b64,
+            label_type, downres, ng_spec_b64, z_compress=z_compress,
         )
         return
 
@@ -1087,7 +1115,7 @@ def main():
         arrow_downres = "" if combined_mode else downres
         _launch_tier_jobs(
             tier_info, env, image, ng_spec_b64, base_name, project, region,
-            label_type, arrow_downres, arrow_wait,
+            label_type, arrow_downres, arrow_wait, z_compress=z_compress,
         )
 
     # --- Chain into downres pipeline after Arrow export ---

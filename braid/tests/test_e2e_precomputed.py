@@ -214,6 +214,79 @@ def volume_128_shard(tmp_path):
     return arrow_path, csv_path, chunks
 
 
+@pytest.fixture
+def volume_zdoubled_shard(tmp_path):
+    """
+    Create a 128x128x256 test volume (2x2x4 chunks) simulating Z-doubled data.
+
+    This models DVID export shards at [16,16,15] nm where the original [16,16,30]
+    segmentation was doubled in Z.  Source chunks come in Z pairs:
+
+        z=0, z=1: same spatial data (Z-doubled pair A)
+        z=2, z=3: same spatial data (Z-doubled pair B)
+
+    Within each block, Z slices are duplicated to simulate the doubling:
+    original Z slice i appears at both z=2i and z=2i+1 within the 64-voxel block.
+
+    With --z-compress 1 (stride=2), the output should be a 128x128x128 volume
+    where each output chunk [0,64) in Z is populated from the pair and matches
+    the un-doubled original.
+    """
+    def make_zdoubled_solid_block(label):
+        """Solid block — Z-doubling is a no-op since all voxels are identical."""
+        return create_solid_dvid_block(label)
+
+    def make_zdoubled_two_label_block(label_a, label_b):
+        """Two-label block with Z-doubled slices.
+
+        Original (un-doubled): label_a for z<32, label_b for z>=32.
+        Z-doubled: pairs of identical slices, so the sub-block boundary
+        is the same (z < gz//2 → label_a, z >= gz//2 → label_b).
+        After z-compress 1 (keep z=0,2,4,...), we recover the original
+        32-slice-each split, but mapped to 32 output voxels: z<16 → label_a,
+        z>=16 → label_b.
+        """
+        return create_two_label_dvid_block(label_a, label_b)
+
+    # Z pair A: chunks z=0 and z=1 (identical data)
+    pair_a_labels = [
+        (0, 0, 100, [100], [100]),    # solid
+        (1, 0, 200, [200], [200]),    # solid
+        (0, 1, 300, [300], [300]),    # solid
+        (1, 1, 400, [400], [400]),    # solid
+    ]
+    # Z pair B: chunks z=2 and z=3 (identical data)
+    pair_b_labels = [
+        (0, 0, None, [500, 600], [500, 600]),  # two-label
+        (1, 0, 700, [700], [700]),              # solid
+        (0, 1, 800, [800], [800]),              # solid
+        (1, 1, 900, [900], [900]),              # solid
+    ]
+
+    chunks = []
+    for z_src in (0, 1):  # pair A
+        for cx, cy, label, svs, labs in pair_a_labels:
+            chunks.append({
+                'x': cx, 'y': cy, 'z': z_src,
+                'supervoxels': svs, 'labels': labs,
+                'dvid_block': make_zdoubled_solid_block(label),
+            })
+    for z_src in (2, 3):  # pair B
+        for cx, cy, label, svs, labs in pair_b_labels:
+            if label is None:
+                block = make_zdoubled_two_label_block(svs[0], svs[1])
+            else:
+                block = make_zdoubled_solid_block(label)
+            chunks.append({
+                'x': cx, 'y': cy, 'z': z_src,
+                'supervoxels': svs, 'labels': labs,
+                'dvid_block': block,
+            })
+
+    arrow_path, csv_path = create_test_shard(tmp_path, "zdoubled_shard", chunks)
+    return arrow_path, csv_path, chunks
+
+
 # ---- Tests ----
 
 class TestBraidReadback:
@@ -437,4 +510,164 @@ class TestE2EPrecomputed:
                 actual = int(full[x, y, z])
                 assert actual == expected_label, (
                     f"At ({x},{y},{z}): expected {expected_label}, got {actual}"
+                )
+
+
+class TestE2EZCompress:
+    """
+    End-to-end with Z compression: Z-doubled source -> z_compress=1 -> readback.
+
+    Verifies the worker's Z decimation and coordinate mapping logic by writing
+    a Z-doubled 128x128x256 source volume (4 Z-chunks) through a z-compress=1
+    pipeline into a 128x128x128 output volume.  Each source block's 64 Z voxels
+    are decimated to 32, and pairs of adjacent source Z-chunks merge into one
+    output chunk via TensorStore transactions.
+    """
+
+    CHUNK = 64
+    Z_STRIDE = 2  # z_compress=1 → stride 2
+    OUT_Z_PER_CHUNK = CHUNK // Z_STRIDE  # 32
+
+    def _write_info_file(self, tmp_dir: str, volume_shape):
+        info = {
+            '@type': 'neuroglancer_multiscale_volume',
+            'data_type': 'uint64',
+            'num_channels': 1,
+            'type': 'segmentation',
+            'scales': [{
+                'key': 's0',
+                'size': list(volume_shape),
+                'resolution': [8, 8, 8],
+                'chunk_sizes': [[64, 64, 64]],
+                'encoding': 'raw',
+                'voxel_offset': [0, 0, 0],
+            }],
+        }
+        with open(os.path.join(tmp_dir, 'info'), 'w') as f:
+            json.dump(info, f)
+
+    def _open_precomputed_volume(self, tmp_dir: str):
+        spec = {
+            'driver': 'neuroglancer_precomputed',
+            'kvstore': {'driver': 'file', 'path': tmp_dir},
+            'scale_index': 0,
+            'open': True,
+        }
+        return ts.open(spec).result()
+
+    def _write_z_compressed(self, tmp_dir, reader, output_shape, label_type):
+        """Write all chunks with Z decimation, mirroring the worker's logic."""
+        self._write_info_file(tmp_dir, output_shape)
+        dest = self._open_precomputed_volume(tmp_dir)
+
+        C = self.CHUNK
+        out_z = self.OUT_Z_PER_CHUNK
+        z_stride = self.Z_STRIDE
+
+        txn = ts.Transaction()
+        for (cx, cy, cz) in reader.available_chunks:
+            chunk_data = reader.read_chunk(cx, cy, cz, label_type=label_type)
+            # Decimate Z (BRAID returns ZYX order)
+            chunk_data = chunk_data[::z_stride, :, :]
+            transposed = chunk_data.transpose(2, 1, 0)  # ZYX -> XYZ
+
+            x0, y0, z0 = cx * C, cy * C, cz * out_z
+            x1 = min(x0 + C, output_shape[0])
+            y1 = min(y0 + C, output_shape[1])
+            z1 = min(z0 + out_z, output_shape[2])
+            clipped = transposed[:x1 - x0, :y1 - y0, :z1 - z0]
+            dest.with_transaction(txn)[x0:x1, y0:y1, z0:z1, 0].write(
+                clipped).result()
+
+        txn.commit_async().result()
+
+    def _read_volume(self, tmp_dir):
+        vol = self._open_precomputed_volume(tmp_dir)
+        return vol[:, :, :, 0]
+
+    def test_solid_blocks_z_compress(self, volume_zdoubled_shard):
+        """Solid-label Z-doubled pairs produce correct output after z-compress."""
+        arrow_path, csv_path, _ = volume_zdoubled_shard
+        reader = ShardReader(arrow_path, csv_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self._write_z_compressed(
+                tmp_dir, reader, [128, 128, 128], LabelType.SUPERVOXELS)
+            vol = self._read_volume(tmp_dir)
+
+            # Source z=0 → output Z [0,32), source z=1 → output Z [32,64)
+            # Both have the same labels, so the full output chunk is uniform.
+            data_000 = vol[0:64, 0:64, 0:64].read().result()
+            assert np.all(data_000 == 100), (
+                f"Expected 100, got unique: {np.unique(data_000)}")
+
+            data_100 = vol[64:128, 0:64, 0:64].read().result()
+            assert np.all(data_100 == 200)
+
+            data_010 = vol[0:64, 64:128, 0:64].read().result()
+            assert np.all(data_010 == 300)
+
+            data_110 = vol[64:128, 64:128, 0:64].read().result()
+            assert np.all(data_110 == 400)
+
+    def test_two_label_block_z_compress(self, volume_zdoubled_shard):
+        """Two-label block Z pattern is preserved through z-compress pipeline."""
+        arrow_path, csv_path, _ = volume_zdoubled_shard
+        reader = ShardReader(arrow_path, csv_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self._write_z_compressed(
+                tmp_dir, reader, [128, 128, 128], LabelType.SUPERVOXELS)
+            vol = self._read_volume(tmp_dir)
+
+            # Chunk (0,0) in XY, Z pair B (source z=2,3 → output Z [64,128)):
+            # Source block has label_a=500 in bottom Z half, label_b=600 in top.
+            # After z-compress, each source block contributes 32 output Z voxels,
+            # with the label split at the midpoint (16 voxels each).
+            #
+            # Source z=2 → output Z [64,96):  z<80 → 500, z>=80 → 600
+            # Source z=3 → output Z [96,128): z<112 → 500, z>=112 → 600
+            data = vol[0:64, 0:64, 64:128].read().result()
+
+            assert np.all(data[:, :, 0:16] == 500), "z=2 bottom half"
+            assert np.all(data[:, :, 16:32] == 600), "z=2 top half"
+            assert np.all(data[:, :, 32:48] == 500), "z=3 bottom half"
+            assert np.all(data[:, :, 48:64] == 600), "z=3 top half"
+
+    def test_full_volume_z_compress(self, volume_zdoubled_shard):
+        """Spot-check the entire Z-compressed output volume."""
+        arrow_path, csv_path, _ = volume_zdoubled_shard
+        reader = ShardReader(arrow_path, csv_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self._write_z_compressed(
+                tmp_dir, reader, [128, 128, 128], LabelType.SUPERVOXELS)
+            vol = self._read_volume(tmp_dir)
+
+            full = vol[0:128, 0:128, 0:128].read().result()
+            assert full.shape == (128, 128, 128)
+
+            # Each solid source block pair merges into one uniform output chunk.
+            expected = {
+                # Pair A: output Z [0,64) — solid labels
+                (32, 32, 16): 100,    # from source z=0, center of 32-voxel slab
+                (32, 32, 48): 100,    # from source z=1, center of 32-voxel slab
+                (96, 32, 16): 200,
+                (32, 96, 16): 300,
+                (96, 96, 48): 400,
+                # Pair B: output Z [64,128)
+                (96, 32, 80): 700,    # from source z=2
+                (96, 32, 112): 700,   # from source z=3
+                (32, 96, 80): 800,
+                (96, 96, 112): 900,
+                # Two-label block: z-compress preserves within-block split
+                (32, 32, 72): 500,    # z=2 bottom half
+                (32, 32, 88): 600,    # z=2 top half
+                (32, 32, 104): 500,   # z=3 bottom half
+                (32, 32, 120): 600,   # z=3 top half
+            }
+            for (x, y, z), label in expected.items():
+                actual = int(full[x, y, z])
+                assert actual == label, (
+                    f"At ({x},{y},{z}): expected {label}, got {actual}"
                 )
