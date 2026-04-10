@@ -473,12 +473,16 @@ def _launch_tier_jobs(tier_info, env, image, ng_spec_b64, base_name,
                 from scripts.verify_export import verify_all_scales, print_report
                 scales = [int(s) for s in scales_str.split(",")]
                 total_missing, results = verify_all_scales(
-                    source_path, dest_path, ng_spec_path, scales)
+                    source_path, dest_path, ng_spec_path, scales,
+                    z_compress=z_compress)
                 print_report(results)
                 if total_missing > 0:
                     print(f"\n*** WARNING: {total_missing} DVID shards have "
                           f"no NG output ***")
-                    print("Run 'pixi run verify-export' for details.")
+                    print("Run 'pixi run verify-export "
+                          f"--z-compress {z_compress}' for details."
+                          if z_compress > 0 else
+                          "Run 'pixi run verify-export' for details.")
             except Exception as e:
                 print(f"\n  Verification failed: {e}")
                 print("  Run 'pixi run verify-export' manually.")
@@ -980,7 +984,8 @@ def main():
             missing = []
             for entry in scale_files:
                 _, shard_name, _, _ = entry
-                shard_num = dvid_to_ng_shard_number(shard_name, params)
+                shard_num = dvid_to_ng_shard_number(shard_name, params,
+                                                     z_compress=z_compress)
                 ng_file = ng_shard_filename(shard_num, params["shard_bits"])
                 if ng_file not in existing_ng:
                     missing.append(entry)

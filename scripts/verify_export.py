@@ -79,7 +79,8 @@ def list_ng_shard_files(dest_path, scale_key):
     return files
 
 
-def verify_scale(source_path, dest_path, scale_idx, scale_params):
+def verify_scale(source_path, dest_path, scale_idx, scale_params,
+                  z_compress=0):
     """Verify a single scale.
 
     Returns dict with keys: scale, dvid_shards, expected_ng_shards,
@@ -91,7 +92,8 @@ def verify_scale(source_path, dest_path, scale_idx, scale_params):
     dvid_to_ng = {}
     ng_to_dvid = defaultdict(list)
     for name in dvid_names:
-        shard_num = dvid_to_ng_shard_number(name, scale_params)
+        shard_num = dvid_to_ng_shard_number(name, scale_params,
+                                             z_compress=z_compress)
         fname = ng_shard_filename(shard_num, scale_params["shard_bits"])
         dvid_to_ng[name] = fname
         ng_to_dvid[fname].append(name)
@@ -123,7 +125,8 @@ def verify_scale(source_path, dest_path, scale_idx, scale_params):
     }
 
 
-def verify_all_scales(source_path, dest_path, ng_spec_path, scales):
+def verify_all_scales(source_path, dest_path, ng_spec_path, scales,
+                      z_compress=0):
     """Verify all requested scales.
 
     Returns (total_missing_dvid_shards, list_of_scale_reports).
@@ -136,7 +139,8 @@ def verify_all_scales(source_path, dest_path, ng_spec_path, scales):
         if s not in scale_info:
             print(f"  Warning: scale {s} not in NG spec, skipping")
             continue
-        result = verify_scale(source_path, dest_path, s, scale_info[s])
+        result = verify_scale(source_path, dest_path, s, scale_info[s],
+                              z_compress=z_compress)
         results.append(result)
         for entry in result["missing"]:
             total_missing_dvid += len(entry["dvid_shards"])
@@ -183,6 +187,10 @@ def main():
                         help="Comma-separated scale indices (default: all in spec)")
     parser.add_argument("--json-report", type=str, default=None,
                         help="Write JSON report to file")
+    parser.add_argument("--z-compress", type=int, default=0, metavar="N",
+                        help="Z compression factor used during export. "
+                             "Adjusts DVID Z coordinates by 1/(N+1) before "
+                             "mapping to NG shard numbers. Default: 0.")
     args = parser.parse_args()
 
     env = load_env(ENV_FILE)
@@ -209,7 +217,8 @@ def main():
     print(f"  Dest:   {dest_path}")
 
     total_missing, results = verify_all_scales(
-        source_path, dest_path, ng_spec_path, scales)
+        source_path, dest_path, ng_spec_path, scales,
+        z_compress=args.z_compress)
 
     all_ok = print_report(results)
 

@@ -509,7 +509,7 @@ def shard_chunk_coords(
 
 
 def dvid_to_ng_shard_number(
-    shard_name: str, scale_params: dict
+    shard_name: str, scale_params: dict, z_compress: int = 0,
 ) -> int:
     """Map a DVID shard name (e.g. "10240_40960_43008") to an NG shard number.
 
@@ -517,11 +517,16 @@ def dvid_to_ng_shard_number(
         shard_name: DVID shard name in "x_y_z" voxel coordinate format.
         scale_params: Dict with keys: chunk_size, coord_bits, preshift_bits,
                       minishard_bits, shard_bits.
+        z_compress: When >0, the DVID source has z_compress+1 times more Z
+                    voxels than the output spec.  The Z voxel coordinate is
+                    divided by (z_compress+1) before computing chunk coords.
 
     Returns:
         The neuroglancer shard number.
     """
     x, y, z = (int(v) for v in shard_name.split("_"))
+    if z_compress > 0:
+        z = z // (z_compress + 1)
     chunk_size = scale_params["chunk_size"]
     cx = x // chunk_size[0]
     cy = y // chunk_size[1]
