@@ -28,8 +28,10 @@ pixi run deploy               # Build Docker image and push to GCR
 pixi run export               # Full pipeline: Arrow export + downres (skips existing)
 pixi run export --dry-run     # Show what would be launched
 pixi run export --overwrite   # Re-export all shards even if output exists
+pixi run export --z-compress 1 --scales 0  # Z decimation for anisotropic exports
 pixi run export-status        # Monitor running Cloud Run jobs
 pixi run export-errors        # Scan logs for export errors
+pixi run verify-export        # Verify all DVID shards have NG output
 pixi run precompute-manifest  # Generate per-task shard manifests
 ```
 
@@ -97,6 +99,26 @@ All configuration lives in `.env` (not committed; see `.env.example` for the tem
 | `BASE_JOB_NAME` | Prefix for Cloud Run job names |
 
 The worker itself reads `SOURCE_PATH`, `DEST_PATH`, `NG_SPEC` (base64-encoded), `SCALES`, `MANIFEST_URI`, `LABEL_TYPE`, `WORKER_MEMORY_GIB` from its environment (set by `scripts/export.py`).
+
+## Anisotropic Datasets (Z Compression)
+
+When the DVID source was exported with Z-doubled data (e.g., original [16,16,30] nm segmentation doubled to [16,16,15] nm), the `--z-compress N` flag decimates Z slices to produce native-resolution output. `--z-compress 1` keeps every 2nd Z slice (stride=2), halving the Z dimension.
+
+This requires two export passes since only s0 needs Z decimation — from s1 onward, the DVID 2x downsample in Z collapses the doubled slices back to the original resolution:
+
+```bash
+# 1. Export s0 with Z decimation (NG_SPEC_PATH points to native-Z spec)
+pixi run export --scales 0 --z-compress 1
+
+# 2. Export s1+ without Z compression (source data already matches)
+pixi run export --scales 1,2,3,4,5,6,7,8
+
+# Verification also needs the flag for s0
+pixi run verify-export --scales 0 --z-compress 1
+pixi run verify-export --scales 1,2,3,4,5,6,7,8
+```
+
+The `--z-compress` flag also adjusts the skip-existing shard mapping so that re-runs correctly detect which output shards are already present. See `examples/fish2_seg_zdoubled_spec.json` (source) and `examples/fish2_seg_native_z_spec.json` (output) for reference.
 
 ## TensorStore Pitfall: Always `.result()` Writes in Transactions
 

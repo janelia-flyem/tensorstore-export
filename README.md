@@ -173,6 +173,7 @@ Without it, the chunk-count model is used, which is more conservative.
 | `--downres` | Target scales for downres (e.g., `1` or `1,2,3,...,9`) | from `.env` |
 | `--only-missing` | For downres, generate manifests only for missing output shards | off |
 | `--supervoxels` | Output raw supervoxel IDs instead of agglomerated labels | off |
+| `--z-compress N` | Decimate Z: keep every (N+1)th slice (see [Anisotropic Datasets](#anisotropic-datasets-z-compression)) | 0 |
 | `--tiers` | Override max tasks per tier (e.g., `4:3000,8:50`) | auto |
 | `--dry-run` | Show tier assignments without writing manifests or launching | |
 | `--wait` | For non-downres export, block until jobs complete | async |
@@ -212,6 +213,7 @@ Verify that every DVID source shard produced an NG output shard on GCS:
 ```bash
 pixi run verify-export                    # all scales
 pixi run verify-export -- --scales 0,1,2  # specific scales
+pixi run verify-export -- --scales 0 --z-compress 1  # with Z compression
 pixi run verify-export -- --json-report report.json
 ```
 
@@ -244,6 +246,30 @@ pixi run export --downres 2 --only-missing
 
 That regenerates manifests only for missing destination shards at the target
 scale and launches the manifest-driven downres worker path.
+
+### Anisotropic Datasets (Z Compression)
+
+When the DVID source was exported with Z-doubled data (e.g., original [16,16,30] nm segmentation doubled to [16,16,15] nm to make it more isotropic), the `--z-compress N` flag decimates Z slices during export to produce a native-resolution output volume. `--z-compress 1` keeps every 2nd Z slice (stride=2), halving the Z dimension.
+
+Only s0 needs Z decimation. From s1 onward, the DVID 2x downsample collapses the doubled Z slices back to the original resolution, so no compression is needed. This requires two export passes:
+
+```bash
+# Step 1: Export s0 with Z decimation
+# (NG_SPEC_PATH in .env points to the native-Z output spec)
+pixi run export --scales 0 --z-compress 1
+
+# Step 2: Export s1+ without Z compression
+pixi run export --scales 1,2,3,4,5,6,7,8
+```
+
+Verification also requires the flag for s0:
+
+```bash
+pixi run verify-export -- --scales 0 --z-compress 1
+pixi run verify-export -- --scales 1,2,3,4,5,6,7,8
+```
+
+The `--z-compress` flag also adjusts the skip-existing shard mapping, so re-runs correctly detect already-exported shards. See `examples/fish2_seg_zdoubled_spec.json` (source) and `examples/fish2_seg_native_z_spec.json` (output) for a working example.
 
 ### Memory Sizing
 
