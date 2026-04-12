@@ -12,6 +12,7 @@ Usage:
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -355,6 +356,20 @@ PLACEHOLDERS = {"your-gcp-project", "gs://your-bucket/path/to/shard/export",
                 "gs://your-bucket/path/to/precomputed/output", "ng-specs.json"}
 
 
+_BASE_JOB_NAME_RE = re.compile(r"^[a-z]([-a-z0-9]*[a-z0-9])?$")
+
+
+def _validate_base_job_name(name: str) -> None:
+    """Reject BASE_JOB_NAME values that Cloud Run/GCR will not accept."""
+    if len(name) > 63 or not _BASE_JOB_NAME_RE.match(name):
+        sys.exit(
+            f"Error: BASE_JOB_NAME={name!r} is invalid.\n"
+            f"  Must be lowercase [a-z0-9-], start with a letter, end with a "
+            f"letter or digit, and be <=63 chars (e.g. 'export-fish2-nativez').\n"
+            f"  Cloud Run jobs and GCR image names both enforce this."
+        )
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Deploy tensorstore-export to Cloud Run.")
@@ -436,6 +451,11 @@ def main():
         if save_answer != "n":
             save_env(ENV_FILE, final)
             print(f"  Saved to {ENV_FILE}")
+
+    # BASE_JOB_NAME is used as both the Cloud Run job name prefix and the
+    # Docker image name.  Both require lowercase [a-z0-9-], start with a
+    # letter, end with a letter or digit, and max 63 chars.
+    _validate_base_job_name(final["BASE_JOB_NAME"])
 
     # Validate and configure GCS buckets (creates dest bucket if needed,
     # disables soft delete, warns about region mismatches).
