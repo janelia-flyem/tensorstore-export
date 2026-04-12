@@ -8,7 +8,7 @@
         [
           64,
           64,
-          64
+          32
         ]
       ],
       "encoding": "compressed_segmentation",
@@ -24,7 +24,7 @@
         "minishard_bits": 6,
         "minishard_index_encoding": "gzip",
         "preshift_bits": 9,
-        "shard_bits": 14,
+        "shard_bits": 15,
         "data_encoding": "gzip"
       },
       "size": [
